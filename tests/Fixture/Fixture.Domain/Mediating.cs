@@ -10,5 +10,8 @@ public interface IRequestHandler<TRequest, TResponse> where TRequest : IRequest<
 
 public class Mediator
 {
-    public object? Send(object request) => null;
+    public object Send(object request)
+    {
+        return null;
+    }
 }

@@ -9,5 +9,8 @@ public static class SharedService
     // One declaration where BOTH fields orphan together: the whole line goes.
     public static int WidgetOnlyA, WidgetOnlyB;
 
-    public static string Prefix() => "shared:";
+    public static string Prefix()
+    {
+        return "shared:";
+    }
 }

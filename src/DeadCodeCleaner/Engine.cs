@@ -17,19 +17,9 @@ public sealed class Engine
         _log = log;
     }
 
-    public async Task<(DeletionReport Report, Graph Graph)> AnalyzeAsync()
+    public async Task<(DeletionReport Report, Graph Graph)> Analyze()
     {
-        // Neutralize build settings that break design-time builds but don't affect analysis.
-        var buildProps = new Dictionary<string, string>
-        {
-            ["RunAnalyzers"] = "false",
-            ["RunAnalyzersDuringBuild"] = "false",
-            ["TreatWarningsAsErrors"] = "false",
-            ["MSBuildTreatWarningsAsErrors"] = "false",
-            ["WarningsAsErrors"] = "",
-            ["NuGetAudit"] = "false",
-        };
-        using var workspace = MSBuildWorkspace.Create(buildProps);
+        using var workspace = MSBuildWorkspace.Create(Constants.NeutralizedBuildProperties);
         var loadWarnings = new List<string>();
         workspace.WorkspaceFailed += (_, e) =>
         {
@@ -37,13 +27,13 @@ public sealed class Engine
                 loadWarnings.Add(e.Diagnostic.Message);
         };
         _log($"Loading solution {_opts.SolutionPath} ...");
-        var solution = await workspace.OpenSolutionAsync(_opts.SolutionPath!);
+        var solution = await workspace.OpenSolutionAsync(_opts.SolutionPath);
         _log($"Building dependency graph for {solution.Projects.Count()} projects ...");
-        var graph = await new GraphBuilder(_config, _log).BuildAsync(solution);
-        foreach (var w in loadWarnings.Take(10))
+        var graph = await new GraphBuilder(_config, _log).Build(solution);
+        foreach (var w in loadWarnings.Take(Constants.WorkspaceWarningLimit))
             graph.Warnings.Add("workspace: " + w);
-        if (loadWarnings.Count > 10)
-            graph.Warnings.Add($"workspace: ... and {loadWarnings.Count - 10} more load diagnostics");
+        if (loadWarnings.Count > Constants.WorkspaceWarningLimit)
+            graph.Warnings.Add($"workspace: ... and {loadWarnings.Count - Constants.WorkspaceWarningLimit} more load diagnostics");
 
         var report = ComputeReport(graph, solution);
         return (report, graph);
@@ -53,7 +43,7 @@ public sealed class Engine
     {
         var report = new DeletionReport
         {
-            Solution = _opts.SolutionPath!,
+            Solution = _opts.SolutionPath,
             RemoveTargets = _opts.RemoveTargets.ToArray(),
         };
         report.Warnings.AddRange(graph.Warnings);
@@ -180,7 +170,7 @@ public sealed class Engine
                 : brokenOrphans.Contains(id) ? "broken-orphan"
                 : "orphaned-test-helper";
             bool review = false;
-            string? note = null;
+            string note = null;
             if (brokenTests.Contains(id))
             {
                 var carriers = new List<string> { id };
@@ -188,7 +178,7 @@ public sealed class Engine
                 var surviving = carriers
                     .SelectMany(c => graph.Edges.TryGetValue(c, out var refs) ? refs : Enumerable.Empty<string>())
                     .Where(t => r2.Contains(t) && !graph.TestNodes.Contains(t))
-                    .Select(t => FqnOf(graph, t)).Distinct().Take(3).ToList();
+                    .Select(t => FqnOf(graph, t)).Distinct().Take(Constants.ShownSurvivingRefs).ToList();
                 if (surviving.Count > 0)
                 {
                     review = true;
@@ -221,8 +211,7 @@ public sealed class Engine
                 Snippet = stmt.Snippet,
             });
         }
-        report.Statements.Sort((a, b) =>
-            string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.StartLine.CompareTo(b.StartLine));
+        report.Statements.Sort((a, b) => string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.StartLine.CompareTo(b.StartLine));
 
         // Whole files: deletable when every node declared in the file is deleted.
         var nodesByFile = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -265,7 +254,7 @@ public sealed class Engine
         return report;
     }
 
-    static HashSet<string> ProjectClosure(Graph graph, IEnumerable<string> roots, HashSet<string> excluded)
+    HashSet<string> ProjectClosure(Graph graph, IEnumerable<string> roots, HashSet<string> excluded)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var queue = new Queue<string>(roots.Where(r => !excluded.Contains(r)));
@@ -280,10 +269,12 @@ public sealed class Engine
         return seen;
     }
 
-    static string FqnOf(Graph graph, string id) =>
-        graph.Decl.TryGetValue(id, out var s) ? SymbolNames.Fqn(s) : id;
+    string FqnOf(Graph graph, string id)
+    {
+        return graph.Decl.TryGetValue(id, out var s) ? SymbolNames.Fqn(s) : id;
+    }
 
-    static bool HasDeadContainer(Graph graph, string id, HashSet<string> dead)
+    bool HasDeadContainer(Graph graph, string id, HashSet<string> dead)
     {
         var cur = id;
         while (graph.ContainerOf.TryGetValue(cur, out var container))
@@ -294,8 +285,7 @@ public sealed class Engine
         return false;
     }
 
-    static List<SourcePart> DeclarationParts(Graph graph, ISymbol s, string id,
-        HashSet<string> allDead, HashSet<string> keptInPlace, List<string> warnings)
+    List<SourcePart> DeclarationParts(Graph graph, ISymbol s, string id, HashSet<string> allDead, HashSet<string> keptInPlace, List<string> warnings)
     {
         var parts = new List<SourcePart>();
         foreach (var r in s.DeclaringSyntaxReferences)
@@ -308,7 +298,7 @@ public sealed class Engine
                 var variables = (container as BaseFieldDeclarationSyntax)?.Declaration.Variables;
                 if (variables is { Count: 1 })
                 {
-                    node = container!;
+                    node = container;
                 }
                 else if (variables != null)
                 {
@@ -329,7 +319,7 @@ public sealed class Engine
                     }
                     // The first sibling's entry carries the whole-declaration span.
                     if (variables.Value[0].Identifier.Text != s.Name) continue;
-                    node = container!;
+                    node = container;
                 }
             }
             var tree = node.SyntaxTree;
@@ -348,7 +338,7 @@ public sealed class Engine
         return parts;
     }
 
-    static string? SiblingFieldId(Graph graph, string memberId, string siblingName)
+    string SiblingFieldId(Graph graph, string memberId, string siblingName)
     {
         if (!graph.ContainerOf.TryGetValue(memberId, out var typeId)) return null;
         foreach (var (nid, sym) in graph.Decl)
@@ -363,14 +353,16 @@ public sealed class Engine
     /// <summary>Packages, project references and whole projects that lose their last surviving
     /// user. "Already unused before" stays, matching the symbol-level policy: a reference is only
     /// removed when deleted code used it and no surviving code does.</summary>
-    static void ComputeProjectCleanup(Graph graph, DeletionReport report,
-        HashSet<string> allDead, HashSet<string> keptInPlace)
+    void ComputeProjectCleanup(Graph graph, DeletionReport report, HashSet<string> allDead, HashSet<string> keptInPlace)
     {
         var nodesByProject = graph.ProjectOf
             .GroupBy(kv => kv.Value, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.Select(kv => kv.Key).ToList(), StringComparer.OrdinalIgnoreCase);
 
-        bool Stays(string n) => !allDead.Contains(n) || keptInPlace.Contains(n);
+        bool Stays(string n)
+        {
+            return !allDead.Contains(n) || keptInPlace.Contains(n);
+        }
 
         var deletableProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (pname, nodeIds) in nodesByProject)
@@ -397,7 +389,7 @@ public sealed class Engine
                 if (graph.Edges.TryGetValue(n, out var outs))
                 {
                     foreach (var t in outs)
-                        if (graph.ProjectOf.TryGetValue(t, out var tp) && !tp.Equals(pname, StringComparison.OrdinalIgnoreCase))
+                        if (graph.ProjectOf.TryGetValue(t, out var tp) && tp != pname)
                             (stays ? survivingProjRefs : deadProjRefs).Add(tp);
                 }
             }
@@ -472,13 +464,10 @@ public sealed class Engine
             if (u.Providers.All(gone.Contains))
                 report.UsingRemovals.Add(new UsingRemoval { File = u.File, Line = u.Line, Namespace = u.Namespace });
         }
-        report.UsingRemovals.Sort((a, b) =>
-            string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.Line.CompareTo(b.Line));
+        report.UsingRemovals.Sort((a, b) => string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.Line.CompareTo(b.Line));
         report.DeletableProjects.Sort((a, b) => string.CompareOrdinal(a.Project, b.Project));
-        report.PackageRefRemovals.Sort((a, b) =>
-            string.CompareOrdinal(a.Project, b.Project) is var c && c != 0 ? c : string.CompareOrdinal(a.Reference, b.Reference));
-        report.ProjectRefRemovals.Sort((a, b) =>
-            string.CompareOrdinal(a.Project, b.Project) is var c && c != 0 ? c : string.CompareOrdinal(a.Reference, b.Reference));
+        report.PackageRefRemovals.Sort((a, b) => string.CompareOrdinal(a.Project, b.Project) is var c && c != 0 ? c : string.CompareOrdinal(a.Reference, b.Reference));
+        report.ProjectRefRemovals.Sort((a, b) => string.CompareOrdinal(a.Project, b.Project) is var c && c != 0 ? c : string.CompareOrdinal(a.Reference, b.Reference));
     }
 
     HashSet<string> ResolveRemovals(Graph graph)
@@ -497,7 +486,7 @@ public sealed class Engine
         foreach (var target in _opts.RemoveTargets)
         {
             var key = target.Trim();
-            string? signature = null;
+            string signature = null;
             var paren = key.IndexOf('(');
             if (paren >= 0)
             {
@@ -509,7 +498,7 @@ public sealed class Engine
             {
                 var suggestions = byFqn.Keys
                     .Where(k => k.Contains(key, StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(k => k.Length).Take(5).ToList();
+                    .OrderBy(k => k.Length).Take(Constants.SuggestionLimit).ToList();
                 throw new InvalidOperationException(
                     $"Removal target not found: '{target}'." +
                     (suggestions.Count > 0 ? " Did you mean: " + string.Join(" | ", suggestions) : ""));
@@ -544,11 +533,12 @@ public sealed class Engine
     }
 
     /// <summary>"(Invoice,int)" — parameter types with minimal qualification, no spaces.</summary>
-    static string ShortSignature(IMethodSymbol ms) =>
-        "(" + string.Join(",", ms.Parameters.Select(p =>
-            p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat).Replace(" ", ""))) + ")";
+    string ShortSignature(IMethodSymbol ms)
+    {
+        return "(" + string.Join(",", ms.Parameters.Select(p => p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat).Replace(" ", ""))) + ")";
+    }
 
-    static HashSet<string> ExpandRemovals(Graph graph, HashSet<string> seeds)
+    HashSet<string> ExpandRemovals(Graph graph, HashSet<string> seeds)
     {
         var removed = new HashSet<string>(seeds, StringComparer.Ordinal);
         foreach (var n in graph.Nodes)
@@ -566,8 +556,7 @@ public sealed class Engine
     /// <summary>Forward-breakage propagation: code that is not in use after the removal and
     /// references deleted code cannot compile, so it is deleted too. A dead member of a dead type
     /// escalates to the whole type (partial deletion could break interface contracts).</summary>
-    static HashSet<string> Poison(Graph graph, HashSet<string> seeds, HashSet<object> r2,
-        Dictionary<string, List<string>> membersOf)
+    HashSet<string> Poison(Graph graph, HashSet<string> seeds, HashSet<object> r2, Dictionary<string, List<string>> membersOf)
     {
         // Reverse adjacency restricted to sources that are not in use after removal.
         var reverse = new Dictionary<string, List<string>>(StringComparer.Ordinal);

@@ -6,9 +6,6 @@ namespace DeadCodeCleaner;
 /// performs the deletions (removing markers along with the code).</summary>
 public static class Editor
 {
-    public const string Marker = "// todo: to be deleted";
-    public const string XmlMarker = "<!-- todo: to be deleted -->";
-
     // ------------------------------------------------------------------ mark
 
     public static void Mark(DeletionReport report, Action<string> log)
@@ -19,8 +16,8 @@ public static class Editor
         {
             var text = File.ReadAllText(file);
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-            if (FirstLine(text).Trim().StartsWith(Marker)) continue;
-            File.WriteAllText(file, Marker + nl + text);
+            if (FirstLine(text).Trim().StartsWith(Constants.Marker)) continue;
+            File.WriteAllText(file, Constants.Marker + nl + text);
             files++; markers++;
         }
 
@@ -36,7 +33,7 @@ public static class Editor
         foreach (var sym in report.Symbols.Where(s => !s.InDeletableFile))
         {
             var suffix = sym.Review && sym.ReviewNote != null
-                ? $" (review: {Truncate(sym.ReviewNote, 120)})" : "";
+                ? $" (review: {Truncate(sym.ReviewNote, Constants.ReviewNoteMaxLength)})" : "";
             foreach (var p in sym.Parts) Plan(p.File, p.StartLine, suffix);
         }
         foreach (var st in report.Statements) Plan(st.File, st.StartLine, "");
@@ -51,10 +48,10 @@ public static class Editor
             for (int i = 0; i < lines.Count; i++)
             {
                 if (linesToMark.TryGetValue(i + 1, out var suffix)
-                    && (i == 0 || !lines[i - 1].Trim().StartsWith(Marker)))
+                    && (i == 0 || !lines[i - 1].Trim().StartsWith(Constants.Marker)))
                 {
                     var indent = lines[i][..(lines[i].Length - lines[i].TrimStart().Length)];
-                    sb.Append(indent).Append(Marker).Append(suffix).Append(nl);
+                    sb.Append(indent).Append(Constants.Marker).Append(suffix).Append(nl);
                     markers++;
                 }
                 sb.Append(lines[i]);
@@ -72,9 +69,9 @@ public static class Editor
         foreach (var pd in report.DeletableProjects)
         {
             var text = File.ReadAllText(pd.CsprojPath);
-            if (FirstLine(text).Trim().StartsWith(XmlMarker[..20])) continue;
+            if (FirstLine(text).Trim().StartsWith(Constants.XmlMarkerPrefix)) continue;
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-            File.WriteAllText(pd.CsprojPath, XmlMarker + nl + text);
+            File.WriteAllText(pd.CsprojPath, Constants.XmlMarker + nl + text);
             markers++; files++;
         }
 
@@ -114,9 +111,9 @@ public static class Editor
             var text = File.ReadAllText(file);
             var ranges = perFile[file];
             var starts = LineStarts(text);
-            foreach (var st in report.Statements.Where(s => s.File.Equals(file, StringComparison.OrdinalIgnoreCase)))
+            foreach (var st in report.Statements.Where(s => s.File == file))
                 AddLineRange(st.StartLine, st.EndLine, text, starts, ranges);
-            foreach (var ur in report.UsingRemovals.Where(u => u.File.Equals(file, StringComparison.OrdinalIgnoreCase)))
+            foreach (var ur in report.UsingRemovals.Where(u => u.File == file))
                 AddLineRange(ur.Line, ur.Line, text, starts, ranges);
             ApplyDeletions(file, text, ranges, ref regions);
         }
@@ -137,19 +134,20 @@ public static class Editor
                     $"sln \"{report.Solution}\" remove \"{pd.CsprojPath}\"")
                 { RedirectStandardOutput = true, RedirectStandardError = true };
                 using var proc = System.Diagnostics.Process.Start(psi);
-                proc?.WaitForExit(60_000);
+                proc?.WaitForExit(Constants.SlnRemoveTimeoutMs);
                 if (proc is { ExitCode: 0 }) log($"  removed {pd.Project} from the solution");
                 else log($"  WARNING: could not remove {pd.Project} from the solution automatically");
             }
-            catch (Exception e) { log($"  WARNING: dotnet sln remove failed for {pd.Project}: {e.Message}"); }
+            catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException or PlatformNotSupportedException)
+            {
+                log($"  WARNING: dotnet sln remove failed for {pd.Project}: {e.Message}");
+            }
             if (File.Exists(pd.CsprojPath)) { File.Delete(pd.CsprojPath); deletedFiles++; }
             TryRemoveProjectDirectory(pd.CsprojPath, log);
         }
 
-        log($"Deleted: {deletedFiles} file(s), {regions} code region(s)/reference(s), " +
-            $"{report.DeletableProjects.Count} project(s).");
-        log("Build the solution to verify. (Usings that would no longer compile were removed; " +
-            "merely-unused ones are left for IDE cleanup.)");
+        log($"Deleted: {deletedFiles} file(s), {regions} code region(s)/reference(s), {report.DeletableProjects.Count} project(s).");
+        log("Build the solution to verify. (Usings that would no longer compile were removed; merely-unused ones are left for IDE cleanup.)");
     }
 
     static void TryRemoveProjectDirectory(string csprojPath, Action<string> log)
@@ -171,12 +169,15 @@ public static class Editor
 
     // ----------------------------------------------------------- xml helpers
 
-    static bool IsPackageRefLine(string line, string package) =>
-        line.Contains("<PackageReference") && line.Contains($"Include=\"{package}\"");
+    static bool IsPackageRefLine(string line, string package)
+    {
+        return line.Contains("<PackageReference") && line.Contains($"Include=\"{package}\"");
+    }
 
-    static bool IsProjectRefLine(string line, string projectName) =>
-        line.Contains("<ProjectReference")
-        && line.Contains(projectName + ".csproj", StringComparison.OrdinalIgnoreCase);
+    static bool IsProjectRefLine(string line, string projectName)
+    {
+        return line.Contains("<ProjectReference") && line.Contains(projectName + ".csproj", StringComparison.OrdinalIgnoreCase);
+    }
 
     static bool MarkXmlLine(string file, Func<string, bool> match)
     {
@@ -187,9 +188,9 @@ public static class Editor
         for (int i = 0; i < lines.Count; i++)
         {
             if (!match(lines[i])) continue;
-            if (i > 0 && lines[i - 1].Trim().StartsWith("<!-- todo: to be deleted")) return false;
+            if (i > 0 && lines[i - 1].Trim().StartsWith(Constants.XmlMarkerPrefix)) return false;
             var indent = lines[i][..(lines[i].Length - lines[i].TrimStart().Length)];
-            lines.Insert(i, indent + XmlMarker);
+            lines.Insert(i, indent + Constants.XmlMarker);
             File.WriteAllText(file, string.Join(nl, lines) + (text.EndsWith("\n") ? nl : ""));
             return true;
         }
@@ -210,7 +211,7 @@ public static class Editor
             {
                 while (to < lines.Count - 1 && !lines[to].Contains(closingTag)) to++;
             }
-            if (from > 0 && lines[from - 1].Trim().StartsWith("<!-- todo: to be deleted")) from--;
+            if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix)) from--;
             lines.RemoveRange(from, to - from + 1);
             File.WriteAllText(file, string.Join(nl, lines) + (text.EndsWith("\n") ? nl : ""));
             return true;
@@ -228,7 +229,7 @@ public static class Editor
         if (s >= 2)
         {
             var above = text[starts[s - 2]..starts[s - 1]].TrimEnd('\r', '\n');
-            if (above.Trim().StartsWith(Marker)) s--;
+            if (above.Trim().StartsWith(Constants.Marker)) s--;
         }
         int startOffset = starts[s - 1];
         int endOffset = e < lineCount ? starts[e] : text.Length;
@@ -266,7 +267,10 @@ public static class Editor
         return result;
     }
 
-    static string Truncate(string s, int max) => s.Length <= max ? s : s[..(max - 3)] + "...";
+    static string Truncate(string s, int max)
+    {
+        return s.Length <= max ? s : s[..(max - 3)] + "...";
+    }
 
     static string FirstLine(string text)
     {
@@ -274,8 +278,10 @@ public static class Editor
         return idx < 0 ? text : text[..idx];
     }
 
-    static List<string> SplitLines(string text) =>
-        text.Replace("\r\n", "\n").Split('\n').ToList();
+    static List<string> SplitLines(string text)
+    {
+        return text.Replace("\r\n", "\n").Split('\n').ToList();
+    }
 
     static int[] LineStarts(string text)
     {

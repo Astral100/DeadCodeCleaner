@@ -2,7 +2,10 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 
 namespace DeadCodeCleaner;
 
@@ -13,6 +16,7 @@ public sealed class GraphBuilder
     readonly Action<string> _log;
     readonly List<(INamedTypeSymbol Type, bool IsTest)> _types = new();
     readonly HashSet<InvocationExpressionSyntax> _processedInvocations = new();
+    readonly HashSet<string> _solutionAssemblies = new(StringComparer.OrdinalIgnoreCase);
 
     public GraphBuilder(AnalyzerConfig config, Action<string> log)
     {
@@ -20,54 +24,7 @@ public sealed class GraphBuilder
         _log = log;
     }
 
-    static readonly HashSet<string> TestAttributeNames = new(StringComparer.Ordinal)
-    {
-        "Fact", "Theory", "Test", "TestMethod", "TestCase", "TestCaseSource", "SetUp", "TearDown",
-        "OneTimeSetUp", "OneTimeTearDown", "TestInitialize", "TestCleanup", "ClassInitialize",
-        "ClassCleanup", "AssemblyInitialize", "AssemblyCleanup", "TestFixture",
-    };
-
-    static readonly HashSet<string> ProdRootAttributeNames = new(StringComparer.Ordinal)
-    {
-        "FunctionName", "Function", "Benchmark", "GlobalSetup", "GlobalCleanup",
-    };
-
-    // Members kept while their type is in use: pattern-based language features and framework
-    // callbacks reference these without a resolvable identifier in syntax.
-    static readonly HashSet<string> KeepAliveMemberNames = new(StringComparer.Ordinal)
-    {
-        "GetEnumerator", "MoveNext", "Current", "GetAwaiter", "GetResult", "IsCompleted",
-        "OnCompleted", "UnsafeOnCompleted", "Deconstruct", "Dispose", "DisposeAsync", "Add",
-    };
-
-    // Implementing/inheriting these (matched by simple name) binds type-argument[Index] to the
-    // implementor: when the bound type is in use, the implementor is in use (MediatR handlers,
-    // FluentValidation validators).
-    static readonly (string Name, int ArgIndex, bool IsInterface)[] Binders =
-    {
-        ("IRequestHandler", 0, true), ("INotificationHandler", 0, true),
-        ("IStreamRequestHandler", 0, true), ("IRequestExceptionHandler", 0, true),
-        ("IRequestExceptionAction", 0, true),
-        ("AbstractValidator", 0, false), ("IValidator", 0, true),
-    };
-
-    static readonly HashSet<string> MsDiMethodNames = new(StringComparer.Ordinal)
-    {
-        "AddScoped", "AddTransient", "AddSingleton", "TryAddScoped", "TryAddTransient", "TryAddSingleton",
-    };
-
-    static readonly HashSet<string> AutofacChainContinuers = new(StringComparer.Ordinal)
-    {
-        "SingleInstance", "InstancePerLifetimeScope", "InstancePerDependency", "InstancePerRequest",
-        "InstancePerMatchingLifetimeScope", "InstancePerOwned", "ExternallyOwned", "OwnedByLifetimeScope",
-        "WithParameter", "WithParameters", "WithProperty", "Named", "Keyed", "PreserveExistingDefaults",
-        "IfNotRegistered", "AutoActivate", "PropertiesAutowired", "UsingConstructor", "OnActivating",
-        "OnActivated", "OnPreparing", "OnRelease",
-    };
-
-    readonly HashSet<string> _solutionAssemblies = new(StringComparer.OrdinalIgnoreCase);
-
-    public async Task<Graph> BuildAsync(Solution solution)
+    public async Task<Graph> Build(Solution solution)
     {
         var compilations = new List<(Compilation Comp, bool IsTest, string ProjectName)>();
         var seenProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -84,14 +41,11 @@ public sealed class GraphBuilder
             if (_graph.Projects.TryGetValue(project.Name, out var pinfo))
                 pinfo.AssemblyName = comp.Assembly.Name;
             var errors = comp.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
-            _log($"  {project.Name}: {project.DocumentIds.Count} documents, " +
-                 $"{comp.ExternalReferences.Length} references, {errors.Count} compile errors" +
-                 (isTest ? " [test]" : ""));
+            _log($"  {project.Name}: {project.DocumentIds.Count} documents, {comp.ExternalReferences.Length} references, {errors.Count} compile errors" + (isTest ? " [test]" : ""));
             if (errors.Count > 0)
             {
-                _graph.Warnings.Add($"{project.Name}: {errors.Count} compile errors — analysis may miss references " +
-                    $"(first: {errors[0].GetMessage()})");
-                foreach (var e in errors.Take(3)) _log($"      error: {e.GetMessage()}");
+                _graph.Warnings.Add($"{project.Name}: {errors.Count} compile errors — analysis may miss references (first: {errors[0].GetMessage()})");
+                foreach (var e in errors.Take(Constants.ShownCompileErrors)) _log($"      error: {e.GetMessage()}");
             }
         }
 
@@ -164,7 +118,7 @@ public sealed class GraphBuilder
         var info = new ProjectInfo { Name = project.Name, FilePath = project.FilePath };
         try
         {
-            var xml = System.Xml.Linq.XDocument.Load(project.FilePath);
+            var xml = XDocument.Load(project.FilePath);
             foreach (var el in xml.Descendants())
             {
                 var include = el.Attribute("Include")?.Value;
@@ -174,28 +128,24 @@ public sealed class GraphBuilder
                 else if (el.Name.LocalName == "ProjectReference")
                     info.ProjectReferences[Path.GetFileNameWithoutExtension(include)] = include;
             }
-            var assetsPath = Path.Combine(Path.GetDirectoryName(project.FilePath)!, "obj", "project.assets.json");
+            var assetsPath = Path.Combine(Path.GetDirectoryName(project.FilePath), "obj", "project.assets.json");
             if (File.Exists(assetsPath))
             {
-                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(assetsPath));
-                if (doc.RootElement.TryGetProperty("targets", out var targets))
+                var assets = JsonSerializer.Deserialize<ProjectAssetsFile>(File.ReadAllText(assetsPath), Constants.CaseInsensitiveJson);
+                foreach (var target in (assets?.Targets.Values ?? Enumerable.Empty<Dictionary<string, ProjectAssetsLibrary>>()).Take(1))
                 {
-                    foreach (var target in targets.EnumerateObject().Take(1))
+                    foreach (var (entryName, lib) in target)
                     {
-                        foreach (var entry in target.Value.EnumerateObject())
+                        var slash = entryName.IndexOf('/');
+                        if (slash <= 0 || lib.Compile == null) continue;
+                        var pkg = entryName[..slash];
+                        foreach (var libPath in lib.Compile.Keys)
                         {
-                            var slash = entry.Name.IndexOf('/');
-                            if (slash <= 0) continue;
-                            var pkg = entry.Name[..slash];
-                            if (!entry.Value.TryGetProperty("compile", out var compile)) continue;
-                            foreach (var lib in compile.EnumerateObject())
-                            {
-                                var file = Path.GetFileNameWithoutExtension(lib.Name);
-                                if (string.IsNullOrEmpty(file) || file == "_") continue;
-                                if (!info.PackageAssemblies.TryGetValue(pkg, out var list))
-                                    info.PackageAssemblies[pkg] = list = new List<string>();
-                                if (!list.Contains(file)) list.Add(file);
-                            }
+                            var file = Path.GetFileNameWithoutExtension(libPath);
+                            if (string.IsNullOrEmpty(file) || file == "_") continue;
+                            if (!info.PackageAssemblies.TryGetValue(pkg, out var list))
+                                info.PackageAssemblies[pkg] = list = new List<string>();
+                            if (!list.Contains(file)) list.Add(file);
                         }
                     }
                 }
@@ -204,21 +154,21 @@ public sealed class GraphBuilder
             {
                 _graph.Warnings.Add($"{project.Name}: no obj/project.assets.json (run restore) — package cleanup skipped for this project");
             }
-            if (File.Exists(Path.Combine(Path.GetDirectoryName(project.FilePath)!, "packages.config")))
+            if (File.Exists(Path.Combine(Path.GetDirectoryName(project.FilePath), "packages.config")))
                 _graph.Warnings.Add($"{project.Name}: uses packages.config — package cleanup not supported for it yet");
         }
-        catch (Exception e)
+        catch (Exception e) when (e is XmlException or JsonException or IOException or UnauthorizedAccessException)
         {
             _graph.Warnings.Add($"{project.Name}: could not read project facts ({e.Message})");
         }
         _graph.Projects[project.Name] = info;
     }
 
-    static bool IsTestProject(Project project)
+    bool IsTestProject(Project project)
     {
         var name = project.Name;
         if (name.EndsWith("Test") || name.EndsWith("Tests")
-            || Regex.IsMatch(name, @"(^|[._])Tests?([._]|$)") || name.Contains("TestCommon"))
+            || Regex.IsMatch(name, Constants.TestProjectNamePattern) || name.Contains("TestCommon"))
             return true;
         // Only DIRECT test-framework dependencies count: transitive flow through a shared
         // project reference must not turn a production project into a test project.
@@ -227,13 +177,14 @@ public sealed class GraphBuilder
             if (project.FilePath != null && File.Exists(project.FilePath))
             {
                 var text = File.ReadAllText(project.FilePath);
-                if (Regex.IsMatch(text, @"Include=""(xunit|nunit|NUnit|MSTest|Microsoft\.NET\.Test\.Sdk)", RegexOptions.IgnoreCase))
+                if (Regex.IsMatch(text, Constants.TestPackagePattern, RegexOptions.IgnoreCase))
                     return true;
                 if (text.Contains("<IsTestProject>true", StringComparison.OrdinalIgnoreCase))
                     return true;
             }
         }
-        catch { /* unreadable project file: treat as production */ }
+        catch (IOException) { /* unreadable project file: treat as production */ }
+        catch (UnauthorizedAccessException) { /* unreadable project file: treat as production */ }
         return false;
     }
 
@@ -268,7 +219,7 @@ public sealed class GraphBuilder
         }
     }
 
-    static IEnumerable<INamedTypeSymbol> AllSourceTypes(INamespaceSymbol ns)
+    IEnumerable<INamedTypeSymbol> AllSourceTypes(INamespaceSymbol ns)
     {
         foreach (var member in ns.GetMembers())
         {
@@ -293,7 +244,7 @@ public sealed class GraphBuilder
     }
 
     /// <summary>Node id when the symbol is a node of this graph, else null.</summary>
-    string? NodeId(ISymbol? symbol)
+    string NodeId(ISymbol symbol)
     {
         if (symbol == null) return null;
         var id = Graph.Id(symbol);
@@ -304,7 +255,7 @@ public sealed class GraphBuilder
 
     void AddStructuralRulesAndRoots(INamedTypeSymbol type, bool isTest)
     {
-        var typeId = Graph.Id(type)!;
+        var typeId = Graph.Id(type);
         var members = type.GetMembers();
         var one = new object[1] { typeId };
 
@@ -318,7 +269,7 @@ public sealed class GraphBuilder
                 bool keep = mm.MethodKind is MethodKind.StaticConstructor or MethodKind.Destructor
                         or MethodKind.UserDefinedOperator or MethodKind.Conversion
                     || (mm.MethodKind == MethodKind.Constructor && mm.Parameters.Length == 0)
-                    || (mm.DeclaredAccessibility == Accessibility.Public && KeepAliveMemberNames.Contains(mm.Name));
+                    || (mm.DeclaredAccessibility == Accessibility.Public && Constants.KeepAliveMemberNames.Contains(mm.Name));
                 if (keep) _graph.AddRule(one, new object[] { mId }, "kept with type");
             }
             else if (!_config.StrictMembers)
@@ -329,14 +280,14 @@ public sealed class GraphBuilder
                 if (keep) _graph.AddRule(one, new object[] { mId }, "public surface kept with type");
             }
             else if (m is IPropertySymbol kp && kp.DeclaredAccessibility == Accessibility.Public
-                     && KeepAliveMemberNames.Contains(kp.Name))
+                     && Constants.KeepAliveMemberNames.Contains(kp.Name))
             {
                 _graph.AddRule(one, new object[] { mId }, "kept with type");
             }
 
             // Override dispatch: the override is used whenever the overridden member is used on a
             // usable instance. External overridden member => keep with type.
-            ISymbol? overridden = m switch
+            ISymbol overridden = m switch
             {
                 IMethodSymbol om when om.IsOverride => om.OverriddenMethod,
                 IPropertySymbol op when op.IsOverride => op.OverriddenProperty,
@@ -368,7 +319,7 @@ public sealed class GraphBuilder
                 if (external)
                     _graph.AddRule(one, new object[] { implId }, "implements external interface");
                 else
-                    _graph.AddRule(new object[] { typeId, Graph.Id(im)! }, new object[] { implId }, "interface dispatch");
+                    _graph.AddRule(new object[] { typeId, Graph.Id(im) }, new object[] { implId }, "interface dispatch");
             }
         }
 
@@ -396,7 +347,7 @@ public sealed class GraphBuilder
                             .Select(r => r.GetSyntax())
                             .OfType<ConstructorDeclarationSyntax>()
                             .Any(c => c.Initializer != null);
-                        if (!hasInitializer) _graph.AddEdge(NodeId(ctor)!, baseCtorId);
+                        if (!hasInitializer) _graph.AddEdge(NodeId(ctor), baseCtorId);
                     }
                 }
             }
@@ -405,7 +356,7 @@ public sealed class GraphBuilder
         // Binders: MediatR handlers, validators — bound type in use => implementor in use.
         foreach (var iface in type.AllInterfaces)
         {
-            foreach (var (bname, argIndex, isInterface) in Binders)
+            foreach (var (bname, argIndex, isInterface) in Constants.Binders)
             {
                 if (!isInterface || iface.Name != bname || iface.TypeArguments.Length <= argIndex) continue;
                 BindTypeArgToImplementor(iface.TypeArguments[argIndex], type, iface, bname);
@@ -413,7 +364,7 @@ public sealed class GraphBuilder
         }
         for (var b = type.BaseType; b != null; b = b.BaseType)
         {
-            foreach (var (bname, argIndex, isInterface) in Binders)
+            foreach (var (bname, argIndex, isInterface) in Constants.Binders)
             {
                 if (isInterface || b.Name != bname || b.TypeArguments.Length <= argIndex) continue;
                 BindTypeArgToImplementor(b.TypeArguments[argIndex], type, b, bname);
@@ -426,11 +377,11 @@ public sealed class GraphBuilder
     void BindTypeArgToImplementor(ITypeSymbol arg, INamedTypeSymbol implementor, INamedTypeSymbol binder, string binderName)
     {
         if (NodeId(arg) is not { } argId) return;
-        var consequents = new List<object> { Graph.Id(implementor)! };
-        consequents.AddRange(implementor.InstanceConstructors.Select(NodeId).Where(id => id != null)!);
+        var consequents = new List<object> { Graph.Id(implementor) };
+        consequents.AddRange(implementor.InstanceConstructors.Select(NodeId).Where(id => id != null));
         // The framework dispatches through the binder's members (e.g. Handle): while a handler
         // exists, those members count as used even if no source calls them directly.
-        consequents.AddRange(binder.OriginalDefinition.GetMembers().Select(NodeId).Where(id => id != null)!);
+        consequents.AddRange(binder.OriginalDefinition.GetMembers().Select(NodeId).Where(id => id != null));
         _graph.AddRule(new object[] { argId }, consequents, $"{binderName} binding");
     }
 
@@ -481,8 +432,8 @@ public sealed class GraphBuilder
                 var an = attr.AttributeClass?.Name;
                 if (an == null) continue;
                 var shortName = an.EndsWith("Attribute") ? an[..^9] : an;
-                bool isTestAttr = TestAttributeNames.Contains(shortName);
-                bool isProdAttr = ProdRootAttributeNames.Contains(shortName);
+                bool isTestAttr = Constants.TestAttributeNames.Contains(shortName);
+                bool isProdAttr = Constants.ProdRootAttributeNames.Contains(shortName);
                 if (!isTestAttr && !isProdAttr) continue;
                 // Test-attributed members root the test world; others root production.
                 bool asTest = isTestAttr || isTest;
@@ -496,14 +447,14 @@ public sealed class GraphBuilder
         }
     }
 
-    static bool BaseChainHasName(INamedTypeSymbol type, params string[] names)
+    bool BaseChainHasName(INamedTypeSymbol type, params string[] names)
     {
         for (var b = type.BaseType; b != null; b = b.BaseType)
             if (names.Contains(b.Name)) return true;
         return false;
     }
 
-    static bool BaseChainHasExternalName(INamedTypeSymbol type, string name, string assemblyPrefix)
+    bool BaseChainHasExternalName(INamedTypeSymbol type, string name, string assemblyPrefix)
     {
         for (var b = type.BaseType; b != null; b = b.BaseType)
             if (b.Name == name && b.ContainingAssembly?.Name.StartsWith(assemblyPrefix) == true) return true;
@@ -594,7 +545,7 @@ public sealed class GraphBuilder
 
     void WalkFieldLike(VariableDeclarationSyntax decl, SyntaxList<AttributeListSyntax> attrs, SemanticModel model)
     {
-        string? first = null;
+        string first = null;
         foreach (var v in decl.Variables)
         {
             if (NodeId(model.GetDeclaredSymbol(v)) is not { } fId) continue;
@@ -653,7 +604,7 @@ public sealed class GraphBuilder
         }
     }
 
-    static bool InSkip(List<TextSpan>? spans, TextSpan span)
+    bool InSkip(List<TextSpan> spans, TextSpan span)
     {
         if (spans == null) return false;
         foreach (var s in spans) if (s.Contains(span)) return true;
@@ -666,13 +617,13 @@ public sealed class GraphBuilder
         foreach (var c in info.CandidateSymbols) AddEdgeTo(sourceId, c);
     }
 
-    void AddEdgeTo(string sourceId, ISymbol? target)
+    void AddEdgeTo(string sourceId, ISymbol target)
     {
         if (Normalize(target) is { } targetId) _graph.AddEdge(sourceId, targetId);
         else RecordExternal(sourceId, target);
     }
 
-    void RecordExternal(string sourceId, ISymbol? target)
+    void RecordExternal(string sourceId, ISymbol target)
     {
         if (target == null) return;
         if (target is IAliasSymbol alias) target = alias.Target;
@@ -684,7 +635,7 @@ public sealed class GraphBuilder
         _graph.AddExternalRef(sourceId, asm);
     }
 
-    string? Normalize(ISymbol? target)
+    string Normalize(ISymbol target)
     {
         if (target == null) return null;
         if (target is IAliasSymbol alias) target = alias.Target;
@@ -700,9 +651,9 @@ public sealed class GraphBuilder
 
     // --------------------------------------------- co-dependent statements
 
-    List<TextSpan>? MatchStatements(SyntaxNode subtree, string sourceId, SemanticModel model)
+    List<TextSpan> MatchStatements(SyntaxNode subtree, string sourceId, SemanticModel model)
     {
-        List<TextSpan>? skip = null;
+        List<TextSpan> skip = null;
         foreach (var inv in subtree.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>())
         {
             if (_processedInvocations.Contains(inv)) continue;
@@ -713,7 +664,7 @@ public sealed class GraphBuilder
 
             if (id == "CreateMap" && typeArgs is { Count: 2 })
                 HandleCreateMap(inv, typeArgs.Value, sourceId, model, ref skip);
-            else if (MsDiMethodNames.Contains(id))
+            else if (Constants.MsDiMethodNames.Contains(id))
                 HandleMsDi(inv, typeArgs, sourceId, model, ref skip);
             else if (id is "RegisterType" or "RegisterGeneric")
                 HandleAutofac(inv, typeArgs, sourceId, model, ref skip);
@@ -721,14 +672,17 @@ public sealed class GraphBuilder
         return skip;
     }
 
-    static SimpleNameSyntax? GetMethodName(InvocationExpressionSyntax inv) => inv.Expression switch
+    SimpleNameSyntax GetMethodName(InvocationExpressionSyntax inv)
     {
-        MemberAccessExpressionSyntax ma => ma.Name,
-        SimpleNameSyntax sn => sn,
-        _ => null,
-    };
+        return inv.Expression switch
+        {
+            MemberAccessExpressionSyntax ma => ma.Name,
+            SimpleNameSyntax sn => sn,
+            _ => null,
+        };
+    }
 
-    string? ResolveTypeNode(SyntaxNode typeSyntax, SemanticModel model)
+    string ResolveTypeNode(SyntaxNode typeSyntax, SemanticModel model)
     {
         var sym = model.GetSymbolInfo(typeSyntax).Symbol
                   ?? (typeSyntax is TypeSyntax ts ? model.GetTypeInfo(ts).Type : null);
@@ -737,10 +691,10 @@ public sealed class GraphBuilder
 
     StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember)
     {
-        var anchor = (SyntaxNode?)inv.FirstAncestorOrSelf<StatementSyntax>() ?? inv;
+        var anchor = (SyntaxNode)inv.FirstAncestorOrSelf<StatementSyntax>() ?? inv;
         var lines = anchor.GetLocation().GetLineSpan();
         var snippet = Regex.Replace(anchor.ToString(), @"\s+", " ").Trim();
-        if (snippet.Length > 160) snippet = snippet[..157] + "...";
+        if (snippet.Length > Constants.SnippetMaxLength) snippet = snippet[..(Constants.SnippetMaxLength - 3)] + "...";
         var stmt = new StatementNode
         {
             Kind = kind,
@@ -754,14 +708,13 @@ public sealed class GraphBuilder
         return stmt;
     }
 
-    static void AddSkip(ref List<TextSpan>? skip, TextSpan span)
+    void AddSkip(ref List<TextSpan> skip, TextSpan span)
     {
         skip ??= new List<TextSpan>();
         skip.Add(span);
     }
 
-    void HandleCreateMap(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax> typeArgs,
-        string sourceId, SemanticModel model, ref List<TextSpan>? skip)
+    void HandleCreateMap(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax> typeArgs, string sourceId, SemanticModel model, ref List<TextSpan> skip)
     {
         var involved = new List<string>();
         foreach (var ta in typeArgs)
@@ -782,7 +735,7 @@ public sealed class GraphBuilder
             var props = involved
                 .Select(t => _graph.Decl.TryGetValue(t, out var d) ? d as INamedTypeSymbol : null)
                 .Where(t => t != null)
-                .SelectMany(t => t!.GetMembers().OfType<IPropertySymbol>())
+                .SelectMany(t => t.GetMembers().OfType<IPropertySymbol>())
                 .Select(NodeId)
                 .Where(pid => pid != null)
                 .Cast<object>()
@@ -792,10 +745,9 @@ public sealed class GraphBuilder
         }
     }
 
-    void HandleMsDi(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax>? typeArgs,
-        string sourceId, SemanticModel model, ref List<TextSpan>? skip)
+    void HandleMsDi(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax>? typeArgs, string sourceId, SemanticModel model, ref List<TextSpan> skip)
     {
-        string? service = null, impl = null;
+        string service = null, impl = null;
         var spansToSkip = new List<TextSpan>();
         if (typeArgs is { Count: 2 })
         {
@@ -833,15 +785,14 @@ public sealed class GraphBuilder
         {
             var payload = new List<object> { impl };
             if (_graph.Decl.TryGetValue(impl, out var d) && d is INamedTypeSymbol it)
-                payload.AddRange(it.InstanceConstructors.Select(NodeId).Where(id => id != null)!);
+                payload.AddRange(it.InstanceConstructors.Select(NodeId).Where(id => id != null));
             _graph.AddRule(new object[] { stmt }, payload, "registration instantiates implementation");
         }
     }
 
-    void HandleAutofac(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax>? typeArgs,
-        string sourceId, SemanticModel model, ref List<TextSpan>? skip)
+    void HandleAutofac(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax>? typeArgs, string sourceId, SemanticModel model, ref List<TextSpan> skip)
     {
-        string? impl = null;
+        string impl = null;
         if (typeArgs is { Count: 1 })
         {
             impl = ResolveTypeNode(typeArgs.Value[0], model);
@@ -884,7 +835,7 @@ public sealed class GraphBuilder
                         if (NodeId(i) is { } iId) services.Add(iId);
                 }
             }
-            else if (!AutofacChainContinuers.Contains(mname)) break;
+            else if (!Constants.AutofacChainContinuers.Contains(mname)) break;
             _processedInvocations.Add(pInv);
             outermost = pInv;
             cur = pInv;
@@ -913,7 +864,7 @@ public sealed class GraphBuilder
         {
             var payload = new List<object> { impl };
             if (_graph.Decl.TryGetValue(impl, out var d2) && d2 is INamedTypeSymbol it2)
-                payload.AddRange(it2.InstanceConstructors.Select(NodeId).Where(id => id != null)!);
+                payload.AddRange(it2.InstanceConstructors.Select(NodeId).Where(id => id != null));
             _graph.AddRule(new object[] { stmt }, payload, "registration instantiates implementation");
         }
     }

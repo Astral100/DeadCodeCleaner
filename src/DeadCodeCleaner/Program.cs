@@ -1,4 +1,5 @@
 ﻿using Microsoft.Build.Locator;
+using System.Text.Json;
 
 namespace DeadCodeCleaner;
 
@@ -7,14 +8,15 @@ public static class Program
     public static async Task<int> Main(string[] args)
     {
         if (!MSBuildLocator.IsRegistered) MSBuildLocator.RegisterDefaults();
-        return await Run(args);
+        var exitCode = await Run(args);
+        return exitCode;
     }
 
     static async Task<int> Run(string[] args)
     {
         CliOptions opts;
         try { opts = Parse(args); }
-        catch (Exception e)
+        catch (ArgumentException e)
         {
             Console.Error.WriteLine("error: " + e.Message);
             PrintUsage();
@@ -24,9 +26,7 @@ public static class Program
         var config = new AnalyzerConfig { StrictMembers = opts.StrictMembers };
         if (opts.ConfigPath != null)
         {
-            var loaded = System.Text.Json.JsonSerializer.Deserialize<AnalyzerConfig>(
-                File.ReadAllText(opts.ConfigPath),
-                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            var loaded = JsonSerializer.Deserialize<AnalyzerConfig>(File.ReadAllText(opts.ConfigPath), Constants.CaseInsensitiveJson);
             if (loaded != null)
             {
                 loaded.StrictMembers |= opts.StrictMembers;
@@ -34,12 +34,12 @@ public static class Program
             }
         }
 
-        void Log(string msg) => Console.WriteLine(msg);
-        var engine = new Engine(opts, config, Log);
+        Action<string> log = Console.WriteLine;
+        var engine = new Engine(opts, config, log);
 
         try
         {
-            var (report, graph) = await engine.AnalyzeAsync();
+            var (report, graph) = await engine.Analyze();
 
             if (opts.Mode == "find")
             {
@@ -48,7 +48,7 @@ public static class Program
                     .Select(s => (Fqn: SymbolNames.Fqn(s), Symbol: s))
                     .Where(x => x.Fqn.Contains(needle, StringComparison.OrdinalIgnoreCase))
                     .OrderBy(x => x.Fqn, StringComparer.Ordinal)
-                    .Take(200)
+                    .Take(Constants.FindMatchLimit)
                     .ToList();
                 foreach (var (fqn, symbol) in matches)
                     Console.WriteLine($"{SymbolNames.Kind(symbol),-11} {fqn}");
@@ -57,16 +57,16 @@ public static class Program
             }
 
             ReportWriter.WriteConsole(report, opts.Verbose);
-            var jsonPath = opts.JsonPath ?? Path.Combine(Environment.CurrentDirectory, "deadcode-report.json");
+            var jsonPath = opts.JsonPath ?? Path.Combine(Environment.CurrentDirectory, Constants.DefaultReportFileName);
             ReportWriter.WriteJson(report, jsonPath);
 
             switch (opts.Mode)
             {
                 case "mark":
-                    Editor.Mark(report, Log);
+                    Editor.Mark(report, log);
                     break;
                 case "delete":
-                    Editor.Delete(report, Log);
+                    Editor.Delete(report, log);
                     break;
             }
             return 0;
@@ -91,7 +91,11 @@ public static class Program
         }
         for (; i < args.Length; i++)
         {
-            string Next() => ++i < args.Length ? args[i] : throw new ArgumentException($"missing value after {args[i - 1]}");
+            string Next()
+            {
+                if (++i < args.Length) return args[i];
+                throw new ArgumentException($"missing value after {args[i - 1]}");
+            }
             switch (args[i])
             {
                 case "--solution" or "-s": opts.SolutionPath = Path.GetFullPath(Next()); break;

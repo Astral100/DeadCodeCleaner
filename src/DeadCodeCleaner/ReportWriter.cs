@@ -7,16 +7,14 @@ public static class ReportWriter
 {
     public static void WriteConsole(DeletionReport report, bool verbose)
     {
-        int limit = verbose ? int.MaxValue : 100;
+        int limit = verbose ? int.MaxValue : Constants.ConsoleListLimit;
         Console.WriteLine();
         Console.WriteLine("================ DeadCodeCleaner report ================");
         Console.WriteLine($"Solution : {report.Solution}");
         Console.WriteLine($"Removing : {string.Join(", ", report.RemoveTargets)}");
         var s = report.Stats;
-        Console.WriteLine($"Graph    : {s.Nodes} symbols, {s.Edges} references, {s.Rules} rules; " +
-                          $"{s.ProductionRoots} production roots, {s.TestRoots} test roots");
-        Console.WriteLine($"In use   : {s.InUseBaseline} baseline -> {s.InUseAfterRemoval} after removal " +
-                          $"({s.AlreadyOrphanedBefore} were already orphaned before and are left untouched)");
+        Console.WriteLine($"Graph    : {s.Nodes} symbols, {s.Edges} references, {s.Rules} rules; {s.ProductionRoots} production roots, {s.TestRoots} test roots");
+        Console.WriteLine($"In use   : {s.InUseBaseline} baseline -> {s.InUseAfterRemoval} after removal ({s.AlreadyOrphanedBefore} were already orphaned before and are left untouched)");
 
         Section("Files deletable in full", report.DeletableFiles.Count);
         foreach (var f in report.DeletableFiles.Take(limit)) Console.WriteLine($"  {f}");

@@ -13,7 +13,7 @@ public class WidgetsController
         _svc = svc;
     }
 
-    public object? GetWidget()
+    public object GetWidget()
     {
         SharedService.WidgetCounter++;
         SharedService.WidgetOnlyA += SharedService.WidgetOnlyB;
@@ -22,15 +22,24 @@ public class WidgetsController
         return _mediator.Send(new GetWidgetQuery());
     }
 
-    public string GetSecondary() => SecondaryHelper.Compute();
+    public string GetSecondary()
+    {
+        return SecondaryHelper.Compute();
+    }
 
     // Overload with its own private dependency: removable individually by signature.
-    public string GetSecondary(int times) => OverloadHelper.Only() + times;
+    public string GetSecondary(int times)
+    {
+        return OverloadHelper.Only() + times;
+    }
 }
 
 public static class OverloadHelper
 {
-    public static string Only() => "o";
+    public static string Only()
+    {
+        return "o";
+    }
 }
 
 public class GadgetsController
@@ -42,10 +51,16 @@ public class GadgetsController
         _svc = svc;
     }
 
-    public string GetGadget() => SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter;
+    public string GetGadget()
+    {
+        return SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter;
+    }
 }
 
 public static class SecondaryHelper
 {
-    public static string Compute() => "s";
+    public static string Compute()
+    {
+        return "s";
+    }
 }

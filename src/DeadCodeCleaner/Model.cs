@@ -21,17 +21,23 @@ public sealed class Rule
 {
     public required object[] Antecedents { get; init; }
     public required object[] Consequents { get; init; }
-    public string? Note { get; init; }
+    public string Note { get; init; }
 }
 
 /// <summary>Equality for graph nodes: ids by value, statements by reference.</summary>
 public sealed class NodeComparer : IEqualityComparer<object>
 {
     public static readonly NodeComparer Instance = new();
-    bool IEqualityComparer<object>.Equals(object? x, object? y) =>
-        x is string a && y is string b ? string.Equals(a, b, StringComparison.Ordinal) : ReferenceEquals(x, y);
-    int IEqualityComparer<object>.GetHashCode(object o) =>
-        o is string s ? s.GetHashCode() : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o);
+
+    bool IEqualityComparer<object>.Equals(object x, object y)
+    {
+        return x is string a && y is string b ? a == b : ReferenceEquals(x, y);
+    }
+
+    int IEqualityComparer<object>.GetHashCode(object o)
+    {
+        return o is string s ? s.GetHashCode() : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o);
+    }
 }
 
 /// <summary>Dependency graph. Nodes are documentation-comment ids ("T:Ns.Type", "M:Ns.Type.M(...)"),
@@ -73,11 +79,14 @@ public sealed class Graph
     }
 
     /// <summary>Node id for a symbol, or null when the symbol kind has no stable id.</summary>
-    public static string? Id(ISymbol? symbol) => symbol?.OriginalDefinition.GetDocumentationCommentId();
+    public static string Id(ISymbol symbol)
+    {
+        return symbol?.OriginalDefinition.GetDocumentationCommentId();
+    }
 
     public void AddEdge(string from, string to)
     {
-        if (string.Equals(from, to, StringComparison.Ordinal)) return;
+        if (from == to) return;
         if (!Edges.TryGetValue(from, out var set))
             Edges[from] = set = new HashSet<string>(StringComparer.Ordinal);
         if (set.Add(to)) EdgeCount++;
@@ -89,7 +98,7 @@ public sealed class Graph
         if (target.Add(id) && !RootReasons.ContainsKey(id)) RootReasons[id] = reason;
     }
 
-    public void AddRule(IEnumerable<object> antecedents, IEnumerable<object> consequents, string? note = null)
+    public void AddRule(IEnumerable<object> antecedents, IEnumerable<object> consequents, string note = null)
     {
         var ants = antecedents.Distinct(NodeComparer.Instance).ToArray();
         var cons = consequents.ToArray();
@@ -121,6 +130,23 @@ public sealed class ProjectInfo
     public Dictionary<string, List<string>> PackageAssemblies { get; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
+/// <summary>Typed shape of obj/project.assets.json — only what package cleanup needs.</summary>
+public sealed class ProjectAssetsFile
+{
+    /// <summary>Target framework -> ("Package/Version" -> library facts).</summary>
+    public Dictionary<string, Dictionary<string, ProjectAssetsLibrary>> Targets { get; set; } = new();
+}
+
+public sealed class ProjectAssetsLibrary
+{
+    /// <summary>Compile-time assembly path -> item facts (only the keys are used).</summary>
+    public Dictionary<string, ProjectAssetsCompileItem> Compile { get; set; }
+}
+
+public sealed class ProjectAssetsCompileItem
+{
+}
+
 public sealed class AnalyzerConfig
 {
     /// <summary>FQN patterns ('*' wildcard) treated as entry points in both runs — never orphaned.</summary>
@@ -135,11 +161,11 @@ public sealed class AnalyzerConfig
 public sealed class CliOptions
 {
     public string Mode = "analyze";           // analyze | mark | delete | find
-    public string? SolutionPath;
+    public string SolutionPath;
     public List<string> RemoveTargets { get; } = new();
-    public string? FindSubstring;
-    public string? JsonPath;
-    public string? ConfigPath;
+    public string FindSubstring;
+    public string JsonPath;
+    public string ConfigPath;
     public bool Verbose;
     public bool StrictMembers;
 }

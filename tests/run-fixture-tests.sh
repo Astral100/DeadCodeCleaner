@@ -45,8 +45,8 @@ check "fully-dead shared declaration deleted (whole line)" \
     '[.symbols[] | select(.fqn=="Fixture.Domain.SharedService.WidgetOnlyA") | .parts | length] | index(1) != null'
 check "broken test class deleted" \
     '[.symbols[] | select(.category=="broken-test") | .fqn] | index("Fixture.Tests.WidgetsControllerTests") != null'
-check "mixed test flagged for review" \
-    '[.symbols[] | select(.fqn=="Fixture.Tests.MixedTests") | .review] | index(true) != null'
+check "mixed-reference test flagged for review" \
+    '[.symbols[] | select(.fqn=="Fixture.Tests.WidgetServiceTests") | .review] | index(true) != null'
 check "test helper cascade" \
     '[.symbols[] | select(.category=="orphaned-test-helper") | .fqn] | index("Fixture.Tests.TestData") != null'
 check "surviving test untouched" \

@@ -9,31 +9,52 @@ public class FactAttribute : Attribute { }
 public class WidgetsControllerTests
 {
     [Fact]
-    public void GetWidget_Works()
+    public void GetWidget_when_called_then_widget_is_returned()
     {
-        var controller = new WidgetsController(new Mediator(), new WidgetService());
-        controller.GetWidget();
+        // Arrange
         TestData.Seed();
+        var sut = new WidgetsController(new Mediator(), new WidgetService());
+
+        // Act
+        var actualWidget = sut.GetWidget();
+
+        // Assert
+        _ = actualWidget;
     }
 }
 
 public class SharedServiceTests
 {
     [Fact]
-    public void Prefix_Works()
+    public void Prefix_when_called_then_prefix_is_returned()
     {
-        _ = SharedService.Prefix();
+        // Arrange
+        var expectedPrefix = "shared:";
+
+        // Act
+        var actualPrefix = SharedService.Prefix();
+
+        // Assert
+        _ = expectedPrefix == actualPrefix;
     }
 }
 
-public class MixedTests
+public class WidgetServiceTests
 {
     // References dying code (WidgetService) AND surviving code (SharedService): must be deleted
     // but flagged for review.
     [Fact]
-    public void Mixed()
+    public void Describe_when_called_then_description_has_prefix()
     {
-        _ = SharedService.Prefix() + new WidgetService().Describe();
+        // Arrange
+        var expectedPrefix = SharedService.Prefix();
+        var sut = new WidgetService();
+
+        // Act
+        var actualDescription = sut.Describe();
+
+        // Assert
+        _ = actualDescription.StartsWith(expectedPrefix);
     }
 }
 

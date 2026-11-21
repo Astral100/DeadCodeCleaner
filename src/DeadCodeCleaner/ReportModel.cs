@@ -25,7 +25,7 @@ public sealed class SymbolDeletion
     public required List<SourcePart> Parts { get; init; }
     /// <summary>Set when a deleted test also references surviving production code — review before deleting.</summary>
     public bool Review { get; init; }
-    public string? ReviewNote { get; init; }
+    public string ReviewNote { get; init; }
     public bool InDeletableFile { get; set; }
 }
 

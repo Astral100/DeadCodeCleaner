@@ -14,7 +14,10 @@ public class GetWidgetHandler : IRequestHandler<GetWidgetQuery, WidgetDto>
 
 public class WidgetRepository
 {
-    public WidgetEntity Load() => new WidgetEntity { Id = 1, Name = "w" };
+    public WidgetEntity Load()
+    {
+        return new WidgetEntity { Id = 1, Name = "w" };
+    }
 }
 
 public class WidgetEntity
@@ -36,5 +39,8 @@ public interface IWidgetService
 
 public class WidgetService : IWidgetService
 {
-    public string Describe() => SharedService.Prefix() + "widget";
+    public string Describe()
+    {
+        return SharedService.Prefix() + "widget";
+    }
 }
