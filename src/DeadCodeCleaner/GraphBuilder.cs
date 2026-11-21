@@ -17,6 +17,16 @@ public sealed class GraphBuilder
     readonly List<(INamedTypeSymbol Type, bool IsTest)> _types = new();
     readonly HashSet<InvocationExpressionSyntax> _processedInvocations = new();
     readonly HashSet<string> _solutionAssemblies = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<SyntaxNode, AnchorInfo> _anchors = new();
+
+    /// <summary>Everything known about one anchor statement shared by tracked registrations: which
+    /// chain invocations the registrations claim as their own, and the statements on the anchor.</summary>
+    sealed class AnchorInfo
+    {
+        public StatementSyntax InnerStatement;
+        public HashSet<InvocationExpressionSyntax> Claimed { get; } = new();
+        public List<StatementNode> Statements { get; } = new();
+    }
 
     public GraphBuilder(AnalyzerConfig config, Action<string> log)
     {
@@ -80,7 +90,58 @@ public sealed class GraphBuilder
                 CollectUsings(comp, tree, projectName);
             }
         }
+
+        // Resolve ProjectReference names: a solution can display a project under a different name
+        // than its csproj file, so references are matched by resolved file path (filename fallback).
+        var byPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var byFileName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (pname, pinfo2) in _graph.Projects)
+        {
+            byPath.TryAdd(Path.GetFullPath(pinfo2.FilePath), pname);
+            byFileName.TryAdd(Path.GetFileNameWithoutExtension(pinfo2.FilePath), pname);
+        }
+        foreach (var pinfo2 in _graph.Projects.Values)
+        {
+            var resolved = new List<(string Name, string Include)>();
+            foreach (var (name, include) in pinfo2.ProjectReferences)
+            {
+                var full = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(pinfo2.FilePath) ?? "", include.Replace('\\', '/')));
+                var rname = byPath.TryGetValue(full, out var n1) ? n1 : byFileName.TryGetValue(name, out var n2) ? n2 : name;
+                resolved.Add((rname, include));
+            }
+            pinfo2.ProjectReferences.Clear();
+            foreach (var (name, include) in resolved) pinfo2.ProjectReferences[name] = include;
+        }
+
+        // Phase 4: whole-anchor safety. Deleting the whole anchor statement is only safe when it is
+        // a plain expression statement whose entire call chain is claimed by tracked registrations;
+        // anything else (return/var anchors, untracked chained calls) must survive partially.
+        foreach (var ai in _anchors.Values)
+        {
+            bool allowed = ai.InnerStatement is ExpressionStatementSyntax es
+                && TryGetChain(es.Expression, out var chain) && chain.All(ai.Claimed.Contains);
+            foreach (var s in ai.Statements) s.WholeAnchorAllowed = allowed && s.ManualReason == null;
+        }
         return _graph;
+    }
+
+    /// <summary>The top-level invocation chain of an expression statement ("a.B().C()" => [C, B]),
+    /// or false when the expression is not a plain receiver chain (assignment, cast, creation, ...).</summary>
+    bool TryGetChain(ExpressionSyntax expr, out List<InvocationExpressionSyntax> chain)
+    {
+        chain = new List<InvocationExpressionSyntax>();
+        var cur = expr;
+        while (true)
+        {
+            if (cur is InvocationExpressionSyntax inv)
+            {
+                chain.Add(inv);
+                if (inv.Expression is MemberAccessExpressionSyntax ma) { cur = ma.Expression; continue; }
+                return inv.Expression is SimpleNameSyntax;
+            }
+            if (cur is MemberAccessExpressionSyntax outer) { cur = outer.Expression; continue; }
+            return cur is IdentifierNameSyntax or ThisExpressionSyntax or BaseExpressionSyntax;
+        }
     }
 
     void CollectUsings(Compilation comp, SyntaxTree tree, string projectName)
@@ -101,6 +162,13 @@ public sealed class GraphBuilder
                 providers.Add(ta);
             }
             var lines = u.GetLocation().GetLineSpan();
+            // Char span for deletion: FullSpan minus leading #directives, same as declarations.
+            int spanStart = u.FullSpan.Start;
+            var leading = u.GetLeadingTrivia();
+            for (int ti = leading.Count - 1; ti >= 0; ti--)
+            {
+                if (leading[ti].IsDirective) { spanStart = leading[ti].FullSpan.End; break; }
+            }
             _graph.UsingRefs.Add(new UsingRef
             {
                 Project = projectName,
@@ -108,6 +176,8 @@ public sealed class GraphBuilder
                 Line = lines.StartLinePosition.Line + 1,
                 Namespace = u.Name.ToString(),
                 Providers = providers,
+                SpanStart = spanStart,
+                SpanLength = u.FullSpan.End - spanStart,
             });
         }
     }
@@ -206,13 +276,18 @@ public sealed class GraphBuilder
         foreach (var type in AllSourceTypes(comp.Assembly.GlobalNamespace))
         {
             if (Graph.Id(type) is not { } typeId) continue;
-            if (!_graph.Nodes.Add(typeId)) continue;
-            _graph.Decl[typeId] = type;
-            _graph.ProjectOf[typeId] = projectName;
-            if (type.ContainingType != null && Graph.Id(type.ContainingType) is { } outerId)
-                _graph.ContainerOf[typeId] = outerId;
-            _types.Add((type, isTest));
-            if (isTest) _graph.TestNodes.Add(typeId);
+            // A linked file compiles the same type into several projects: the first compilation owns
+            // the declaration facts, but every project records membership (for reference cleanup).
+            bool firstSeen = _graph.Nodes.Add(typeId);
+            _graph.AddNodeProject(typeId, projectName);
+            if (firstSeen)
+            {
+                _graph.Decl[typeId] = type;
+                if (type.ContainingType != null && Graph.Id(type.ContainingType) is { } outerId)
+                    _graph.ContainerOf[typeId] = outerId;
+                _types.Add((type, isTest));
+                if (isTest) _graph.TestNodes.Add(typeId);
+            }
             foreach (var m in type.GetMembers())
             {
                 if (m.IsImplicitlyDeclared) continue;
@@ -221,9 +296,10 @@ public sealed class GraphBuilder
                 if (m.Kind is not (SymbolKind.Method or SymbolKind.Property or SymbolKind.Field or SymbolKind.Event)) continue;
                 if (m.DeclaringSyntaxReferences.Length == 0) continue;
                 if (Graph.Id(m) is not { } mId) continue;
+                _graph.AddNodeProject(mId, projectName);
+                if (!firstSeen) continue;
                 _graph.Nodes.Add(mId);
                 _graph.Decl[mId] = m;
-                _graph.ProjectOf[mId] = projectName;
                 _graph.ContainerOf[mId] = typeId;
                 if (isTest) _graph.TestNodes.Add(mId);
             }
@@ -705,20 +781,26 @@ public sealed class GraphBuilder
         return sym is ITypeSymbol t ? NodeId(t) : null;
     }
 
-    StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember)
+    StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember, IEnumerable<InvocationExpressionSyntax> claimed, bool allowSegment = true)
     {
         var innerStatement = inv.FirstAncestorOrSelf<StatementSyntax>();
         SyntaxNode anchor = innerStatement ?? (SyntaxNode)inv;
-        bool manualOnly = false;
+        string manualReason = null;
+        // A registration inside a lambda (factory delegates, MapperConfiguration callbacks) cannot be
+        // deleted by span arithmetic without breaking the surrounding expression.
+        for (var a = inv.Parent; a != null && a != innerStatement; a = a.Parent)
+        {
+            if (a is AnonymousFunctionExpressionSyntax) { manualReason = "the registration sits inside a lambda"; break; }
+        }
         // A braceless embedded statement cannot be deleted alone: expand to the construct that
         // owns it (deleting "if (x) Register();" whole), or flag for manual action when an else
         // branch makes whole-construct deletion wrong.
-        while (innerStatement != null)
+        while (innerStatement != null && manualReason == null)
         {
             var parent = anchor.Parent;
             if (parent is IfStatementSyntax ifs && ifs.Statement == anchor)
             {
-                if (ifs.Else != null) { manualOnly = true; break; }
+                if (ifs.Else != null) { manualReason = "the registration sits in an if/else branch"; break; }
                 anchor = ifs;
             }
             else if (parent is ElseClauseSyntax ec && ec.Statement == anchor) { anchor = ec; break; }
@@ -738,7 +820,7 @@ public sealed class GraphBuilder
             if (leading[ti].IsDirective) { anchorStart = leading[ti].FullSpan.End; break; }
         }
         int segmentStart = -1, segmentLength = 0;
-        if (inv.Expression is MemberAccessExpressionSyntax chain)
+        if (allowSegment && inv.Expression is MemberAccessExpressionSyntax chain)
         {
             segmentStart = chain.Expression.Span.End;
             segmentLength = inv.Span.End - segmentStart;
@@ -758,9 +840,12 @@ public sealed class GraphBuilder
             AnchorLength = anchor.FullSpan.End - anchorStart,
             SegmentStart = segmentStart,
             SegmentLength = segmentLength,
-            ManualOnly = manualOnly,
+            ManualReason = manualReason,
         };
         _graph.Statements.Add(stmt);
+        if (!_anchors.TryGetValue(anchor, out var ai)) _anchors[anchor] = ai = new AnchorInfo { InnerStatement = innerStatement };
+        ai.Statements.Add(stmt);
+        foreach (var ci in claimed) ai.Claimed.Add(ci);
         return stmt;
     }
 
@@ -781,7 +866,16 @@ public sealed class GraphBuilder
         _processedInvocations.Add(inv);
         foreach (var ta in typeArgs) AddSkip(ref skip, ta.Span);
 
-        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId);
+        // The whole fluent chain hanging off CreateMap (ForMember, ReverseMap, ...) is map
+        // configuration: it lives and dies with the mapping, so the statement claims it.
+        var claimed = new List<InvocationExpressionSyntax> { inv };
+        var chainTop = (SyntaxNode)inv;
+        while (chainTop.Parent is MemberAccessExpressionSyntax cma && cma.Parent is InvocationExpressionSyntax cInv)
+        {
+            claimed.Add(cInv);
+            chainTop = cInv;
+        }
+        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed);
         var guards = new List<object> { sourceId };
         guards.AddRange(involved);
         _graph.AddRule(guards, new object[] { stmt }, "CreateMap in use iff both types in use");
@@ -831,7 +925,7 @@ public sealed class GraphBuilder
         _processedInvocations.Add(inv);
         foreach (var s in spansToSkip) AddSkip(ref skip, s);
 
-        var stmt = NewStatement("DI.Register", inv, sourceId);
+        var stmt = NewStatement("DI.Register", inv, sourceId, new[] { inv });
         var guards = new List<object> { sourceId };
         if (service != null) guards.Add(service);
         else if (impl != null) guards.Add(impl); // external service type: tie to the implementation
@@ -868,6 +962,7 @@ public sealed class GraphBuilder
 
         // Follow the fluent chain upward: .As<T>(), .AsSelf(), .AsImplementedInterfaces(), lifetimes.
         var services = new List<string>();
+        var claimed = new List<InvocationExpressionSyntax> { inv };
         bool asSelf = false, hasExternalService = false;
         var cur = inv;
         InvocationExpressionSyntax outermost = inv;
@@ -893,13 +988,16 @@ public sealed class GraphBuilder
             }
             else if (!Constants.AutofacChainContinuers.Contains(mname)) break;
             _processedInvocations.Add(pInv);
+            claimed.Add(pInv);
             outermost = pInv;
             cur = pInv;
         }
 
         if (impl == null && services.Count == 0) return;
 
-        var stmt = NewStatement("DI.Register", outermost, sourceId);
+        // No segment: a chain segment of the outermost call would delete only the lifetime call,
+        // not the registration, so a partially surviving anchor falls back to a manual warning.
+        var stmt = NewStatement("DI.Register", outermost, sourceId, claimed, allowSegment: false);
         if (services.Count > 0)
         {
             foreach (var s in services)

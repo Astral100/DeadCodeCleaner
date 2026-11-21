@@ -7,7 +7,8 @@ public static class Program
     public static void Main()
     {
         var services = new ServiceCollection();
-        services.AddScoped<IWidgetService, WidgetService>();
+        // Chained with an UNTRACKED call: deleting the registration must keep AddFixtureLogging().
+        services.AddScoped<IWidgetService, WidgetService>().AddFixtureLogging();
         services.AddScoped<IGadgetService, GadgetService>();
     }
 }
@@ -15,5 +16,13 @@ public static class Program
 // Name-based stand-in for Microsoft.Extensions.DependencyInjection.
 public class ServiceCollection
 {
-    public void AddScoped<TService, TImplementation>() where TImplementation : TService { }
+    public ServiceCollection AddScoped<TService, TImplementation>() where TImplementation : TService
+    {
+        return this;
+    }
+
+    public ServiceCollection AddFixtureLogging()
+    {
+        return this;
+    }
 }

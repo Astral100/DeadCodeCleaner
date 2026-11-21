@@ -5,6 +5,8 @@ set -u
 cd "$(dirname "$0")/.."
 
 REPORT=$(mktemp)
+SCRATCH=""
+trap 'rm -rf "$SCRATCH"; rm -f "$REPORT"' EXIT
 FAIL=0
 
 check() { # check <description> <jq filter that must output true>
@@ -61,6 +63,8 @@ check "gadget CreateMap NOT reported" \
     '[.statements[].snippet] | map(select(contains("GadgetEntity"))) | length == 0'
 check "DI registration reported" \
     '[.statements[] | select(.kind=="DI.Register") | .snippet] | map(select(contains("IWidgetService"))) | length == 1'
+check "chained registration is segment-only (untracked call survives)" \
+    '[.statements[] | select(.snippet|contains("IWidgetService")) | .wholeStatement] == [false]'
 check "Widgets.cs deletable in full" \
     '[.deletableFiles[]] | map(select(endswith("Widgets.cs"))) | length == 1'
 check "Controllers.cs NOT deletable" \
@@ -130,10 +134,22 @@ if ! grep -rq --include='*.cs' --include='*.csproj' "todo: to be deleted" "$SCRA
     pass "no markers left after delete"; else failx "no markers left after delete"; fi
 if [ ! -f "$SCRATCH/Fixture/Fixture.Domain/Widgets.cs" ]; then
     pass "Widgets.cs deleted"; else failx "Widgets.cs deleted"; fi
+if ! grep -q "IWidgetService" "$SCRATCH/Fixture/Fixture.Web/Program.cs"; then
+    pass "dead registration segment removed"; else failx "dead registration segment removed"; fi
+if grep -q "services.AddFixtureLogging();" "$SCRATCH/Fixture/Fixture.Web/Program.cs"; then
+    pass "untracked chained call survives delete"; else failx "untracked chained call survives delete"; fi
 if dotnet build "$SCRATCH/Fixture/Fixture.sln" > /dev/null 2>&1; then
     pass "solution builds after delete"; else failx "solution builds after delete"; fi
-rm -rf "$SCRATCH"
 
-rm -f "$REPORT"
+echo "== Case 6: removing a target that surviving code still uses warns loudly"
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution tests/Fixture/Fixture.sln \
+    --remove Fixture.Domain.SharedService --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+
+check "STILL REFERENCED warning emitted" \
+    '[.warnings[]] | map(select(startswith("STILL REFERENCED"))) | length >= 1'
+check "warning names a surviving referrer" \
+    '[.warnings[] | select(startswith("STILL REFERENCED"))] | map(select(contains("GadgetsController") or contains("GetGadget"))) | length >= 1'
+
 if [ "$FAIL" = 1 ]; then echo "RESULT: FAILURES PRESENT"; exit 1; fi
 echo "RESULT: all checks passed"

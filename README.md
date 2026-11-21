@@ -26,9 +26,12 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
 - **AutoMapper `CreateMap<A,B>()`** and **DI registrations** (`AddScoped/AddTransient/AddSingleton`,
   Autofac `RegisterType<T>().As<I>()` chains, `typeof` overloads) are *co-dependent statements*:
   they do not keep their types in use, but die when their types die — and are then reported as
-  individual statements to remove. In a fluent chain (`services.AddScoped<IA,A>().AddScoped<IB,B>()`)
-  only the dead call's segment is removed when the other survives; a registration that is the body
-  of a braceless `if`/loop takes the whole construct with it, and one inside an if/else branch is
+  individual statements to remove. The whole statement is deleted only when it is a plain expression
+  statement whose entire call chain belongs to dead registrations (AutoMapper's `ForMember`/
+  `ReverseMap` and Autofac's lifetime calls count as part of theirs); otherwise only the dead call's
+  chain segment is removed (`services.AddScoped<IA,A>().AddLogging()` keeps `AddLogging`, and
+  `return services.AddScoped<IA,A>();` keeps the `return`). A registration that is the body of a
+  braceless `if`/loop takes the whole construct with it; one inside an if/else branch or a lambda is
   reported as a warning for manual removal instead.
 - **Empty containers**: an AutoMapper profile or Autofac module whose every mapping/registration
   died (and that nothing surviving references) is deleted whole.
@@ -36,10 +39,13 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   surviving user was deleted is removed from the csproj; `using` directives that no assembly can
   satisfy any more are removed; a project whose every declaration is deleted is removed from the
   solution and its csproj deleted (directory too, when nothing but code remained). Transitive
-  reachability is respected for both kinds — a project reference is kept when surviving code
-  reaches another project only through it, and a package is kept when surviving code uses an
-  assembly that arrives only through that package's dependency closure (e.g. `EFCore` via
-  `EFCore.SqlServer`). "Already unused before" references stay, like symbols.
+  reachability is respected for both kinds and ACROSS projects — SDK-style references are
+  transitive, so a reference in project B is kept when a dependent project A reaches code or
+  package assemblies only through it (e.g. `EFCore` via `EFCore.SqlServer`, or A → B → C where
+  only A uses C). When no kept reference can cover a need (the only path ran through a deleted
+  project), a warning asks for a manual direct reference. "Already unused before" references
+  stay, like symbols. Removing a symbol that SURVIVING code still references cannot compile:
+  such targets are flagged with a `STILL REFERENCED` warning naming the referrers.
 
 ### Tests
 
@@ -75,9 +81,9 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 - `mark` and `delete` re-run the analysis, so they always operate on current file content; `mark`
   is idempotent, and `delete` removes marker comments along with the code. Whole-file deletions get
   one marker at the top of the file (or the file itself is deleted). Edits preserve each file's
-  encoding (BOMs; non-UTF-8 files are handled byte-preserving via Latin-1), never swallow a
-  `#region`/`#if` directive whose counterpart survives, and never delete a file whole when it also
-  carries global usings or assembly attributes.
+  encoding (BOMs; non-UTF-8 files are handled byte-preserving via Latin-1) and every untouched
+  line's own line ending, never swallow a `#region`/`#if` directive whose counterpart survives,
+  and never delete a file whole when it also carries global usings or assembly attributes.
 - `--config cfg.json` supports `{ "keep": ["Ns.Something*", ...], "strictMembers": false }` —
   `keep` patterns are extra entry points that are never orphaned (use for reflection-only code).
 - By default, public properties and enum members of in-use types are kept (serializers and model
@@ -99,6 +105,7 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 
 ## Tests
 
-`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (46 checks covering
+`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (51 checks covering
 MediatR, AutoMapper, DI, test poisoning, pre-existing orphans, member-level and overload-level
-removal, project-reference cleanup, mark idempotency, and a delete round-trip that must rebuild).
+removal, project-reference cleanup, chain-segment deletion that preserves untracked calls, the
+still-referenced warning, mark idempotency, and a delete round-trip that must rebuild).

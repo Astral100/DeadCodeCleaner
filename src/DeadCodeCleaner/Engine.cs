@@ -64,6 +64,26 @@ public sealed class Engine
             if (r1.Contains(n) && !r2.Contains(n)) orphanProd.Add(n);
         }
 
+        // Surviving code that references a removal target cannot compile after the deletion: warn
+        // loudly, because the cascade only covers code that DIES with the targets.
+        var stillReferenced = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var (src, outs) in graph.Edges)
+        {
+            if (!r2.Contains(src)) continue;
+            foreach (var t in outs)
+            {
+                if (!removed.Contains(t)) continue;
+                if (!stillReferenced.TryGetValue(t, out var list)) stillReferenced[t] = list = new List<string>();
+                list.Add(src);
+            }
+        }
+        foreach (var (target, sources) in stillReferenced.OrderBy(kv => FqnOf(graph, kv.Key), StringComparer.Ordinal))
+        {
+            var shown = sources.Select(s => FqnOf(graph, s)).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+            var more = shown.Count > Constants.ShownSurvivingRefs ? $" (+{shown.Count - Constants.ShownSurvivingRefs} more)" : "";
+            report.Warnings.Add($"STILL REFERENCED: removing {FqnOf(graph, target)} breaks surviving code — the build will fail: {string.Join(", ", shown.Take(Constants.ShownSurvivingRefs))}{more}");
+        }
+
         // Poison: any code that is not in use after the removal (tests, and pre-existing orphans)
         // but references deleted code can no longer compile — it is deleted too, transitively.
         _log("Propagating into tests and pre-existing orphans ...");
@@ -204,16 +224,20 @@ public sealed class Engine
             .GroupBy(s => s.FilePath + "#" + s.AnchorStart, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
         var emittedWholeSpans = new HashSet<string>(StringComparer.Ordinal);
+        void WarnOnce(string msg)
+        {
+            if (!report.Warnings.Contains(msg)) report.Warnings.Add(msg);
+        }
         foreach (var stmt in deadStmts)
         {
             if (allDead.Contains(stmt.ContainingMember) || HasDeadContainer(graph, stmt.ContainingMember, allDead)) continue;
-            if (stmt.ManualOnly)
+            if (stmt.ManualReason != null)
             {
-                report.Warnings.Add($"manual: {stmt.FilePath}:{stmt.StartLine} — registration sits in an if/else branch; delete it manually: {stmt.Snippet}");
+                WarnOnce($"manual: {stmt.FilePath}:{stmt.StartLine} — {stmt.ManualReason}; delete it manually: {stmt.Snippet}");
                 continue;
             }
             var siblings = stmtsByAnchor[stmt.FilePath + "#" + stmt.AnchorStart];
-            bool whole = siblings.All(deadStmts.Contains);
+            bool whole = stmt.WholeAnchorAllowed && siblings.All(deadStmts.Contains);
             int spanStart, spanLength;
             if (whole)
             {
@@ -228,7 +252,7 @@ public sealed class Engine
             }
             else
             {
-                report.Warnings.Add($"manual: {stmt.FilePath}:{stmt.StartLine} — shares a statement with a surviving registration; delete it manually: {stmt.Snippet}");
+                WarnOnce($"manual: {stmt.FilePath}:{stmt.StartLine} — the containing statement must partially survive; delete this call manually: {stmt.Snippet}");
                 continue;
             }
             report.Statements.Add(new StatementDeletion
@@ -270,10 +294,12 @@ public sealed class Engine
             }
             report.DeletableFiles.Add(f);
         }
+        // Membership checks are case-insensitive: linked files can carry different path casings.
+        var deletableFileSet = new HashSet<string>(report.DeletableFiles, StringComparer.OrdinalIgnoreCase);
         foreach (var sym in report.Symbols)
-            sym.InDeletableFile = sym.Parts.All(p => report.DeletableFiles.Contains(p.File));
+            sym.InDeletableFile = sym.Parts.All(p => deletableFileSet.Contains(p.File));
 
-        ComputeProjectCleanup(graph, report, allDead, keptInPlace);
+        ComputeProjectCleanup(graph, report, allDead, keptInPlace, deletableFileSet);
 
         report.Stats = new ReportStats
         {
@@ -289,21 +315,6 @@ public sealed class Engine
                 !graph.TestNodes.Contains(n) && !r1.Contains(n) && !rt1.Contains(n)),
         };
         return report;
-    }
-
-    HashSet<string> ProjectClosure(Graph graph, IEnumerable<string> roots, HashSet<string> excluded)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var queue = new Queue<string>(roots.Where(r => !excluded.Contains(r)));
-        while (queue.Count > 0)
-        {
-            var p = queue.Dequeue();
-            if (!seen.Add(p)) continue;
-            if (graph.Projects.TryGetValue(p, out var pi))
-                foreach (var r in pi.ProjectReferences.Keys)
-                    if (!excluded.Contains(r)) queue.Enqueue(r);
-        }
-        return seen;
     }
 
     string FqnOf(Graph graph, string id)
@@ -397,12 +408,21 @@ public sealed class Engine
 
     /// <summary>Packages, project references and whole projects that lose their last surviving
     /// user. "Already unused before" stays, matching the symbol-level policy: a reference is only
-    /// removed when deleted code used it and no surviving code does.</summary>
-    void ComputeProjectCleanup(Graph graph, DeletionReport report, HashSet<string> allDead, HashSet<string> keptInPlace)
+    /// removed when deleted code used it and no surviving code does. SDK-style references are
+    /// transitive, so a removal in one project must not strand a DEPENDENT project either: a global
+    /// repair loop restores candidates until every surviving need stays reachable in the final
+    /// reference graph.</summary>
+    void ComputeProjectCleanup(Graph graph, DeletionReport report, HashSet<string> allDead, HashSet<string> keptInPlace, HashSet<string> deletableFiles)
     {
-        var nodesByProject = graph.ProjectOf
-            .GroupBy(kv => kv.Value, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.Select(kv => kv.Key).ToList(), StringComparer.OrdinalIgnoreCase);
+        var nodesByProject = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (node, projects) in graph.ProjectsOf)
+        {
+            foreach (var p in projects)
+            {
+                if (!nodesByProject.TryGetValue(p, out var list)) nodesByProject[p] = list = new List<string>();
+                list.Add(node);
+            }
+        }
 
         bool Stays(string n)
         {
@@ -440,122 +460,209 @@ public sealed class Engine
             report.DeletableProjects.Add(new ProjectDeletion { Project = pname, CsprojPath = pi.FilePath });
         }
 
-        foreach (var (pname, pi) in graph.Projects)
+        // Per-project usage facts. A "need" is a group of projects that declare one referenced node
+        // (several for linked files): it is satisfied while ANY of them stays reachable.
+        var survivingExt = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var deadExt = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var survivingProjRefs = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var deadProjRefs = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var survivingNeeds = new Dictionary<string, List<string[]>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pname in graph.Projects.Keys)
         {
-            if (deletableProjects.Contains(pname)) continue; // the whole project goes
+            var se = survivingExt[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var de = deadExt[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sp = survivingProjRefs[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var dp = deadProjRefs[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var needs = survivingNeeds[pname] = new List<string[]>();
+            var needKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var nodeIds = nodesByProject.TryGetValue(pname, out var ids) ? ids : new List<string>();
-            var survivingExt = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var deadExt = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var survivingProjRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var deadProjRefs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var n in nodeIds)
             {
                 bool stays = Stays(n);
-                if (graph.ExternalRefs.TryGetValue(n, out var ext))
-                    (stays ? survivingExt : deadExt).UnionWith(ext);
+                if (graph.ExternalRefs.TryGetValue(n, out var ext)) (stays ? se : de).UnionWith(ext);
                 if (graph.Edges.TryGetValue(n, out var outs))
                 {
                     foreach (var t in outs)
-                        if (graph.ProjectOf.TryGetValue(t, out var tp) && tp != pname)
-                            (stays ? survivingProjRefs : deadProjRefs).Add(tp);
+                    {
+                        if (!graph.ProjectsOf.TryGetValue(t, out var tps) || tps.Contains(pname)) continue;
+                        if (stays)
+                        {
+                            var group = tps.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+                            if (needKeys.Add(string.Join("|", group))) needs.Add(group);
+                            sp.UnionWith(group);
+                        }
+                        else dp.UnionWith(tps);
+                    }
                 }
             }
-            var pkgCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        // Initial removal candidates from each project's own usage.
+        var pkgCandidates = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var refCandidates = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (pname, pi) in graph.Projects)
+        {
+            var pc = pkgCandidates[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var rc = refCandidates[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (deletableProjects.Contains(pname)) continue; // the whole project goes
             foreach (var pkg in pi.PackageReferences)
             {
                 if (!pi.PackageAssemblies.TryGetValue(pkg, out var asms) || asms.Count == 0) continue; // unknown: keep
-                bool usedBySurviving = asms.Any(survivingExt.Contains);
-                bool usedByDead = asms.Any(deadExt.Contains);
-                if (!usedBySurviving && usedByDead) pkgCandidates.Add(pkg);
+                bool usedBySurviving = asms.Any(survivingExt[pname].Contains);
+                bool usedByDead = asms.Any(deadExt[pname].Contains);
+                if (!usedBySurviving && usedByDead) pc.Add(pkg);
             }
-            // Transitive repair: surviving code may use an assembly that arrives only through a
-            // candidate's dependency closure (e.g. EFCore via EFCore.SqlServer) — keep that candidate.
-            if (pkgCandidates.Count > 0)
-            {
-                var providedByAll = PackageClosureAssemblies(pi, pi.PackageReferences);
-                var survivingNeeded = survivingExt.Where(providedByAll.Contains).ToList();
-                while (pkgCandidates.Count > 0)
-                {
-                    var remaining = PackageClosureAssemblies(pi, pi.PackageReferences.Where(x => !pkgCandidates.Contains(x)));
-                    var missing = survivingNeeded.Where(a => !remaining.Contains(a)).ToList();
-                    if (missing.Count == 0) break;
-                    bool pkgRepaired = false;
-                    foreach (var c in pkgCandidates.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
-                    {
-                        var provides = PackageClosureAssemblies(pi, new[] { c });
-                        if (missing.Any(provides.Contains)) { pkgCandidates.Remove(c); pkgRepaired = true; break; }
-                    }
-                    if (!pkgRepaired) break;
-                }
-            }
-            foreach (var pkg in pi.PackageReferences.Where(pkgCandidates.Contains))
-                report.PackageRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = pkg });
-            // Project references: candidates by direct usage, then repaired so that projects the
-            // surviving code reaches only TRANSITIVELY (through a removed reference) stay reachable.
-            var direct = pi.ProjectReferences.Keys.ToList();
-            var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var refName in direct)
+            foreach (var refName in pi.ProjectReferences.Keys)
             {
                 bool targetDeleted = deletableProjects.Contains(refName);
-                bool usedBySurviving = survivingProjRefs.Contains(refName);
-                bool usedByDead = deadProjRefs.Contains(refName);
-                if (targetDeleted || (!usedBySurviving && usedByDead)) candidates.Add(refName);
+                bool usedBySurviving = survivingProjRefs[pname].Contains(refName);
+                bool usedByDead = deadProjRefs[pname].Contains(refName);
+                if (targetDeleted || (!usedBySurviving && usedByDead)) rc.Add(refName);
             }
-            while (candidates.Count > 0)
+        }
+
+        IEnumerable<string> OriginalRefs(string p)
+        {
+            return graph.Projects.TryGetValue(p, out var pi) ? pi.ProjectReferences.Keys : Enumerable.Empty<string>();
+        }
+        IEnumerable<string> FinalRefs(string p)
+        {
+            var rc = refCandidates.TryGetValue(p, out var c) ? c : null;
+            return OriginalRefs(p).Where(r => rc == null || !rc.Contains(r));
+        }
+        HashSet<string> Reach(string root, Func<string, IEnumerable<string>> refsOf, bool excludeDeletable)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<string>();
+            queue.Enqueue(root);
+            while (queue.Count > 0)
             {
-                var reachable = ProjectClosure(graph, direct.Where(d => !candidates.Contains(d)), deletableProjects);
-                var missing = survivingProjRefs
-                    .Where(n => !reachable.Contains(n) && !deletableProjects.Contains(n)).ToList();
-                if (missing.Count == 0) break;
-                bool repaired = false;
-                foreach (var c in candidates.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
-                {
-                    var cClosure = ProjectClosure(graph, new[] { c }, deletableProjects);
-                    if (missing.Any(cClosure.Contains)) { candidates.Remove(c); repaired = true; break; }
-                }
-                if (!repaired) break;
+                var p = queue.Dequeue();
+                if (excludeDeletable && deletableProjects.Contains(p)) continue;
+                if (!seen.Add(p)) continue;
+                foreach (var r in refsOf(p)) queue.Enqueue(r);
             }
-            foreach (var c in candidates.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
-                report.ProjectRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = c });
+            return seen;
+        }
+        HashSet<string> ProvidedAssemblies(IEnumerable<string> projects, bool final)
+        {
+            var asms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var q in projects)
+            {
+                if (!graph.Projects.TryGetValue(q, out var qi)) continue;
+                var pc = final && pkgCandidates.TryGetValue(q, out var c) ? c : null;
+                asms.UnionWith(PackageClosureAssemblies(qi, qi.PackageReferences.Where(x => pc == null || !pc.Contains(x))));
+            }
+            return asms;
+        }
+        bool RestoreRefToward(HashSet<string> fromReach, string needed)
+        {
+            foreach (var q in fromReach.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!refCandidates.TryGetValue(q, out var rc)) continue;
+                foreach (var c in rc.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (Reach(c, OriginalRefs, excludeDeletable: true).Contains(needed)) { rc.Remove(c); return true; }
+                }
+            }
+            return false;
+        }
+        bool RestoreForAssembly(HashSet<string> fromReach, string asm)
+        {
+            foreach (var q in fromReach.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!graph.Projects.TryGetValue(q, out var qi) || !pkgCandidates.TryGetValue(q, out var pc)) continue;
+                foreach (var pkg in pc.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (PackageClosureAssemblies(qi, new[] { pkg }).Contains(asm)) { pc.Remove(pkg); return true; }
+                }
+            }
+            // A removed project reference may have carried the needed package transitively.
+            foreach (var q in fromReach.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!refCandidates.TryGetValue(q, out var rc)) continue;
+                foreach (var c in rc.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    var subtree = Reach(c, OriginalRefs, excludeDeletable: true);
+                    if (ProvidedAssemblies(subtree, final: false).Contains(asm)) { rc.Remove(c); return true; }
+                }
+            }
+            return false;
+        }
+
+        // Global repair: restore candidates (one per pass) until every project's surviving needs —
+        // referenced projects and package-provided assemblies — stay reachable in the final graph.
+        var unresolvable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        bool restored = true;
+        while (restored)
+        {
+            restored = false;
+            foreach (var pname in graph.Projects.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                if (deletableProjects.Contains(pname)) continue;
+                var reach = Reach(pname, FinalRefs, excludeDeletable: true);
+                foreach (var group in survivingNeeds[pname])
+                {
+                    var alive = group.Where(g => !deletableProjects.Contains(g)).ToList();
+                    if (alive.Count == 0 || alive.Any(reach.Contains)) continue;
+                    var key = pname + " -> " + string.Join("|", group);
+                    if (unresolvable.Contains(key)) continue;
+                    if (alive.Any(t => RestoreRefToward(reach, t))) { restored = true; break; }
+                    unresolvable.Add(key);
+                    report.Warnings.Add($"{pname}: surviving code uses project {alive[0]}, which is no longer reachable after cleanup — add a direct ProjectReference manually");
+                }
+                if (restored) break;
+                var providedBefore = ProvidedAssemblies(Reach(pname, OriginalRefs, excludeDeletable: false), final: false);
+                var providedAfter = ProvidedAssemblies(reach, final: true);
+                foreach (var a in survivingExt[pname].OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (!providedBefore.Contains(a) || providedAfter.Contains(a)) continue;
+                    var key = pname + " !asm " + a;
+                    if (unresolvable.Contains(key)) continue;
+                    if (RestoreForAssembly(reach, a)) { restored = true; break; }
+                    unresolvable.Add(key);
+                    report.Warnings.Add($"{pname}: surviving code uses assembly {a}, which no remaining package provides after cleanup — check manually");
+                }
+                if (restored) break;
+            }
+        }
+
+        foreach (var (pname, pi) in graph.Projects.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            if (deletableProjects.Contains(pname)) continue;
+            foreach (var pkg in pi.PackageReferences.Where(pkgCandidates[pname].Contains))
+                report.PackageRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = pkg });
+            foreach (var c in refCandidates[pname].OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                var file = pi.ProjectReferences.TryGetValue(c, out var include) ? Path.GetFileName(include.Replace('\\', '/')) : c + ".csproj";
+                report.ProjectRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = c, ReferenceFile = file });
+            }
         }
 
         // Using directives that lose every assembly able to satisfy them become compile errors:
-        // remove them with the references.
+        // remove them with the references. Every project is checked — a closure can shrink because
+        // a DOWNSTREAM project's reference was removed, not only its own.
         var goneByProject = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-        var removedRefsByProject = report.ProjectRefRemovals
-            .GroupBy(r => r.Project, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.Select(r => r.Reference).ToHashSet(StringComparer.OrdinalIgnoreCase),
-                StringComparer.OrdinalIgnoreCase);
-        var removedPkgsByProject = report.PackageRefRemovals
-            .GroupBy(r => r.Project, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.Select(r => r.Reference).ToList(), StringComparer.OrdinalIgnoreCase);
-        foreach (var pname in removedRefsByProject.Keys.Concat(removedPkgsByProject.Keys).Distinct(StringComparer.OrdinalIgnoreCase))
+        foreach (var (pname, pi) in graph.Projects)
         {
-            if (!graph.Projects.TryGetValue(pname, out var pi)) continue;
+            if (deletableProjects.Contains(pname)) continue;
+            var originalProjects = Reach(pname, OriginalRefs, excludeDeletable: false);
+            var finalProjects = Reach(pname, FinalRefs, excludeDeletable: true);
             var gone = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var direct = pi.ProjectReferences.Keys.ToList();
-            var removedR = removedRefsByProject.TryGetValue(pname, out var rr) ? rr : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var original = ProjectClosure(graph, direct, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
-            var final = ProjectClosure(graph, direct.Where(d => !removedR.Contains(d)), deletableProjects);
-            foreach (var lostProject in original.Where(o => !final.Contains(o)))
-                if (graph.Projects.TryGetValue(lostProject, out var lp) && lp.AssemblyName.Length > 0)
-                    gone.Add(lp.AssemblyName);
-            if (removedPkgsByProject.TryGetValue(pname, out var pkgs))
-            {
-                var removedSet = new HashSet<string>(pkgs, StringComparer.OrdinalIgnoreCase);
-                var before = PackageClosureAssemblies(pi, pi.PackageReferences);
-                var after = PackageClosureAssemblies(pi, pi.PackageReferences.Where(x => !removedSet.Contains(x)));
-                gone.UnionWith(before.Where(a => !after.Contains(a)));
-            }
+            foreach (var lost in originalProjects.Where(o => !finalProjects.Contains(o)))
+                if (graph.Projects.TryGetValue(lost, out var lp) && lp.AssemblyName.Length > 0) gone.Add(lp.AssemblyName);
+            var before = ProvidedAssemblies(originalProjects, final: false);
+            var after = ProvidedAssemblies(finalProjects, final: true);
+            gone.UnionWith(before.Where(a => !after.Contains(a)));
             if (gone.Count > 0) goneByProject[pname] = gone;
         }
         foreach (var u in graph.UsingRefs)
         {
             if (!goneByProject.TryGetValue(u.Project, out var gone)) continue;
-            if (report.DeletableFiles.Contains(u.File)) continue;
+            if (deletableFiles.Contains(u.File)) continue;
             if (u.Providers.Count == 0) continue;
             if (u.Providers.All(gone.Contains))
-                report.UsingRemovals.Add(new UsingRemoval { File = u.File, Line = u.Line, Namespace = u.Namespace });
+                report.UsingRemovals.Add(new UsingRemoval { File = u.File, Line = u.Line, Namespace = u.Namespace, SpanStart = u.SpanStart, SpanLength = u.SpanLength });
         }
         report.UsingRemovals.Sort((a, b) => string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.Line.CompareTo(b.Line));
         report.DeletableProjects.Sort((a, b) => string.CompareOrdinal(a.Project, b.Project));

@@ -51,6 +51,9 @@ public sealed class UsingRemoval
     public required string File { get; init; }
     public required int Line { get; init; }
     public required string Namespace { get; init; }
+    /// <summary>Char range to delete (the directive with its leading trivia, minus leading #directives).</summary>
+    public required int SpanStart { get; init; }
+    public required int SpanLength { get; init; }
 }
 
 /// <summary>A PackageReference or ProjectReference that loses its last surviving user.</summary>
@@ -60,6 +63,9 @@ public sealed class ReferenceRemoval
     public required string CsprojPath { get; init; }
     /// <summary>Package name, or referenced project name.</summary>
     public required string Reference { get; init; }
+    /// <summary>For project references: the referenced csproj file name as written in the Include
+    /// attribute (a solution can display the project under a different name). Null for packages.</summary>
+    public string ReferenceFile { get; init; }
 }
 
 public sealed class StatementDeletion

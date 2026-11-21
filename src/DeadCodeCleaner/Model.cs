@@ -21,8 +21,12 @@ public sealed class StatementNode
     /// the call has no member-access receiver. Used when siblings on the same statement survive.</summary>
     public required int SegmentStart { get; init; }
     public required int SegmentLength { get; init; }
-    /// <summary>True when automatic deletion is unsafe (the statement is an if-branch with an else).</summary>
-    public required bool ManualOnly { get; init; }
+    /// <summary>Why automatic deletion is unsafe (if/else branch, inside a lambda), or null when it is safe.</summary>
+    public string ManualReason { get; init; }
+    /// <summary>True when deleting the whole anchor is safe: the anchor is an expression statement whose
+    /// entire call chain consists of tracked registrations and their chain continuations. Set in a
+    /// post-pass once every statement on the anchor is known.</summary>
+    public bool WholeAnchorAllowed { get; set; }
 }
 
 /// <summary>Conjunctive implication: when ALL antecedents are in use, all consequents become in use.
@@ -73,8 +77,8 @@ public sealed class Graph
     public List<string> Warnings { get; } = new();
     /// <summary>Node id -> external (out-of-solution) assembly names it references.</summary>
     public Dictionary<string, HashSet<string>> ExternalRefs { get; } = new(StringComparer.Ordinal);
-    /// <summary>Node id -> name of the project that declares it.</summary>
-    public Dictionary<string, string> ProjectOf { get; } = new(StringComparer.Ordinal);
+    /// <summary>Node id -> names of the projects that compile it (more than one for linked files).</summary>
+    public Dictionary<string, HashSet<string>> ProjectsOf { get; } = new(StringComparer.Ordinal);
     /// <summary>Project name -> csproj facts.</summary>
     public Dictionary<string, ProjectInfo> Projects { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Every using directive in the solution, with its provider assemblies.</summary>
@@ -89,6 +93,13 @@ public sealed class Graph
         if (!ExternalRefs.TryGetValue(nodeId, out var set))
             ExternalRefs[nodeId] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         set.Add(assemblyName);
+    }
+
+    public void AddNodeProject(string nodeId, string projectName)
+    {
+        if (!ProjectsOf.TryGetValue(nodeId, out var set))
+            ProjectsOf[nodeId] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        set.Add(projectName);
     }
 
     /// <summary>Node id for a symbol, or null when the symbol kind has no stable id.</summary>
@@ -128,6 +139,9 @@ public sealed class UsingRef
     public required int Line { get; init; }        // 1-based
     public required string Namespace { get; init; }
     public required HashSet<string> Providers { get; init; }
+    /// <summary>Char span of the directive incl. leading trivia, with leading #directives excluded.</summary>
+    public required int SpanStart { get; init; }
+    public required int SpanLength { get; init; }
 }
 
 /// <summary>Per-project facts needed for package/reference cleanup.</summary>

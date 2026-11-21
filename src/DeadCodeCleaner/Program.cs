@@ -31,6 +31,8 @@ public static class Program
                 var loaded = JsonSerializer.Deserialize<AnalyzerConfig>(File.ReadAllText(opts.ConfigPath), Constants.CaseInsensitiveJson);
                 if (loaded != null)
                 {
+                    loaded.Keep ??= new List<string>();      // an explicit JSON null overrides the initializer
+                    loaded.Roots ??= new List<string>();
                     loaded.StrictMembers |= opts.StrictMembers;
                     config = loaded;
                 }
@@ -79,7 +81,8 @@ public static class Program
             }
             return 0;
         }
-        catch (Exception e) when (e is InvalidOperationException or IOException or UnauthorizedAccessException)
+        catch (Exception e) when (e is InvalidOperationException or IOException or UnauthorizedAccessException
+            or Microsoft.Build.Exceptions.InvalidProjectFileException)
         {
             Console.Error.WriteLine("error: " + e.Message);
             return 1;
