@@ -1,0 +1,51 @@
+using Fixture.Domain;
+
+namespace Fixture.Web;
+
+public class WidgetsController
+{
+    private readonly Mediator _mediator;
+    private readonly IWidgetService _svc;
+
+    public WidgetsController(Mediator mediator, IWidgetService svc)
+    {
+        _mediator = mediator;
+        _svc = svc;
+    }
+
+    public object? GetWidget()
+    {
+        SharedService.WidgetCounter++;
+        SharedService.WidgetOnlyA += SharedService.WidgetOnlyB;
+        var description = _svc.Describe();
+        _ = description;
+        return _mediator.Send(new GetWidgetQuery());
+    }
+
+    public string GetSecondary() => SecondaryHelper.Compute();
+
+    // Overload with its own private dependency: removable individually by signature.
+    public string GetSecondary(int times) => OverloadHelper.Only() + times;
+}
+
+public static class OverloadHelper
+{
+    public static string Only() => "o";
+}
+
+public class GadgetsController
+{
+    private readonly IGadgetService _svc;
+
+    public GadgetsController(IGadgetService svc)
+    {
+        _svc = svc;
+    }
+
+    public string GetGadget() => SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter;
+}
+
+public static class SecondaryHelper
+{
+    public static string Compute() => "s";
+}
