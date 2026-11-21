@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace DeadCodeCleaner;
 
@@ -14,10 +15,10 @@ public static class Editor
 
         foreach (var file in report.DeletableFiles)
         {
-            var text = File.ReadAllText(file);
+            var text = ReadFileText(file, out var encoding);
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-            if (FirstLine(text).Trim().StartsWith(Constants.Marker)) continue;
-            File.WriteAllText(file, Constants.Marker + nl + text);
+            if (FirstLine(text).Trim().StartsWith(Constants.Marker, StringComparison.Ordinal)) continue;
+            WriteFileText(file, Constants.Marker + nl + text, encoding);
             files++; markers++;
         }
 
@@ -41,37 +42,46 @@ public static class Editor
 
         foreach (var (file, linesToMark) in perFile)
         {
-            var text = File.ReadAllText(file);
+            var text = ReadFileText(file, out var encoding);
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-            var lines = SplitLines(text);
-            var sb = new StringBuilder();
-            for (int i = 0; i < lines.Count; i++)
+            var lines = SplitLines(text, out bool trailingNewline);
+            int inserted = 0;
+            foreach (var (lineNumber, suffix) in linesToMark.Reverse())
             {
-                if (linesToMark.TryGetValue(i + 1, out var suffix)
-                    && (i == 0 || !lines[i - 1].Trim().StartsWith(Constants.Marker)))
-                {
-                    var indent = lines[i][..(lines[i].Length - lines[i].TrimStart().Length)];
-                    sb.Append(indent).Append(Constants.Marker).Append(suffix).Append(nl);
-                    markers++;
-                }
-                sb.Append(lines[i]);
-                if (i < lines.Count - 1 || text.EndsWith("\n")) sb.Append(nl);
+                int idx = lineNumber - 1;
+                if (idx < 0 || idx >= lines.Count) continue;
+                if (idx > 0 && lines[idx - 1].Trim().StartsWith(Constants.Marker, StringComparison.Ordinal)) continue;
+                var indent = lines[idx][..(lines[idx].Length - lines[idx].TrimStart().Length)];
+                lines.Insert(idx, indent + Constants.Marker + suffix);
+                inserted++;
             }
-            File.WriteAllText(file, sb.ToString());
-            files++;
+            if (inserted == 0) continue;
+            WriteFileText(file, JoinLines(lines, nl, trailingNewline), encoding);
+            files++; markers += inserted;
         }
 
         // csproj markers: references to remove, and fully deletable projects.
         foreach (var rr in report.PackageRefRemovals)
-            if (MarkXmlLine(rr.CsprojPath, l => IsPackageRefLine(l, rr.Reference))) { markers++; files++; }
+        {
+            var n = MarkXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference));
+            if (n > 0) { markers += n; files++; }
+        }
         foreach (var rr in report.ProjectRefRemovals)
-            if (MarkXmlLine(rr.CsprojPath, l => IsProjectRefLine(l, rr.Reference))) { markers++; files++; }
+        {
+            var n = MarkXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.Reference));
+            if (n > 0) { markers += n; files++; }
+        }
         foreach (var pd in report.DeletableProjects)
         {
-            var text = File.ReadAllText(pd.CsprojPath);
-            if (FirstLine(text).Trim().StartsWith(Constants.XmlMarkerPrefix)) continue;
+            var text = ReadFileText(pd.CsprojPath, out var encoding);
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-            File.WriteAllText(pd.CsprojPath, Constants.XmlMarker + nl + text);
+            var lines = SplitLines(text, out bool trailingNewline);
+            // Keep an XML declaration ("<?xml ...?>") on the first line: legacy csprojs have one,
+            // and anything before it makes the file invalid XML.
+            int at = lines.Count > 0 && lines[0].TrimStart().StartsWith("<?xml", StringComparison.Ordinal) ? 1 : 0;
+            if (at < lines.Count && lines[at].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) continue;
+            lines.Insert(at, Constants.XmlMarker);
+            WriteFileText(pd.CsprojPath, JoinLines(lines, nl, trailingNewline), encoding);
             markers++; files++;
         }
 
@@ -96,51 +106,66 @@ public static class Editor
             if (!perFile.TryGetValue(file, out var list)) perFile[file] = list = new List<(int, int)>();
             list.Add((start, end));
         }
+        void Ensure(string file)
+        {
+            if (report.DeletableFiles.Contains(file)) return;
+            if (!perFile.ContainsKey(file)) perFile[file] = new List<(int, int)>();
+        }
         foreach (var sym in report.Symbols.Where(s => !s.InDeletableFile))
             foreach (var p in sym.Parts)
                 Range(p.File, p.SpanStart, p.SpanStart + p.SpanLength);
-        foreach (var st in report.Statements)
-            if (!report.DeletableFiles.Contains(st.File) && !perFile.ContainsKey(st.File))
-                perFile[st.File] = new List<(int, int)>();
-        foreach (var ur in report.UsingRemovals)
-            if (!report.DeletableFiles.Contains(ur.File) && !perFile.ContainsKey(ur.File))
-                perFile[ur.File] = new List<(int, int)>();
+        foreach (var st in report.Statements) Ensure(st.File);
+        foreach (var ur in report.UsingRemovals) Ensure(ur.File);
+
+        // Case-insensitive lookups so a casing difference between a symbol part and a statement
+        // in the same file can never skip a deletion.
+        var statementsByFile = report.Statements
+            .GroupBy(s => s.File, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
+        var usingsByFile = report.UsingRemovals
+            .GroupBy(u => u.File, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
 
         foreach (var file in perFile.Keys.ToList())
         {
-            var text = File.ReadAllText(file);
+            var text = ReadFileText(file, out var encoding);
             var ranges = perFile[file];
             var starts = LineStarts(text);
-            foreach (var st in report.Statements.Where(s => s.File == file))
-                AddLineRange(st.StartLine, st.EndLine, text, starts, ranges);
-            foreach (var ur in report.UsingRemovals.Where(u => u.File == file))
-                AddLineRange(ur.Line, ur.Line, text, starts, ranges);
-            ApplyDeletions(file, text, ranges, ref regions);
+            if (statementsByFile.TryGetValue(file, out var sts))
+            {
+                foreach (var st in sts)
+                {
+                    ranges.Add((st.SpanStart, st.SpanStart + st.SpanLength));
+                    // A whole-statement span already covers its marker (leading trivia); a chain
+                    // segment does not, so its marker line is removed explicitly.
+                    if (!st.WholeStatement) AddMarkerLineAbove(st.StartLine, text, starts, ranges);
+                }
+            }
+            if (usingsByFile.TryGetValue(file, out var us))
+            {
+                foreach (var ur in us) AddLineRange(ur.Line, ur.Line, text, starts, ranges);
+            }
+            ApplyDeletions(file, text, ranges, encoding, ref regions);
         }
 
         // csproj cleanup: packages, project references, whole projects.
         foreach (var rr in report.PackageRefRemovals)
-            if (RemoveXmlElement(rr.CsprojPath, l => IsPackageRefLine(l, rr.Reference), "</PackageReference>"))
-            { regions++; log($"  removed PackageReference {rr.Reference} from {rr.Project}"); }
+        {
+            var n = RemoveXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference));
+            if (n > 0) { regions += n; log($"  removed PackageReference {rr.Reference} from {rr.Project}"); }
+        }
         foreach (var rr in report.ProjectRefRemovals)
-            if (RemoveXmlElement(rr.CsprojPath, l => IsProjectRefLine(l, rr.Reference), "</ProjectReference>"))
-            { regions++; log($"  removed ProjectReference {rr.Reference} from {rr.Project}"); }
+        {
+            var n = RemoveXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.Reference));
+            if (n > 0) { regions += n; log($"  removed ProjectReference {rr.Reference} from {rr.Project}"); }
+        }
 
         foreach (var pd in report.DeletableProjects)
         {
-            try
+            if (!RemoveProjectFromSolution(report.Solution, pd.CsprojPath, pd.Project, log))
             {
-                var psi = new System.Diagnostics.ProcessStartInfo("dotnet",
-                    $"sln \"{report.Solution}\" remove \"{pd.CsprojPath}\"")
-                { RedirectStandardOutput = true, RedirectStandardError = true };
-                using var proc = System.Diagnostics.Process.Start(psi);
-                proc?.WaitForExit(Constants.SlnRemoveTimeoutMs);
-                if (proc is { ExitCode: 0 }) log($"  removed {pd.Project} from the solution");
-                else log($"  WARNING: could not remove {pd.Project} from the solution automatically");
-            }
-            catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException or PlatformNotSupportedException)
-            {
-                log($"  WARNING: dotnet sln remove failed for {pd.Project}: {e.Message}");
+                log($"  WARNING: {pd.Project} left on disk — remove it from the solution manually, then delete {pd.CsprojPath}");
+                continue;
             }
             if (File.Exists(pd.CsprojPath)) { File.Delete(pd.CsprojPath); deletedFiles++; }
             TryRemoveProjectDirectory(pd.CsprojPath, log);
@@ -148,6 +173,37 @@ public static class Editor
 
         log($"Deleted: {deletedFiles} file(s), {regions} code region(s)/reference(s), {report.DeletableProjects.Count} project(s).");
         log("Build the solution to verify. (Usings that would no longer compile were removed; merely-unused ones are left for IDE cleanup.)");
+    }
+
+    static bool RemoveProjectFromSolution(string solution, string csprojPath, string projectName, Action<string> log)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("dotnet", $"sln \"{solution}\" remove \"{csprojPath}\"")
+            { RedirectStandardOutput = true, RedirectStandardError = true };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return false;
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+            if (!proc.WaitForExit(Constants.SlnRemoveTimeoutMs))
+            {
+                proc.Kill(entireProcessTree: true);
+                log($"  WARNING: dotnet sln remove timed out for {projectName}");
+                return false;
+            }
+            if (proc.ExitCode == 0)
+            {
+                log($"  removed {projectName} from the solution");
+                return true;
+            }
+            log($"  WARNING: dotnet sln remove failed for {projectName} (exit code {proc.ExitCode})");
+            return false;
+        }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException or PlatformNotSupportedException)
+        {
+            log($"  WARNING: dotnet sln remove failed for {projectName}: {e.Message}");
+            return false;
+        }
     }
 
     static void TryRemoveProjectDirectory(string csprojPath, Action<string> log)
@@ -169,54 +225,79 @@ public static class Editor
 
     // ----------------------------------------------------------- xml helpers
 
-    static bool IsPackageRefLine(string line, string package)
+    static bool IsPackageRefElement(string elementText, string package)
     {
-        return line.Contains("<PackageReference") && line.Contains($"Include=\"{package}\"");
+        return elementText.Contains($"Include=\"{package}\"");
     }
 
-    static bool IsProjectRefLine(string line, string projectName)
+    static bool IsProjectRefElement(string elementText, string projectName)
     {
-        return line.Contains("<ProjectReference") && line.Contains(projectName + ".csproj", StringComparison.OrdinalIgnoreCase);
+        // Exact filename match: a reference to "Core" must not match "Common.Core.csproj".
+        var m = Regex.Match(elementText, "Include=\"([^\"]+)\"");
+        if (!m.Success) return false;
+        var fileName = Path.GetFileName(m.Groups[1].Value.Replace('\\', '/'));
+        return StringComparer.OrdinalIgnoreCase.Equals(fileName, projectName + ".csproj");
     }
 
-    static bool MarkXmlLine(string file, Func<string, bool> match)
+    /// <summary>Line ranges (inclusive) of every element named <paramref name="elementName"/> whose
+    /// full text matches. Handles single-line, multi-line and multi-line-attribute elements.</summary>
+    static List<(int From, int To)> FindXmlElements(List<string> lines, string elementName, Func<string, bool> match)
     {
-        if (!File.Exists(file)) return false;
-        var text = File.ReadAllText(file);
-        var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-        var lines = SplitLines(text);
+        var found = new List<(int, int)>();
+        var open = "<" + elementName;
+        var close = "</" + elementName + ">";
         for (int i = 0; i < lines.Count; i++)
         {
-            if (!match(lines[i])) continue;
-            if (i > 0 && lines[i - 1].Trim().StartsWith(Constants.XmlMarkerPrefix)) return false;
-            var indent = lines[i][..(lines[i].Length - lines[i].TrimStart().Length)];
-            lines.Insert(i, indent + Constants.XmlMarker);
-            File.WriteAllText(file, string.Join(nl, lines) + (text.EndsWith("\n") ? nl : ""));
-            return true;
-        }
-        return false;
-    }
-
-    static bool RemoveXmlElement(string file, Func<string, bool> match, string closingTag)
-    {
-        if (!File.Exists(file)) return false;
-        var text = File.ReadAllText(file);
-        var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-        var lines = SplitLines(text);
-        for (int i = 0; i < lines.Count; i++)
-        {
-            if (!match(lines[i])) continue;
-            int from = i, to = i;
-            if (!lines[i].Contains("/>"))
+            if (!lines[i].Contains(open)) continue;
+            int to = i;
+            if (!lines[i].Contains("/>") && !lines[i].Contains(close))
             {
-                while (to < lines.Count - 1 && !lines[to].Contains(closingTag)) to++;
+                while (to < lines.Count - 1 && !lines[to].Contains("/>") && !lines[to].Contains(close)) to++;
             }
-            if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix)) from--;
-            lines.RemoveRange(from, to - from + 1);
-            File.WriteAllText(file, string.Join(nl, lines) + (text.EndsWith("\n") ? nl : ""));
-            return true;
+            var elementText = string.Join(" ", lines.GetRange(i, to - i + 1));
+            if (match(elementText)) found.Add((i, to));
+            i = to;
         }
-        return false;
+        return found;
+    }
+
+    static int MarkXmlElements(string file, string elementName, Func<string, bool> match)
+    {
+        if (!File.Exists(file)) return 0;
+        var text = ReadFileText(file, out var encoding);
+        var nl = text.Contains("\r\n") ? "\r\n" : "\n";
+        var lines = SplitLines(text, out bool trailingNewline);
+        var found = FindXmlElements(lines, elementName, match);
+        int inserted = 0;
+        for (int fi = found.Count - 1; fi >= 0; fi--)
+        {
+            var (from, _) = found[fi];
+            if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) continue;
+            var indent = lines[from][..(lines[from].Length - lines[from].TrimStart().Length)];
+            lines.Insert(from, indent + Constants.XmlMarker);
+            inserted++;
+        }
+        if (inserted > 0) WriteFileText(file, JoinLines(lines, nl, trailingNewline), encoding);
+        return inserted;
+    }
+
+    static int RemoveXmlElements(string file, string elementName, Func<string, bool> match)
+    {
+        if (!File.Exists(file)) return 0;
+        var text = ReadFileText(file, out var encoding);
+        var nl = text.Contains("\r\n") ? "\r\n" : "\n";
+        var lines = SplitLines(text, out bool trailingNewline);
+        var found = FindXmlElements(lines, elementName, match);
+        int removed = 0;
+        for (int fi = found.Count - 1; fi >= 0; fi--)
+        {
+            var (from, to) = found[fi];
+            if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) from--;
+            lines.RemoveRange(from, to - from + 1);
+            removed++;
+        }
+        if (removed > 0) WriteFileText(file, JoinLines(lines, nl, trailingNewline), encoding);
+        return removed;
     }
 
     // ---------------------------------------------------------- text helpers
@@ -229,14 +310,23 @@ public static class Editor
         if (s >= 2)
         {
             var above = text[starts[s - 2]..starts[s - 1]].TrimEnd('\r', '\n');
-            if (above.Trim().StartsWith(Constants.Marker)) s--;
+            if (above.Trim().StartsWith(Constants.Marker, StringComparison.Ordinal)) s--;
         }
         int startOffset = starts[s - 1];
         int endOffset = e < lineCount ? starts[e] : text.Length;
         ranges.Add((startOffset, endOffset));
     }
 
-    static void ApplyDeletions(string file, string text, List<(int Start, int End)> ranges, ref int regions)
+    static void AddMarkerLineAbove(int line, string text, int[] starts, List<(int, int)> ranges)
+    {
+        if (line < 2 || line - 1 > starts.Length) return;
+        int aboveStart = starts[line - 2];
+        int aboveEnd = line - 1 < starts.Length ? starts[line - 1] : text.Length;
+        var above = text[aboveStart..aboveEnd];
+        if (above.Trim().StartsWith(Constants.Marker, StringComparison.Ordinal)) ranges.Add((aboveStart, aboveEnd));
+    }
+
+    static void ApplyDeletions(string file, string text, List<(int Start, int End)> ranges, Encoding encoding, ref int regions)
     {
         if (ranges.Count == 0) return;
         var merged = Merge(ranges);
@@ -248,7 +338,7 @@ public static class Editor
             sb.Remove(s, e - s);
             regions++;
         }
-        File.WriteAllText(file, sb.ToString());
+        WriteFileText(file, sb.ToString(), encoding);
     }
 
     static List<(int Start, int End)> Merge(List<(int Start, int End)> ranges)
@@ -267,6 +357,46 @@ public static class Editor
         return result;
     }
 
+    /// <summary>Reads a file preserving its encoding for the write-back: BOMs are honoured, BOM-less
+    /// files are decoded as strict UTF-8, and invalid UTF-8 falls back to Latin-1 (byte-preserving)
+    /// instead of silently inserting U+FFFD replacement characters.</summary>
+    static string ReadFileText(string path, out Encoding encoding)
+    {
+        var bytes = File.ReadAllBytes(path);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
+            return new UTF8Encoding(false).GetString(bytes, 3, bytes.Length - 3);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        {
+            encoding = Encoding.Unicode;
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            encoding = Encoding.BigEndianUnicode;
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+        var strict = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+        try
+        {
+            var text = strict.GetString(bytes);
+            encoding = strict;
+            return text;
+        }
+        catch (DecoderFallbackException)
+        {
+            encoding = Encoding.Latin1;
+            return Encoding.Latin1.GetString(bytes);
+        }
+    }
+
+    static void WriteFileText(string path, string text, Encoding encoding)
+    {
+        File.WriteAllText(path, text, encoding);
+    }
+
     static string Truncate(string s, int max)
     {
         return s.Length <= max ? s : s[..(max - 3)] + "...";
@@ -278,9 +408,19 @@ public static class Editor
         return idx < 0 ? text : text[..idx];
     }
 
-    static List<string> SplitLines(string text)
+    /// <summary>Splits into lines without a phantom empty trailing element; JoinLines restores the
+    /// exact trailing-newline state, so split+join round-trips unchanged text byte-for-byte.</summary>
+    static List<string> SplitLines(string text, out bool trailingNewline)
     {
-        return text.Replace("\r\n", "\n").Split('\n').ToList();
+        trailingNewline = text.EndsWith("\n");
+        var lines = text.Replace("\r\n", "\n").Split('\n').ToList();
+        if (trailingNewline && lines.Count > 0 && lines[^1].Length == 0) lines.RemoveAt(lines.Count - 1);
+        return lines;
+    }
+
+    static string JoinLines(List<string> lines, string nl, bool trailingNewline)
+    {
+        return string.Join(nl, lines) + (trailingNewline ? nl : "");
     }
 
     static int[] LineStarts(string text)

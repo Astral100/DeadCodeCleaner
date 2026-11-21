@@ -69,6 +69,10 @@ public sealed class StatementDeletion
     public required int StartLine { get; init; }
     public required int EndLine { get; init; }
     public required string Snippet { get; init; }
+    /// <summary>Char range to delete: the whole statement, or just this call's chain segment.</summary>
+    public required int SpanStart { get; init; }
+    public required int SpanLength { get; init; }
+    public required bool WholeStatement { get; init; }
 }
 
 public sealed class ReportStats

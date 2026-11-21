@@ -14,6 +14,8 @@ check() { # check <description> <jq filter that must output true>
     if [ "$result" = "FAIL" ]; then FAIL=1; fi
     printf '  %-4s %s\n' "$result" "$desc"
 }
+pass() { printf '  ok   %s\n' "$1"; }
+failx() { printf '  FAIL %s\n' "$1"; FAIL=1; }
 
 echo "== Case 1: remove WidgetsController (type-level, full cascade)"
 dotnet run --project src/DeadCodeCleaner -- analyze \
@@ -103,6 +105,34 @@ check "Tests->Web project reference removable" \
 check "no NuGet removals (fixture has none)" '.packageRefRemovals | length == 0'
 check "no whole project deletable (pre-existing orphans remain)" '.deletableProjects | length == 0'
 check "DeadLegacyHelper still untouched"  '[.symbols[].fqn] | index("Fixture.Domain.DeadLegacyHelper") == null'
+
+echo "== Case 5: mark idempotency and delete round-trip (scratch copy)"
+SCRATCH=$(mktemp -d)
+cp -r tests/Fixture "$SCRATCH/Fixture"
+dotnet restore "$SCRATCH/Fixture/Fixture.sln" > /dev/null 2>&1
+snapshot() {
+    find "$SCRATCH/Fixture" \( -name '*.cs' -o -name '*.csproj' -o -name '*.sln' \) \
+        -not -path '*/obj/*' -not -path '*/bin/*' -print0 | sort -z | xargs -0 md5sum
+}
+dotnet run --project src/DeadCodeCleaner -- mark --solution "$SCRATCH/Fixture/Fixture.sln" \
+    --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1 || { echo "MARK FAILED"; exit 1; }
+S1=$(snapshot)
+if grep -q "todo: to be deleted" "$SCRATCH/Fixture/Fixture.Web/Controllers.cs"; then
+    pass "markers inserted"; else failx "markers inserted"; fi
+dotnet run --project src/DeadCodeCleaner -- mark --solution "$SCRATCH/Fixture/Fixture.sln" \
+    --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1 || { echo "SECOND MARK FAILED"; exit 1; }
+S2=$(snapshot)
+if [ "$S1" = "$S2" ]; then
+    pass "mark is idempotent (second run changes nothing)"; else failx "mark is idempotent (second run changes nothing)"; fi
+dotnet run --project src/DeadCodeCleaner -- delete --solution "$SCRATCH/Fixture/Fixture.sln" \
+    --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED"; exit 1; }
+if ! grep -rq --include='*.cs' --include='*.csproj' "todo: to be deleted" "$SCRATCH/Fixture"; then
+    pass "no markers left after delete"; else failx "no markers left after delete"; fi
+if [ ! -f "$SCRATCH/Fixture/Fixture.Domain/Widgets.cs" ]; then
+    pass "Widgets.cs deleted"; else failx "Widgets.cs deleted"; fi
+if dotnet build "$SCRATCH/Fixture/Fixture.sln" > /dev/null 2>&1; then
+    pass "solution builds after delete"; else failx "solution builds after delete"; fi
+rm -rf "$SCRATCH"
 
 rm -f "$REPORT"
 if [ "$FAIL" = 1 ]; then echo "RESULT: FAILURES PRESENT"; exit 1; fi

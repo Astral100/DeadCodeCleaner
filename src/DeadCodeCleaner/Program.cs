@@ -16,7 +16,7 @@ public static class Program
     {
         CliOptions opts;
         try { opts = Parse(args); }
-        catch (ArgumentException e)
+        catch (Exception e) when (e is ArgumentException or NotSupportedException)
         {
             Console.Error.WriteLine("error: " + e.Message);
             PrintUsage();
@@ -26,11 +26,19 @@ public static class Program
         var config = new AnalyzerConfig { StrictMembers = opts.StrictMembers };
         if (opts.ConfigPath != null)
         {
-            var loaded = JsonSerializer.Deserialize<AnalyzerConfig>(File.ReadAllText(opts.ConfigPath), Constants.CaseInsensitiveJson);
-            if (loaded != null)
+            try
             {
-                loaded.StrictMembers |= opts.StrictMembers;
-                config = loaded;
+                var loaded = JsonSerializer.Deserialize<AnalyzerConfig>(File.ReadAllText(opts.ConfigPath), Constants.CaseInsensitiveJson);
+                if (loaded != null)
+                {
+                    loaded.StrictMembers |= opts.StrictMembers;
+                    config = loaded;
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException)
+            {
+                Console.Error.WriteLine($"error: could not read config {opts.ConfigPath}: {e.Message}");
+                return 2;
             }
         }
 
@@ -71,7 +79,7 @@ public static class Program
             }
             return 0;
         }
-        catch (InvalidOperationException e)
+        catch (Exception e) when (e is InvalidOperationException or IOException or UnauthorizedAccessException)
         {
             Console.Error.WriteLine("error: " + e.Message);
             return 1;
@@ -82,7 +90,7 @@ public static class Program
     {
         var opts = new CliOptions();
         int i = 0;
-        if (args.Length > 0 && !args[0].StartsWith("--"))
+        if (args.Length > 0 && !args[0].StartsWith('-'))
         {
             opts.Mode = args[0].ToLowerInvariant();
             if (opts.Mode is not ("analyze" or "mark" or "delete" or "find"))

@@ -13,6 +13,16 @@ public sealed class StatementNode
     public required string Snippet { get; init; }
     /// <summary>Node id of the member containing the statement.</summary>
     public required string ContainingMember { get; init; }
+    /// <summary>Char span of the whole anchor statement (expanded over braceless if/loop parents),
+    /// with leading #directives excluded so their counterparts are never orphaned.</summary>
+    public required int AnchorStart { get; init; }
+    public required int AnchorLength { get; init; }
+    /// <summary>Char span of just this call's chain segment (".AddScoped&lt;...&gt;(...)"), or -1 when
+    /// the call has no member-access receiver. Used when siblings on the same statement survive.</summary>
+    public required int SegmentStart { get; init; }
+    public required int SegmentLength { get; init; }
+    /// <summary>True when automatic deletion is unsafe (the statement is an if-branch with an else).</summary>
+    public required bool ManualOnly { get; init; }
 }
 
 /// <summary>Conjunctive implication: when ALL antecedents are in use, all consequents become in use.
@@ -69,6 +79,9 @@ public sealed class Graph
     public Dictionary<string, ProjectInfo> Projects { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Every using directive in the solution, with its provider assemblies.</summary>
     public List<UsingRef> UsingRefs { get; } = new();
+    /// <summary>Files carrying non-symbol top-level content (global usings, assembly attributes,
+    /// extern aliases) that must never be deleted whole.</summary>
+    public HashSet<string> FilesWithTopLevelContent { get; } = new(StringComparer.OrdinalIgnoreCase);
     public int EdgeCount { get; private set; }
 
     public void AddExternalRef(string nodeId, string assemblyName)
@@ -128,6 +141,8 @@ public sealed class ProjectInfo
     public Dictionary<string, string> ProjectReferences { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Package name -> compile-time assembly names it contributes (from project.assets.json).</summary>
     public Dictionary<string, List<string>> PackageAssemblies { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Package name -> names of the packages it depends on (from project.assets.json).</summary>
+    public Dictionary<string, List<string>> PackageDependencies { get; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 /// <summary>Typed shape of obj/project.assets.json — only what package cleanup needs.</summary>
@@ -141,6 +156,8 @@ public sealed class ProjectAssetsLibrary
 {
     /// <summary>Compile-time assembly path -> item facts (only the keys are used).</summary>
     public Dictionary<string, ProjectAssetsCompileItem> Compile { get; set; }
+    /// <summary>Dependent package name -> version range (only the keys are used).</summary>
+    public Dictionary<string, string> Dependencies { get; set; }
 }
 
 public sealed class ProjectAssetsCompileItem

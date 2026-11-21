@@ -132,20 +132,31 @@ public sealed class GraphBuilder
             if (File.Exists(assetsPath))
             {
                 var assets = JsonSerializer.Deserialize<ProjectAssetsFile>(File.ReadAllText(assetsPath), Constants.CaseInsensitiveJson);
-                foreach (var target in (assets?.Targets.Values ?? Enumerable.Empty<Dictionary<string, ProjectAssetsLibrary>>()).Take(1))
+                var targets = assets?.Targets?.Values ?? Enumerable.Empty<Dictionary<string, ProjectAssetsLibrary>>();
+                foreach (var target in targets.Take(1))
                 {
                     foreach (var (entryName, lib) in target)
                     {
                         var slash = entryName.IndexOf('/');
-                        if (slash <= 0 || lib.Compile == null) continue;
+                        if (slash <= 0 || lib == null) continue;
                         var pkg = entryName[..slash];
-                        foreach (var libPath in lib.Compile.Keys)
+                        if (lib.Compile != null)
                         {
-                            var file = Path.GetFileNameWithoutExtension(libPath);
-                            if (string.IsNullOrEmpty(file) || file == "_") continue;
-                            if (!info.PackageAssemblies.TryGetValue(pkg, out var list))
-                                info.PackageAssemblies[pkg] = list = new List<string>();
-                            if (!list.Contains(file)) list.Add(file);
+                            foreach (var libPath in lib.Compile.Keys)
+                            {
+                                var file = Path.GetFileNameWithoutExtension(libPath);
+                                if (string.IsNullOrEmpty(file) || file == "_") continue;
+                                if (!info.PackageAssemblies.TryGetValue(pkg, out var list))
+                                    info.PackageAssemblies[pkg] = list = new List<string>();
+                                if (!list.Contains(file)) list.Add(file);
+                            }
+                        }
+                        if (lib.Dependencies != null)
+                        {
+                            if (!info.PackageDependencies.TryGetValue(pkg, out var deps))
+                                info.PackageDependencies[pkg] = deps = new List<string>();
+                            foreach (var dep in lib.Dependencies.Keys)
+                                if (!deps.Contains(dep)) deps.Add(dep);
                         }
                     }
                 }
@@ -483,6 +494,11 @@ public sealed class GraphBuilder
         var model = comp.GetSemanticModel(tree);
         var root = tree.GetRoot();
 
+        // Files with non-symbol top-level content must never be deleted whole.
+        if (root is CompilationUnitSyntax cu
+            && (cu.AttributeLists.Count > 0 || cu.Externs.Count > 0 || cu.Usings.Any(u => u.GlobalKeyword.RawKind != 0)))
+            _graph.FilesWithTopLevelContent.Add(tree.FilePath);
+
         var globals = root.ChildNodes().OfType<GlobalStatementSyntax>().ToList();
         if (globals.Count > 0)
         {
@@ -691,7 +707,42 @@ public sealed class GraphBuilder
 
     StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember)
     {
-        var anchor = (SyntaxNode)inv.FirstAncestorOrSelf<StatementSyntax>() ?? inv;
+        var innerStatement = inv.FirstAncestorOrSelf<StatementSyntax>();
+        SyntaxNode anchor = innerStatement ?? (SyntaxNode)inv;
+        bool manualOnly = false;
+        // A braceless embedded statement cannot be deleted alone: expand to the construct that
+        // owns it (deleting "if (x) Register();" whole), or flag for manual action when an else
+        // branch makes whole-construct deletion wrong.
+        while (innerStatement != null)
+        {
+            var parent = anchor.Parent;
+            if (parent is IfStatementSyntax ifs && ifs.Statement == anchor)
+            {
+                if (ifs.Else != null) { manualOnly = true; break; }
+                anchor = ifs;
+            }
+            else if (parent is ElseClauseSyntax ec && ec.Statement == anchor) { anchor = ec; break; }
+            else if (parent is WhileStatementSyntax w && w.Statement == anchor) anchor = w;
+            else if (parent is ForStatementSyntax f && f.Statement == anchor) anchor = f;
+            else if (parent is ForEachStatementSyntax fe && fe.Statement == anchor) anchor = fe;
+            else if (parent is DoStatementSyntax d && d.Statement == anchor) anchor = d;
+            else if (parent is UsingStatementSyntax us && us.Statement == anchor) anchor = us;
+            else if (parent is LockStatementSyntax lk && lk.Statement == anchor) anchor = lk;
+            else break;
+        }
+        // Exclude leading #directives from the deletable span so their counterparts stay paired.
+        int anchorStart = anchor.FullSpan.Start;
+        var leading = anchor.GetLeadingTrivia();
+        for (int ti = leading.Count - 1; ti >= 0; ti--)
+        {
+            if (leading[ti].IsDirective) { anchorStart = leading[ti].FullSpan.End; break; }
+        }
+        int segmentStart = -1, segmentLength = 0;
+        if (inv.Expression is MemberAccessExpressionSyntax chain)
+        {
+            segmentStart = chain.Expression.Span.End;
+            segmentLength = inv.Span.End - segmentStart;
+        }
         var lines = anchor.GetLocation().GetLineSpan();
         var snippet = Regex.Replace(anchor.ToString(), @"\s+", " ").Trim();
         if (snippet.Length > Constants.SnippetMaxLength) snippet = snippet[..(Constants.SnippetMaxLength - 3)] + "...";
@@ -703,6 +754,11 @@ public sealed class GraphBuilder
             EndLine = lines.EndLinePosition.Line + 1,
             Snippet = snippet,
             ContainingMember = containingMember,
+            AnchorStart = anchorStart,
+            AnchorLength = anchor.FullSpan.End - anchorStart,
+            SegmentStart = segmentStart,
+            SegmentLength = segmentLength,
+            ManualOnly = manualOnly,
         };
         _graph.Statements.Add(stmt);
         return stmt;

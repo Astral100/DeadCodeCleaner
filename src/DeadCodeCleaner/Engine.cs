@@ -198,10 +198,39 @@ public sealed class Engine
             });
         }
 
-        // Statement entries (only when their containing member survives).
+        // Statement entries (only when their containing member survives). Statements sharing one
+        // anchor (fluent chains) delete only their own segment when a sibling survives.
+        var stmtsByAnchor = graph.Statements
+            .GroupBy(s => s.FilePath + "#" + s.AnchorStart, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+        var emittedWholeSpans = new HashSet<string>(StringComparer.Ordinal);
         foreach (var stmt in deadStmts)
         {
             if (allDead.Contains(stmt.ContainingMember) || HasDeadContainer(graph, stmt.ContainingMember, allDead)) continue;
+            if (stmt.ManualOnly)
+            {
+                report.Warnings.Add($"manual: {stmt.FilePath}:{stmt.StartLine} — registration sits in an if/else branch; delete it manually: {stmt.Snippet}");
+                continue;
+            }
+            var siblings = stmtsByAnchor[stmt.FilePath + "#" + stmt.AnchorStart];
+            bool whole = siblings.All(deadStmts.Contains);
+            int spanStart, spanLength;
+            if (whole)
+            {
+                if (!emittedWholeSpans.Add(stmt.FilePath + "#" + stmt.AnchorStart)) continue;
+                spanStart = stmt.AnchorStart;
+                spanLength = stmt.AnchorLength;
+            }
+            else if (stmt.SegmentStart >= 0)
+            {
+                spanStart = stmt.SegmentStart;
+                spanLength = stmt.SegmentLength;
+            }
+            else
+            {
+                report.Warnings.Add($"manual: {stmt.FilePath}:{stmt.StartLine} — shares a statement with a surviving registration; delete it manually: {stmt.Snippet}");
+                continue;
+            }
             report.Statements.Add(new StatementDeletion
             {
                 Kind = stmt.Kind,
@@ -209,6 +238,9 @@ public sealed class Engine
                 StartLine = stmt.StartLine,
                 EndLine = stmt.EndLine,
                 Snippet = stmt.Snippet,
+                SpanStart = spanStart,
+                SpanLength = spanLength,
+                WholeStatement = whole,
             });
         }
         report.Statements.Sort((a, b) => string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.StartLine.CompareTo(b.StartLine));
@@ -230,8 +262,13 @@ public sealed class Engine
             StringComparer.OrdinalIgnoreCase);
         foreach (var f in filesTouched.OrderBy(x => x, StringComparer.Ordinal))
         {
-            if (nodesByFile.TryGetValue(f, out var declared) && declared.All(allDead.Contains))
-                report.DeletableFiles.Add(f);
+            if (!nodesByFile.TryGetValue(f, out var declared) || !declared.All(allDead.Contains)) continue;
+            if (graph.FilesWithTopLevelContent.Contains(f))
+            {
+                report.Warnings.Add($"file kept (has global usings / assembly attributes): {f} — its dead declarations are deleted individually");
+                continue;
+            }
+            report.DeletableFiles.Add(f);
         }
         foreach (var sym in report.Symbols)
             sym.InDeletableFile = sym.Parts.All(p => report.DeletableFiles.Contains(p.File));
@@ -324,15 +361,23 @@ public sealed class Engine
             }
             var tree = node.SyntaxTree;
             if (string.IsNullOrEmpty(tree.FilePath)) continue;
+            // FullSpan includes leading trivia; exclude leading #directives (#region, #if) whose
+            // counterpart lies outside the deleted span, or deletion breaks compilation.
             var span = node.FullSpan;
+            int spanStart = span.Start;
+            var leading = node.GetLeadingTrivia();
+            for (int ti = leading.Count - 1; ti >= 0; ti--)
+            {
+                if (leading[ti].IsDirective) { spanStart = leading[ti].FullSpan.End; break; }
+            }
             var lines = tree.GetLineSpan(node.Span);
             parts.Add(new SourcePart
             {
                 File = tree.FilePath,
                 StartLine = lines.StartLinePosition.Line + 1,
                 EndLine = lines.EndLinePosition.Line + 1,
-                SpanStart = span.Start,
-                SpanLength = span.Length,
+                SpanStart = spanStart,
+                SpanLength = span.End - spanStart,
             });
         }
         return parts;
@@ -364,6 +409,28 @@ public sealed class Engine
             return !allDead.Contains(n) || keptInPlace.Contains(n);
         }
 
+        HashSet<string> PackageClosure(ProjectInfo p, IEnumerable<string> roots)
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<string>(roots);
+            while (queue.Count > 0)
+            {
+                var pkg = queue.Dequeue();
+                if (!seen.Add(pkg)) continue;
+                if (p.PackageDependencies.TryGetValue(pkg, out var deps))
+                    foreach (var dep in deps) queue.Enqueue(dep);
+            }
+            return seen;
+        }
+
+        HashSet<string> PackageClosureAssemblies(ProjectInfo p, IEnumerable<string> roots)
+        {
+            var asms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pkg in PackageClosure(p, roots))
+                if (p.PackageAssemblies.TryGetValue(pkg, out var list)) asms.UnionWith(list);
+            return asms;
+        }
+
         var deletableProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (pname, nodeIds) in nodesByProject)
         {
@@ -393,14 +460,36 @@ public sealed class Engine
                             (stays ? survivingProjRefs : deadProjRefs).Add(tp);
                 }
             }
+            var pkgCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var pkg in pi.PackageReferences)
             {
                 if (!pi.PackageAssemblies.TryGetValue(pkg, out var asms) || asms.Count == 0) continue; // unknown: keep
                 bool usedBySurviving = asms.Any(survivingExt.Contains);
                 bool usedByDead = asms.Any(deadExt.Contains);
-                if (!usedBySurviving && usedByDead)
-                    report.PackageRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = pkg });
+                if (!usedBySurviving && usedByDead) pkgCandidates.Add(pkg);
             }
+            // Transitive repair: surviving code may use an assembly that arrives only through a
+            // candidate's dependency closure (e.g. EFCore via EFCore.SqlServer) — keep that candidate.
+            if (pkgCandidates.Count > 0)
+            {
+                var providedByAll = PackageClosureAssemblies(pi, pi.PackageReferences);
+                var survivingNeeded = survivingExt.Where(providedByAll.Contains).ToList();
+                while (pkgCandidates.Count > 0)
+                {
+                    var remaining = PackageClosureAssemblies(pi, pi.PackageReferences.Where(x => !pkgCandidates.Contains(x)));
+                    var missing = survivingNeeded.Where(a => !remaining.Contains(a)).ToList();
+                    if (missing.Count == 0) break;
+                    bool pkgRepaired = false;
+                    foreach (var c in pkgCandidates.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var provides = PackageClosureAssemblies(pi, new[] { c });
+                        if (missing.Any(provides.Contains)) { pkgCandidates.Remove(c); pkgRepaired = true; break; }
+                    }
+                    if (!pkgRepaired) break;
+                }
+            }
+            foreach (var pkg in pi.PackageReferences.Where(pkgCandidates.Contains))
+                report.PackageRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = pkg });
             // Project references: candidates by direct usage, then repaired so that projects the
             // surviving code reaches only TRANSITIVELY (through a removed reference) stay reachable.
             var direct = pi.ProjectReferences.Keys.ToList();
@@ -452,8 +541,12 @@ public sealed class Engine
                 if (graph.Projects.TryGetValue(lostProject, out var lp) && lp.AssemblyName.Length > 0)
                     gone.Add(lp.AssemblyName);
             if (removedPkgsByProject.TryGetValue(pname, out var pkgs))
-                foreach (var pkg in pkgs)
-                    if (pi.PackageAssemblies.TryGetValue(pkg, out var asms)) gone.UnionWith(asms);
+            {
+                var removedSet = new HashSet<string>(pkgs, StringComparer.OrdinalIgnoreCase);
+                var before = PackageClosureAssemblies(pi, pi.PackageReferences);
+                var after = PackageClosureAssemblies(pi, pi.PackageReferences.Where(x => !removedSet.Contains(x)));
+                gone.UnionWith(before.Where(a => !after.Contains(a)));
+            }
             if (gone.Count > 0) goneByProject[pname] = gone;
         }
         foreach (var u in graph.UsingRefs)
@@ -476,11 +569,17 @@ public sealed class Engine
         if (_opts.RemoveTargets.Count == 0) return seeds;
 
         var byFqn = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        void Register(string key, string id)
+        {
+            if (!byFqn.TryGetValue(key, out var list)) byFqn[key] = list = new List<string>();
+            list.Add(id);
+        }
         foreach (var (id, symbol) in graph.Decl)
         {
             var fqn = SymbolNames.Fqn(symbol);
-            if (!byFqn.TryGetValue(fqn, out var list)) byFqn[fqn] = list = new List<string>();
-            list.Add(id);
+            Register(fqn, id);
+            // Generic types also register with an arity suffix ("Ns.Result`1") for disambiguation.
+            if (symbol is INamedTypeSymbol { Arity: > 0 } generic) Register(fqn + "`" + generic.Arity, id);
         }
 
         foreach (var target in _opts.RemoveTargets)
@@ -521,11 +620,18 @@ public sealed class Engine
             var containers = matches
                 .Select(m => graph.ContainerOf.TryGetValue(m, out var c) ? c : "")
                 .Distinct().ToList();
-            if (matches.Count > 1 && containers.Count > 1)
+            if (matches.Count > 1)
             {
-                throw new InvalidOperationException(
-                    $"Removal target '{target}' is ambiguous:\n  " +
-                    string.Join("\n  ", matches.Select(m => SymbolNames.Detailed(graph.Decl[m]))));
+                // Multiple matches are only fine when they are overloads of one method.
+                bool allOverloads = containers.Count == 1
+                    && matches.All(m => graph.Decl.TryGetValue(m, out var d) && d is IMethodSymbol);
+                if (!allOverloads)
+                {
+                    throw new InvalidOperationException(
+                        $"Removal target '{target}' is ambiguous:\n  " +
+                        string.Join("\n  ", matches.Select(m => SymbolNames.Detailed(graph.Decl[m]))) +
+                        "\n(A generic type can be selected with an arity suffix, e.g. 'Ns.Result`2' for Result<T1,T2>.)");
+                }
             }
             foreach (var m in matches) seeds.Add(m); // without a signature: all overloads
         }
@@ -535,7 +641,8 @@ public sealed class Engine
     /// <summary>"(Invoice,int)" — parameter types with minimal qualification, no spaces.</summary>
     string ShortSignature(IMethodSymbol ms)
     {
-        return "(" + string.Join(",", ms.Parameters.Select(p => p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat).Replace(" ", ""))) + ")";
+        // Nullable reference annotations are dropped ("string?" matches "string"); Nullable<T> value types keep their "?".
+        return "(" + string.Join(",", ms.Parameters.Select(p => p.Type.WithNullableAnnotation(NullableAnnotation.None).ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat).Replace(" ", ""))) + ")";
     }
 
     HashSet<string> ExpandRemovals(Graph graph, HashSet<string> seeds)
