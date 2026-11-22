@@ -62,12 +62,15 @@ public sealed class GraphBuilder
                 _graph.ProjectsNotAnalyzed.Add(project.Name);
                 continue;
             }
-            var classification = ClassifyProject(project);
-            if (classification == TestClassification.TestByName)
+            // A test project references a test library AND contains at least one actual test; its name
+            // never counts. A library referencing a test framework without any test (shared test
+            // helpers) is production code.
+            bool referencesTestLibrary = ReferencesTestLibrary(project);
+            bool isTest = referencesTestLibrary && ContainsTest(comp);
+            if (referencesTestLibrary && !isTest)
             {
-                _graph.Warnings.Add($"{project.Name}: classified as a TEST project by its NAME alone (no test-framework reference found) — if it is deployed production code, rename it or keep its symbols, because its code does not count as production roots");
+                _graph.Warnings.Add($"{project.Name}: references a test library but contains no test — treated as PRODUCTION code");
             }
-            bool isTest = classification != TestClassification.Production;
             compilations.Add((comp, isTest, project.Name));
             _solutionAssemblies.Add(comp.Assembly.Name);
             CollectProjectInfo(project);
@@ -87,8 +90,10 @@ public sealed class GraphBuilder
 
         WarnAboutNonCompiledContent();
 
-        // Phase 1: collect all nodes first (rule construction needs the full node set).
-        foreach (var (comp, isTest, projectName) in compilations) { CollectNodes(comp, isTest, projectName); }
+        // Phase 1: collect all nodes first (rule construction needs the full node set). Production
+        // compilations go first: a file linked into a production AND a test project is owned by the
+        // first compilation that declares it, and production liveness must win.
+        foreach (var (comp, isTest, projectName) in compilations.OrderBy(c => c.IsTest)) { CollectNodes(comp, isTest, projectName); }
 
         // Phase 2: structural rules and roots.
         foreach (var (type, isTest) in _types) { AddStructuralRulesAndRoots(type, isTest); }
@@ -203,7 +208,7 @@ public sealed class GraphBuilder
                 textsByDir[dir] = texts = new List<(string, string)>();
                 try
                 {
-                    foreach (var f in EnumerateFilesPruned(dir))
+                    foreach (var f in Editor.EnumerateFilesPruned(dir))
                     {
                         if (Constants.NonCompiledContentExtensions.Contains(Path.GetExtension(f)) && seenFiles.Add(f)) { found++; }
                         // View/markup text is kept for the deleted-symbol mention scan: views
@@ -231,23 +236,6 @@ public sealed class GraphBuilder
         }
     }
 
-    /// <summary>Every file under <paramref name="dir"/>, skipping build-output and tooling
-    /// directories (bin, obj, node_modules, ...).</summary>
-    IEnumerable<string> EnumerateFilesPruned(string dir)
-    {
-        var stack = new Stack<string>();
-        stack.Push(dir);
-        while (stack.Count > 0)
-        {
-            var cur = stack.Pop();
-            foreach (var sub in Directory.EnumerateDirectories(cur))
-            {
-                if (!Constants.SkippedScanDirectories.Contains(Path.GetFileName(sub))) { stack.Push(sub); }
-            }
-            foreach (var f in Directory.EnumerateFiles(cur)) { yield return f; }
-        }
-    }
-
     /// <summary>Config-like files that can wire up types and packages by name: .config, and .json
     /// except NuGet/tooling artifacts and this tool's own report.</summary>
     bool IsConfigLikeFile(string path)
@@ -268,7 +256,7 @@ public sealed class GraphBuilder
             var fi = new FileInfo(path);
             if (fi.Length > Constants.MaxScannedConfigFileBytes)
             {
-                _graph.Warnings.Add($"config file not scanned (over {Constants.MaxScannedConfigFileBytes} bytes): {path} — type/package mentions in it go unnoticed");
+                _graph.Warnings.Add($"file not scanned (over {Constants.MaxScannedConfigFileBytes} bytes): {path} — mentions of deleted types, members or packages in it go unnoticed");
                 return "";
             }
             return File.ReadAllText(path);
@@ -421,41 +409,51 @@ public sealed class GraphBuilder
         _graph.Projects[project.Name] = info;
     }
 
-    TestClassification ClassifyProject(Project project)
+    bool ReferencesTestLibrary(Project project)
     {
         // Only DIRECT test-framework dependencies count: transitive flow through a shared project
         // reference must not turn a production project into a test project. The csproj is parsed as
         // XML, never matched as raw text: a commented-out package is not evidence.
-        bool evidence = false;
         try
         {
-            if (project.FilePath != null && File.Exists(project.FilePath))
+            if (project.FilePath == null || !File.Exists(project.FilePath)) { return false; }
+            foreach (var el in XDocument.Load(project.FilePath).Descendants())
             {
-                foreach (var el in XDocument.Load(project.FilePath).Descendants())
+                var ln = el.Name.LocalName;
+                if (ln is "PackageReference" or "Reference")
                 {
-                    var ln = el.Name.LocalName;
-                    if (ln is "PackageReference" or "Reference")
-                    {
-                        var include = (string)el.Attribute("Include") ?? (string)el.Attribute("Update") ?? "";
-                        var id = include.Split(',')[0].Trim();
-                        if (Regex.IsMatch(id, Constants.TestPackageIdPattern, RegexOptions.IgnoreCase)) { evidence = true; break; }
-                    }
-                    else if (ln == "IsTestProject" && Regex.IsMatch(el.Value, @"^\s*true\s*$", RegexOptions.IgnoreCase)) { evidence = true; break; }
-                    else if (ln == "ProjectTypeGuids" && el.Value.Contains(Constants.TestProjectTypeGuid, StringComparison.OrdinalIgnoreCase)) { evidence = true; break; }
+                    var include = (string)el.Attribute("Include") ?? (string)el.Attribute("Update") ?? "";
+                    var id = include.Split(',')[0].Trim();
+                    if (Regex.IsMatch(id, Constants.TestPackageIdPattern, RegexOptions.IgnoreCase)) { return true; }
                 }
+                else if (ln == "IsTestProject" && Regex.IsMatch(el.Value, @"^\s*true\s*$", RegexOptions.IgnoreCase)) { return true; }
+                else if (ln == "ProjectTypeGuids" && el.Value.Contains(Constants.TestProjectTypeGuid, StringComparison.OrdinalIgnoreCase)) { return true; }
             }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Xml.XmlException) { /* unreadable or malformed project file: no evidence */ }
-        if (evidence) { return TestClassification.TestByEvidence; }
-        var name = project.Name;
-        bool nameMatch = name.EndsWith("Test", StringComparison.Ordinal) || name.EndsWith("Tests", StringComparison.Ordinal)
-            || Regex.IsMatch(name, Constants.TestProjectNamePattern) || name.Contains("TestCommon", StringComparison.Ordinal);
-        if (!nameMatch) { return TestClassification.Production; }
-        // An EXECUTABLE with no test-framework evidence is a deployable tool whatever its name says
-        // ("LoadTest", "X.Test.Tools"): classifying it as a test project would strip its production
-        // roots and make everything it exclusively uses deletable.
-        bool exe = project.CompilationOptions?.OutputKind is OutputKind.ConsoleApplication or OutputKind.WindowsApplication or OutputKind.WindowsRuntimeApplication;
-        return exe ? TestClassification.Production : TestClassification.TestByName;
+        return false;
+    }
+
+    /// <summary>True when the compilation declares at least one actual test: a test-attributed method,
+    /// or a test-fixture-attributed class.</summary>
+    bool ContainsTest(Compilation comp)
+    {
+        foreach (var type in AllSourceTypes(comp.Assembly.GlobalNamespace))
+        {
+            if (type.GetAttributes().Any(a => Constants.TestClassAttributeNames.Contains(ShortAttributeName(a)))) { return true; }
+            foreach (var m in type.GetMembers())
+            {
+                if (m is IMethodSymbol && m.GetAttributes().Any(a => Constants.TestMethodAttributeNames.Contains(ShortAttributeName(a)))) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>The attribute's class name without its "Attribute" suffix ("Fact" for FactAttribute).</summary>
+    string ShortAttributeName(AttributeData attr)
+    {
+        var an = attr.AttributeClass?.Name ?? "";
+        return an.EndsWith("Attribute", StringComparison.Ordinal) ? an[..^9] : an;
     }
 
     // ---------------------------------------------------------------- Phase 1
@@ -741,7 +739,7 @@ public sealed class GraphBuilder
             rootWholeType = true;
             reason = "controller";
         }
-        else if (type.AllInterfaces.Any(i => i.Name == "IHostedService") || BaseChainHasName(type, "BackgroundService"))
+        else if (type.AllInterfaces.Any(i => i.Name == "IHostedService" && IsFrameworkType(i)) || BaseChainHasName(type, "BackgroundService"))
         {
             rootWholeType = true;
             reason = "hosted service";
@@ -751,7 +749,7 @@ public sealed class GraphBuilder
             rootWholeType = true;
             reason = "startup/program";
         }
-        else if (BaseChainHasName(type, "Profile") || BaseChainHasExternalName(type, "Profile", "AutoMapper"))
+        else if (BaseChainHasName(type, "Profile"))
         {
             rootWholeType = true;
             reason = Constants.ReasonAutoMapperProfile;
@@ -779,7 +777,7 @@ public sealed class GraphBuilder
             rootWholeType = true;
             reason = "WebForms code-behind";
         }
-        else if (type.AllInterfaces.Any(i => i.Name is "IEntityTypeConfiguration" or "IMiddleware" or "IHttpModule" or "IHttpHandler" or "IJob" or "ITagHelper"))
+        else if (type.AllInterfaces.Any(i => i.Name is "IEntityTypeConfiguration" or "IMiddleware" or "IHttpModule" or "IHttpHandler" or "IJob" or "ITagHelper" && IsFrameworkType(i)))
         {
             rootWholeType = true;
             reason = "framework-discovered implementation";
@@ -830,6 +828,19 @@ public sealed class GraphBuilder
             }
         }
 
+        // A test fixture with no attributed member of its own: an NUnit/MSTest fixture class, or a
+        // concrete class INHERITING its tests from a base fixture (the runner executes them on it).
+        bool fixtureAttribute = type.GetAttributes().Any(a => Constants.TestClassAttributeNames.Contains(ShortAttributeName(a)));
+        bool inheritsTests = type.TypeKind == TypeKind.Class && !type.IsAbstract && BaseChainHasTestMethod(type);
+        if (fixtureAttribute || inheritsTests)
+        {
+            _graph.AddRoot(typeId, "test class", true);
+            foreach (var ctor in type.InstanceConstructors)
+            {
+                if (NodeId(ctor) is { } cId) { _graph.AddRoot(cId, "test/attr class ctor", true); }
+            }
+        }
+
         // Attribute-based roots (member level).
         foreach (var m in members)
         {
@@ -838,7 +849,7 @@ public sealed class GraphBuilder
             {
                 var an = attr.AttributeClass?.Name;
                 if (an == null) { continue; }
-                var shortName = an.EndsWith("Attribute", StringComparison.Ordinal) ? an[..^9] : an;
+                var shortName = ShortAttributeName(attr);
                 bool isTestAttr = Constants.TestAttributeNames.Contains(shortName);
                 bool isProdAttr = Constants.ProdRootAttributeNames.Contains(shortName);
                 if (!isTestAttr && !isProdAttr) { continue; }
@@ -860,11 +871,34 @@ public sealed class GraphBuilder
         return type.GetAttributes().Any(a => a.AttributeClass?.Name == name);
     }
 
+    /// <summary>True when a base class carries one of the framework names AND comes from the framework:
+    /// a solution's own "Profile" or "Hub" class is ordinary code, not a framework-discovered root.</summary>
     bool BaseChainHasName(INamedTypeSymbol type, params string[] names)
     {
         for (var b = type.BaseType; b != null; b = b.BaseType)
         {
-            if (names.Contains(b.Name)) { return true; }
+            if (names.Contains(b.Name) && IsFrameworkType(b)) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>True for a type declared outside the solution (or unresolvable), or for any type when
+    /// config "inSolutionRegistrations" opts the solution's own framework stand-ins in.</summary>
+    bool IsFrameworkType(INamedTypeSymbol t)
+    {
+        if (_config.InSolutionRegistrations) { return true; }
+        var asm = t.ContainingAssembly?.Name;
+        return asm == null || !_solutionAssemblies.Contains(asm);
+    }
+
+    bool BaseChainHasTestMethod(INamedTypeSymbol type)
+    {
+        for (var b = type.BaseType; b != null; b = b.BaseType)
+        {
+            foreach (var m in b.GetMembers())
+            {
+                if (m is IMethodSymbol && m.GetAttributes().Any(a => Constants.TestMethodAttributeNames.Contains(ShortAttributeName(a)))) { return true; }
+            }
         }
         return false;
     }
@@ -1181,6 +1215,19 @@ public sealed class GraphBuilder
                 _graph.DynamicMemberNames.Add(dmr.MemberName);
                 break;
         }
+        // Writes to external members (ServicePointManager.SecurityProtocol = ..., an event
+        // subscription) are side effects exactly like calls, but leave no invocation behind.
+        if (!suppressed)
+        {
+            var writeTarget = op switch
+            {
+                IAssignmentOperation asg => asg.Target,
+                IIncrementOrDecrementOperation inc => inc.Target,
+                IEventAssignmentOperation ea => ea.EventReference,
+                _ => null,
+            };
+            if (writeTarget is IMemberReferenceOperation wmr) { RecordExternalWrite(sourceId, wmr); }
+        }
         if (op is IConversionOperation icv && icv.IsImplicit)
         {
             // An IMPLICIT conversion has no syntax of its own: its target type (the callee's
@@ -1227,6 +1274,16 @@ public sealed class GraphBuilder
             return;
         }
         _graph.AddExternalCallRef(sourceId, asm);
+    }
+
+    /// <summary>Records a write to an external member as a blocking external call. Writes through the
+    /// instance itself ("this.X = ...", object initializers) only change state that dies with it.</summary>
+    void RecordExternalWrite(string sourceId, IMemberReferenceOperation target)
+    {
+        if (target.Instance is IInstanceReferenceOperation) { return; }
+        var asm = target.Member?.OriginalDefinition.ContainingAssembly?.Name;
+        if (asm == null || _solutionAssemblies.Contains(asm)) { return; }
+        _graph.AddExternalCallRef(sourceId, asm + Constants.ExternalWriteSuffix);
     }
 
     bool IsPureBclTarget(ISymbol def)
@@ -1458,6 +1515,8 @@ public sealed class GraphBuilder
             AnchorLength = anchor.FullSpan.End - anchorStart,
             SegmentStart = segmentStart,
             SegmentLength = segmentLength,
+            NameStart = GetMethodName(inv)?.SpanStart ?? inv.SpanStart,
+            MarkerLineInsideToken = Editor.LineStartsInsideToken(anchor.SyntaxTree, lines.StartLinePosition.Line),
             FileTextLength = anchor.SyntaxTree.Length,
             FileTextHash = TreeHash(anchor.SyntaxTree),
             ManualReason = manualReason,
@@ -1517,6 +1576,9 @@ public sealed class GraphBuilder
             _processedInvocations.Add(cInv);
             AddSkip(ref skip, TextSpan.FromBounds(cma.Name.SpanStart, cInv.Span.End));
             var segRefs = new List<string>();
+            // The chained call's own TARGET: a solution-declared extension method on the mapping
+            // expression (.IgnoreAllNonExisting()) is called from here and nowhere else visible.
+            if (Normalize(model.GetSymbolInfo(cInv).Symbol) is { } chainTarget) { segRefs.Add(chainTarget); }
             foreach (var idn in cInv.ArgumentList.DescendantNodes())
             {
                 if (idn is not (IdentifierNameSyntax or GenericNameSyntax)) { continue; }
@@ -1541,11 +1603,13 @@ public sealed class GraphBuilder
                 var segLines = cInv.GetLocation().GetLineSpan();
                 var segSnippet = Regex.Replace("." + cma.Name + cInv.ArgumentList, @"\s+", " ").Trim();
                 if (segSnippet.Length > Constants.SnippetMaxLength) { segSnippet = segSnippet[..(Constants.SnippetMaxLength - 3)] + "..."; }
+                var segLine0 = cma.Name.GetLocation().GetLineSpan().StartLinePosition.Line;
                 segments.Add(new StatementSegment
                 {
                     Start = cma.OperatorToken.SpanStart,
                     Length = cInv.Span.End - cma.OperatorToken.SpanStart,
-                    Line = cma.Name.GetLocation().GetLineSpan().StartLinePosition.Line + 1,
+                    MarkerLineInsideToken = Editor.LineStartsInsideToken(cInv.SyntaxTree, segLine0),
+                    Line = segLine0 + 1,
                     EndLine = segLines.EndLinePosition.Line + 1,
                     MethodName = mname,
                     Snippet = segSnippet,

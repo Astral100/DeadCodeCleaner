@@ -1,3 +1,4 @@
+using Microsoft.CodeAnalysis;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -38,10 +39,17 @@ public static class Editor
 
         // line -> marker suffix ("" for plain; review notes carry the reason)
         var perFile = new Dictionary<string, SortedDictionary<int, string>>(Constants.PathComparer);
-        void Plan(string fileRaw, int line, string suffix)
+        void Plan(string fileRaw, int line, string suffix, bool insideToken)
         {
             var file = CanonicalPath(fileRaw);
             if (deletableFiles.Contains(file)) { return; }
+            // The line begins inside a multi-line string that ends on it: an inserted marker line
+            // would become part of the string. Skipped; delete mode needs no marker.
+            if (insideToken)
+            {
+                log($"  WARNING: {file}:{line} starts inside a multi-line string literal — marker skipped, the deletion itself is unaffected");
+                return;
+            }
             if (!perFile.TryGetValue(file, out var set)) { perFile[file] = set = new SortedDictionary<int, string>(); }
             if (!set.TryGetValue(line, out var existing) || existing.Length < suffix.Length) { set[line] = suffix; }
         }
@@ -49,10 +57,10 @@ public static class Editor
         {
             var suffix = sym.Review && sym.ReviewNote != null
                 ? $" (review: {Truncate(sym.ReviewNote, Constants.ReviewNoteMaxLength)})" : "";
-            foreach (var p in sym.Parts) { Plan(p.File, p.StartLine, suffix); }
+            foreach (var p in sym.Parts) { Plan(p.File, p.StartLine, suffix, p.MarkerLineInsideToken); }
         }
-        foreach (var st in report.Statements) { Plan(st.File, st.StartLine, ""); }
-        foreach (var ur in report.UsingRemovals) { Plan(ur.File, ur.Line, ""); }
+        foreach (var st in report.Statements) { Plan(st.File, st.StartLine, "", st.MarkerLineInsideToken); }
+        foreach (var ur in report.UsingRemovals) { Plan(ur.File, ur.Line, "", false); }
 
         foreach (var (file, linesToMark) in perFile)
         {
@@ -91,19 +99,24 @@ public static class Editor
         }
 
         // csproj markers: references to remove, and fully deletable projects.
+        // Grouped per csproj: the file is validated against the analysis once, then every marker goes
+        // in with a single write (a second validation after the first write would see "changed").
+        var xmlMarks = new List<(string File, string Element, Func<string, bool> Match)>();
         foreach (var rr in report.PackageRefRemovals)
         {
-            var n = MarkXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference), log);
-            if (n > 0) { markers += n; files++; }
+            xmlMarks.Add((rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference)));
         }
         foreach (var rr in report.ProjectRefRemovals)
         {
-            var n = MarkXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"), log);
-            if (n > 0) { markers += n; files++; }
+            xmlMarks.Add((rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj")));
         }
         foreach (var rr in report.CompileEntryRemovals)
         {
-            var n = MarkXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference), log);
+            xmlMarks.Add((rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference)));
+        }
+        foreach (var group in xmlMarks.GroupBy(x => CanonicalPath(x.File), Constants.PathComparer).OrderBy(g => g.Key, Constants.PathComparer))
+        {
+            var n = MarkXmlElements(group.Key, group.Select(x => (x.Element, x.Match)).ToList(), lengths, hashes, log);
             if (n > 0) { markers += n; files++; }
         }
         foreach (var pd in report.DeletableProjects)
@@ -114,6 +127,11 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(pd.CsprojPath, out var encoding);
+            if (Stale(lengths, hashes, CanonicalPath(pd.CsprojPath), text, out var pwhy))
+            {
+                log($"  WARNING: {pd.CsprojPath} {pwhy} — skipped");
+                continue;
+            }
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
             var lines = SplitLinesKeepEnds(text);
             // Keep an XML declaration ("<?xml ...?>") on the first line: legacy csprojs have one,
@@ -209,6 +227,41 @@ public static class Editor
                 return 1;
             }
             wholeFiles.Add((file, text, wenc));
+        }
+
+        // Whole projects: the csproj must be the one analyzed, and no C# file may have appeared under
+        // the project since — removing the project would strand code the plan never saw.
+        foreach (var pd in report.DeletableProjects)
+        {
+            var cpath = CanonicalPath(pd.CsprojPath);
+            if (File.Exists(cpath))
+            {
+                var ptext = ReadFileText(cpath, out _);
+                if (Stale(lengths, hashes, cpath, ptext, out var pwhy))
+                {
+                    log($"error: {cpath} {pwhy} — NOTHING was deleted");
+                    return 1;
+                }
+            }
+            var dir = Path.GetDirectoryName(cpath);
+            if (dir == null || !Directory.Exists(dir)) { continue; }
+            var known = new HashSet<string>(pd.SourceFiles.Select(CanonicalPath), Constants.PathComparer);
+            try
+            {
+                var added = EnumerateFilesPruned(dir)
+                    .Where(f => Path.GetExtension(f) == ".cs" && !known.Contains(CanonicalPath(f)))
+                    .OrderBy(f => f, Constants.PathComparer).FirstOrDefault();
+                if (added != null)
+                {
+                    log($"error: {added} appeared in project {pd.Project} after the analysis — removing the project would strand it; NOTHING was deleted, re-run delete");
+                    return 1;
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                log($"error: could not list {dir} to validate project {pd.Project}: {e.Message} — NOTHING was deleted");
+                return 1;
+            }
         }
 
         // csproj edits are computed and validated BEFORE any write, exactly like source edits: a
@@ -464,6 +517,32 @@ public static class Editor
         return !Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories).Any();
     }
 
+    /// <summary>Every file under <paramref name="dir"/>, skipping build-output and tooling
+    /// directories (bin, obj, node_modules, ...).</summary>
+    internal static IEnumerable<string> EnumerateFilesPruned(string dir)
+    {
+        var stack = new Stack<string>();
+        stack.Push(dir);
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            foreach (var sub in Directory.EnumerateDirectories(cur))
+            {
+                if (!Constants.SkippedScanDirectories.Contains(Path.GetFileName(sub))) { stack.Push(sub); }
+            }
+            foreach (var f in Directory.EnumerateFiles(cur)) { yield return f; }
+        }
+    }
+
+    /// <summary>True when the given (0-based) line begins INSIDE a token — a verbatim or raw string
+    /// literal that spans lines and ends on it. A line inserted there would land inside the string.</summary>
+    internal static bool LineStartsInsideToken(SyntaxTree tree, int line)
+    {
+        var lineStart = tree.GetText().Lines[line].Start;
+        var token = tree.GetRoot().FindToken(lineStart);
+        return token.Span.Start < lineStart && lineStart < token.Span.End;
+    }
+
     // ----------------------------------------------------------- xml helpers
 
     static bool IsPackageRefElement(string elementText, string package)
@@ -605,19 +684,29 @@ public static class Editor
         return InXmlComment(lineText, lineText.Length, startsInComment);
     }
 
-    static int MarkXmlElements(string file, string elementName, Func<string, bool> match, Action<string> log)
+    static int MarkXmlElements(string file, List<(string Element, Func<string, bool> Match)> edits, Dictionary<string, int> lengths, Dictionary<string, string> hashes, Action<string> log)
     {
         if (!File.Exists(file)) { return 0; }
         try
         {
             var text = ReadFileText(file, out var encoding);
+            if (Stale(lengths, hashes, file, text, out var why))
+            {
+                log($"  WARNING: {file} {why} — skipped");
+                return 0;
+            }
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
             var lines = SplitLinesKeepEnds(text);
-            var found = FindXmlElements(lines, elementName, match);
-            int inserted = 0;
-            for (int fi = found.Count - 1; fi >= 0; fi--)
+            // Every element's start line is found on the UNMODIFIED lines first, then markers go in
+            // bottom-up, so an insertion never shifts a line still to be marked.
+            var starts = new SortedSet<int>();
+            foreach (var (element, match) in edits)
             {
-                var (from, _) = found[fi];
+                foreach (var (from, _) in FindXmlElements(lines, element, match)) { starts.Add(from); }
+            }
+            int inserted = 0;
+            foreach (var from in starts.Reverse())
+            {
                 if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) { continue; }
                 var terminator = LineTerminator(lines[from]);
                 if (terminator.Length == 0) { terminator = nl; }

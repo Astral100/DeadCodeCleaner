@@ -93,7 +93,7 @@ public sealed class Engine
         }
         foreach (var st in report.Statements) { AddSpan(st.File, st.SpanStart, st.SpanLength); }
         foreach (var ur in report.UsingRemovals) { AddSpan(ur.File, ur.SpanStart, ur.SpanLength); }
-        var deletableFiles = new HashSet<string>(report.DeletableFiles, Constants.PathComparer);
+        var deletableFiles = new HashSet<string>(report.DeletableFiles.Select(Editor.CanonicalPath), Constants.PathComparer);
 
         string PathOfProject(string name)
         {
@@ -106,7 +106,7 @@ public sealed class Engine
             foreach (var doc in project.Documents)
             {
                 if (doc.FilePath == null) { continue; }
-                if (deletableFiles.Contains(doc.FilePath))
+                if (deletableFiles.Contains(Editor.CanonicalPath(doc.FilePath)))
                 {
                     sol2 = sol2.RemoveDocument(doc.Id);
                     changed.Add(project.Id);
@@ -267,7 +267,10 @@ public sealed class Engine
         var orphanProd = new HashSet<string>(StringComparer.Ordinal);
         foreach (var n in graph.Nodes)
         {
-            if (removed.Contains(n) || graph.TestNodes.Contains(n)) { continue; }
+            if (removed.Contains(n)) { continue; }
+            // Test-world code is handled by the test cascade below — but a test-project node no test
+            // ever reached lives ONLY through production, so production orphaning applies to it.
+            if (graph.TestNodes.Contains(n) && rt1.Contains(n)) { continue; }
             if (r1.Contains(n) && !r2.Contains(n)) { orphanProd.Add(n); }
         }
 
@@ -302,7 +305,20 @@ public sealed class Engine
             if (!membersOf.TryGetValue(container, out var list)) { membersOf[container] = list = new List<string>(); }
             list.Add(member);
         }
-        var poisoned = Poison(graph, poisonSeeds, r2, rt1, membersOf);
+        // Config keep patterns hold in the TEST world too: a kept node (and every container it sits
+        // in, since a dead container takes its members along) is never poisoned. If it references
+        // deleted code it then breaks the build — reported below, and refused by delete.
+        var keptProtected = new HashSet<string>(graph.ConfigKeptIds, StringComparer.Ordinal);
+        foreach (var k in graph.ConfigKeptIds)
+        {
+            var cur = k;
+            while (graph.ContainerOf.TryGetValue(cur, out var kc))
+            {
+                keptProtected.Add(kc);
+                cur = kc;
+            }
+        }
+        var poisoned = Poison(graph, poisonSeeds, r2, rt1, membersOf, keptProtected);
 
         var brokenTests = new HashSet<string>(
             poisoned.Where(p => graph.TestNodes.Contains(p) && rt1.Contains(p)), StringComparer.Ordinal);
@@ -361,14 +377,35 @@ public sealed class Engine
         var stmtsByMember = graph.Statements
             .GroupBy(s => s.ContainingMember, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
-        foreach (var (typeId, reason) in graph.RootReasons)
+        // Every member at any depth (nested types and THEIR members): code inside a nested type is
+        // part of the container and dies with it, so it must pass the same checks.
+        List<string> Descendants(string typeId)
         {
-            if (reason is not (Constants.ReasonAutoMapperProfile or Constants.ReasonAutofacModule)) { continue; }
-            if (allDead.Contains(typeId)) { continue; }
-            if (!graph.Decl.TryGetValue(typeId, out var containerSym) || containerSym is not INamedTypeSymbol nts) { continue; }
-            if (!membersOf.TryGetValue(typeId, out var containerMembers)) { continue; }
+            var result = new List<string>();
+            var stack = new Stack<string>();
+            stack.Push(typeId);
+            while (stack.Count > 0)
+            {
+                if (!membersOf.TryGetValue(stack.Pop(), out var ms)) { continue; }
+                foreach (var m in ms)
+                {
+                    result.Add(m);
+                    stack.Push(m);
+                }
+            }
+            return result;
+        }
+        var containerCandidates = graph.RootReasons
+            .Where(kv => kv.Value is Constants.ReasonAutoMapperProfile or Constants.ReasonAutofacModule)
+            .Select(kv => kv.Key).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        bool TryDeleteEmptyContainer(string typeId)
+        {
+            if (allDead.Contains(typeId)) { return false; }
+            if (!graph.Decl.TryGetValue(typeId, out var containerSym) || containerSym is not INamedTypeSymbol nts) { return false; }
+            if (!membersOf.ContainsKey(typeId)) { return false; }
+            var containerMembers = Descendants(typeId);
             // An explicit config keep/root wins over everything, this pass included.
-            if (graph.ConfigKeptIds.Contains(typeId) || containerMembers.Any(graph.ConfigKeptIds.Contains)) { continue; }
+            if (graph.ConfigKeptIds.Contains(typeId) || containerMembers.Any(graph.ConfigKeptIds.Contains)) { return false; }
             var allowed = new HashSet<string>(StringComparer.Ordinal) { typeId };
             allowed.UnionWith(containerMembers);
             var allowedAsms = new HashSet<string>(Constants.EmptyContainerBenignAssemblies, StringComparer.OrdinalIgnoreCase);
@@ -421,7 +458,7 @@ public sealed class Engine
                     }
                 }
             }
-            if (!eligible || stmtsTotal == 0) { continue; }
+            if (!eligible || stmtsTotal == 0) { return false; }
             var targetSet = new HashSet<string>(containerMembers, StringComparer.Ordinal) { typeId };
             bool referenced = false;
             foreach (var (src, outs) in graph.Edges)
@@ -434,18 +471,30 @@ public sealed class Engine
                     break;
                 }
             }
-            if (referenced) { continue; }
-            orphanProd.Add(typeId);
+            if (referenced) { return false; }
+            // A container in a test project is test-world code: report it as such.
+            var bucket = graph.TestNodes.Contains(typeId) ? orphanTestHelpers : orphanProd;
+            bucket.Add(typeId);
             allDead.Add(typeId);
             foreach (var m in containerMembers)
             {
-                orphanProd.Add(m);
+                bucket.Add(m);
                 allDead.Add(m);
             }
+            return true;
         }
-        // The empty-container pass can grow allDead: statements referencing a container deleted by
-        // it must die too.
-        KillInvolvedStatements();
+        // To a fixed point: deleting one empty container can kill statements (and free another
+        // container that only it referenced), so the pass repeats until nothing more dies.
+        bool containerDied = true;
+        while (containerDied)
+        {
+            containerDied = false;
+            foreach (var typeId in containerCandidates)
+            {
+                if (TryDeleteEmptyContainer(typeId)) { containerDied = true; }
+            }
+            KillInvolvedStatements();
+        }
 
         // Fields that share a declaration with surviving fields are kept (they still count as
         // orphaned logically, but cannot be deleted alone). Tracked so cleanup passes treat them
@@ -509,23 +558,32 @@ public sealed class Engine
             report.Warnings.Add($"{publicApiDeleted} deleted symbol(s) are public API — if any project in this solution is consumed OUTSIDE it (published package, another repo), those consumers are invisible here; add keep patterns for the published surface");
         }
 
+        // Every deleted name, members of wholly-deleted types included: a view references a deleted
+        // controller's ACTION names far more often than the type name. One entry per simple name.
+        var deletedNames = new List<(string Fqn, string Name)>();
+        var seenDeletedNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var id in allDead.Where(x => !keptInPlace.Contains(x)).OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+        {
+            if (!graph.Decl.TryGetValue(id, out var dsym)) { continue; }
+            if (dsym is IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor or MethodKind.Destructor }) { continue; }
+            if (dsym.Name.Length < 3 || !seenDeletedNames.Add(dsym.Name)) { continue; }
+            deletedNames.Add((SymbolNames.Fqn(dsym), dsym.Name));
+        }
+
         // Deleted symbols whose names still appear inside inactive #if regions: the compiler (and
         // the verifier) cannot see that code, so another build configuration may break silently.
         if (graph.DisabledTexts.Count > 0)
         {
             int mentions = 0;
-            foreach (var symd in report.Symbols)
+            foreach (var (fqn, name) in deletedNames)
             {
-                var dot = symd.Fqn.LastIndexOf('.');
-                var name = dot >= 0 ? symd.Fqn[(dot + 1)..] : symd.Fqn;
-                if (name.Length < 3 || name == "ctor" || name == "cctor") { continue; }
                 foreach (var (file, disabledText) in graph.DisabledTexts.OrderBy(kv => kv.Key, Constants.PathComparer))
                 {
                     if (!Regex.IsMatch(disabledText, @"\b" + Regex.Escape(name) + @"\b")) { continue; }
                     mentions++;
                     if (mentions <= Constants.ShownInactiveMentions)
                     {
-                        report.Warnings.Add($"deleted {symd.Fqn} is mentioned in inactive #if code in {file} — another build configuration may still use it");
+                        report.Warnings.Add($"deleted {fqn} is mentioned in inactive #if code in {file} — another build configuration may still use it");
                     }
                     break;
                 }
@@ -542,18 +600,15 @@ public sealed class Engine
         if (graph.ViewTexts.Count > 0)
         {
             int viewMentions = 0;
-            foreach (var symd in report.Symbols)
+            foreach (var (fqn, name) in deletedNames)
             {
-                var dot = symd.Fqn.LastIndexOf('.');
-                var name = dot >= 0 ? symd.Fqn[(dot + 1)..] : symd.Fqn;
-                if (name.Length < 3 || name == "ctor" || name == "cctor") { continue; }
                 foreach (var (file, viewText) in graph.ViewTexts.OrderBy(kv => kv.Key, Constants.PathComparer))
                 {
                     if (!Regex.IsMatch(viewText, @"\b" + Regex.Escape(name) + @"\b")) { continue; }
                     viewMentions++;
                     if (viewMentions <= Constants.ShownViewMentions)
                     {
-                        report.Warnings.Add($"deleted {symd.Fqn} is mentioned in {file} — views compile at runtime, so this deletion can break a page the verifier cannot see");
+                        report.Warnings.Add($"deleted {fqn} is mentioned in {file} — views compile at runtime, so this deletion can break a page the verifier cannot see");
                     }
                     break;
                 }
@@ -636,6 +691,20 @@ public sealed class Engine
                 report.Warnings.Add($"STILL REFERENCED: kept-in-place {FqnOf(graph, id)} references deleted {string.Join(", ", broken)} — adjust manually or the build will fail");
             }
         }
+        // Config-kept code the production sweep does not reach (test-world code) is shielded from the
+        // poison pass, so a reference from it into deleted code is a build break the user must fix:
+        // counted like a still-referenced target, so delete refuses.
+        var keptBrokenTargets = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var id in graph.ConfigKeptIds.Where(k => !r2.Contains(k) && !allDead.Contains(k)).OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+        {
+            if (!graph.Edges.TryGetValue(id, out var outs)) { continue; }
+            var brokenIds = outs.Where(allDead.Contains).ToList();
+            if (brokenIds.Count == 0) { continue; }
+            keptBrokenTargets.UnionWith(brokenIds);
+            var shown = brokenIds.Select(t => FqnOf(graph, t)).Distinct().OrderBy(x => x, StringComparer.Ordinal).Take(Constants.ShownSurvivingRefs);
+            report.Warnings.Add($"STILL REFERENCED: config-kept {FqnOf(graph, id)} references deleted {string.Join(", ", shown)} — the keep pattern protects it, so the build will fail; fix it manually");
+        }
+        report.StillReferencedTargets += keptBrokenTargets.Count;
 
         // Statement entries (only when their containing member survives). Statements sharing one
         // anchor (fluent chains) delete only their own segment when a sibling survives.
@@ -649,6 +718,22 @@ public sealed class Engine
         }
         // Member-level chain segments of SURVIVING statements whose refs died (an explicitly removed
         // mapped member): only the ".ForMember(...)" goes — the rest of the mapping stands.
+        // Method-name positions of SURVIVING statements, per file: a deleted span must never contain
+        // one (a live registration nested inside a dying chain's argument or lambda), or deleting the
+        // span silently takes the live statement with it. The name — not the anchor — is used: a
+        // nested registration can share its anchor statement with the dying one.
+        var survivingNames = new Dictionary<string, List<(int Pos, StatementNode Stmt)>>(Constants.PathComparer);
+        foreach (var s in graph.Statements)
+        {
+            if (deadStmts.Contains(s)) { continue; }
+            if (!survivingNames.TryGetValue(s.FilePath, out var nlist)) { survivingNames[s.FilePath] = nlist = new List<(int, StatementNode)>(); }
+            nlist.Add((s.NameStart, s));
+        }
+        bool SpanHidesSurvivor(string file, int start, int length, StatementNode self)
+        {
+            return survivingNames.TryGetValue(file, out var names)
+                && names.Any(n => n.Stmt != self && n.Pos >= start && n.Pos < start + length);
+        }
         var segmentRemovals = new List<(StatementNode Stmt, StatementSegment Seg)>();
         foreach (var stmt in graph.Statements)
         {
@@ -657,20 +742,15 @@ public sealed class Engine
             foreach (var seg in stmt.ChainSegments)
             {
                 if (!seg.Refs.Any(allDead.Contains)) { continue; }
+                if (SpanHidesSurvivor(stmt.FilePath, seg.Start, seg.Length, stmt))
+                {
+                    WarnOnce($"manual: {stmt.FilePath}:{seg.Line} — a surviving tracked statement is nested inside this segment; delete it manually: {seg.Snippet}");
+                    continue;
+                }
                 segmentRemovals.Add((stmt, seg));
                 var gone = seg.Refs.Where(allDead.Contains).Select(n => FqnOf(graph, n)).Distinct().ToList();
                 WarnOnce($"map configuration removed: {stmt.FilePath}:{seg.Line} .{seg.MethodName}(...) references deleted {string.Join(", ", gone)} — the segment is removed, the rest of the mapping is kept");
             }
-        }
-        // Anchor positions of SURVIVING statements, per file: a dead statement's span must never
-        // contain one (a live registration nested inside a dying chain's argument), or deleting the
-        // span silently takes the live statement with it.
-        var survivingAnchors = new Dictionary<string, List<int>>(Constants.PathComparer);
-        foreach (var s in graph.Statements)
-        {
-            if (deadStmts.Contains(s)) { continue; }
-            if (!survivingAnchors.TryGetValue(s.FilePath, out var alist)) { survivingAnchors[s.FilePath] = alist = new List<int>(); }
-            alist.Add(s.AnchorStart);
         }
         foreach (var stmt in deadStmts.OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.AnchorStart).ThenBy(s => s.SegmentStart))
         {
@@ -699,8 +779,7 @@ public sealed class Engine
                 WarnOnce($"manual: {stmt.FilePath}:{stmt.StartLine} — the containing statement must partially survive; delete this call manually: {stmt.Snippet}");
                 continue;
             }
-            if (survivingAnchors.TryGetValue(stmt.FilePath, out var anchors)
-                && anchors.Any(a => a > spanStart && a < spanStart + spanLength))
+            if (SpanHidesSurvivor(stmt.FilePath, spanStart, spanLength, stmt))
             {
                 WarnOnce($"manual: {stmt.FilePath}:{stmt.StartLine} — a surviving tracked statement is nested inside this span; delete it manually: {stmt.Snippet}");
                 continue;
@@ -717,6 +796,7 @@ public sealed class Engine
                 SpanStart = spanStart,
                 SpanLength = spanLength,
                 WholeStatement = whole,
+                MarkerLineInsideToken = stmt.MarkerLineInsideToken,
             });
         }
         foreach (var (stmt, seg) in segmentRemovals)
@@ -733,6 +813,7 @@ public sealed class Engine
                 SpanStart = seg.Start,
                 SpanLength = seg.Length,
                 WholeStatement = false,
+                MarkerLineInsideToken = seg.MarkerLineInsideToken,
             });
         }
         report.Statements.Sort((a, b) => string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.StartLine.CompareTo(b.StartLine));
@@ -787,6 +868,7 @@ public sealed class Engine
         foreach (var path in report.PackageRefRemovals.Select(r => r.CsprojPath)
             .Concat(report.ProjectRefRemovals.Select(r => r.CsprojPath))
             .Concat(report.CompileEntryRemovals.Select(r => r.CsprojPath))
+            .Concat(report.DeletableProjects.Select(p => p.CsprojPath))
             .Distinct(Constants.PathComparer))
         {
             if (path == null || !File.Exists(path)) { continue; }
@@ -977,6 +1059,7 @@ public sealed class Engine
                 EndLine = lines.EndLinePosition.Line + 1,
                 SpanStart = spanStart,
                 SpanLength = spanEnd - spanStart,
+                MarkerLineInsideToken = Editor.LineStartsInsideToken(tree, lines.StartLinePosition.Line),
             });
         }
         return parts;
@@ -1079,8 +1162,21 @@ public sealed class Engine
                 report.Warnings.Add($"{pname}: every declaration is dead, but the project is NOT removed — {protectedFile} has inactive #if regions or duplicate type names; its code is deleted file by file, remove the project manually");
                 continue;
             }
+            // Snapshot of the project's C# files: delete refuses when one appeared since, instead of
+            // stranding code the plan never saw.
+            var sourceFiles = new List<string>();
+            var pdir = Path.GetDirectoryName(Path.GetFullPath(pi.FilePath));
+            try
+            {
+                if (pdir != null && Directory.Exists(pdir)) { sourceFiles.AddRange(Editor.EnumerateFilesPruned(pdir).Where(f => Path.GetExtension(f) == ".cs")); }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                report.Warnings.Add($"{pname}: every declaration is dead, but the project is NOT removed — its directory could not be listed ({e.Message}); remove it manually");
+                continue;
+            }
             deletableProjects.Add(pname);
-            report.DeletableProjects.Add(new ProjectDeletion { Project = pname, CsprojPath = pi.FilePath });
+            report.DeletableProjects.Add(new ProjectDeletion { Project = pname, CsprojPath = pi.FilePath, SourceFiles = sourceFiles });
         }
 
         // Per-project usage facts. A "need" is a group of projects that declare one referenced node
@@ -1571,7 +1667,7 @@ public sealed class Engine
     /// <summary>Forward-breakage propagation: code that is not in use after the removal and
     /// references deleted code cannot compile, so it is deleted too. A dead member of a dead type
     /// escalates to the whole type (partial deletion could break interface contracts).</summary>
-    HashSet<string> Poison(Graph graph, HashSet<string> seeds, HashSet<object> r2, HashSet<object> rt1, Dictionary<string, List<string>> membersOf)
+    HashSet<string> Poison(Graph graph, HashSet<string> seeds, HashSet<object> r2, HashSet<object> rt1, Dictionary<string, List<string>> membersOf, HashSet<string> keptProtected)
     {
         // Reverse adjacency restricted to sources that are not in use after removal.
         var reverse = new Dictionary<string, List<string>>(StringComparer.Ordinal);
@@ -1590,7 +1686,7 @@ public sealed class Engine
 
         void Kill(string id)
         {
-            if (seeds.Contains(id) || !dead.Add(id)) { return; }
+            if (seeds.Contains(id) || keptProtected.Contains(id) || !dead.Add(id)) { return; }
             queue.Enqueue(id);
             // A dead member of a type that is itself out of use takes the whole type down — except
             // in test classes (one broken test must not delete its healthy siblings) and types the

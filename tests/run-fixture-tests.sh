@@ -11,7 +11,10 @@ SCRATCH3=""
 SCRATCH4=""
 SCRATCH5=""
 SCRATCH6=""
-trap 'rm -rf "$SCRATCH" "$SCRATCH2" "$SCRATCH3" "$SCRATCH4" "$SCRATCH5" "$SCRATCH6"; rm -f "$REPORT"' EXIT
+SCRATCH7=""
+SCRATCH8=""
+KEEPCFG=$(mktemp)
+trap 'rm -rf "$SCRATCH" "$SCRATCH2" "$SCRATCH3" "$SCRATCH4" "$SCRATCH5" "$SCRATCH6" "$SCRATCH7" "$SCRATCH8"; rm -f "$REPORT" "$KEEPCFG"' EXIT
 FAIL=0
 
 check() { # check <description> <jq filter that must output true>
@@ -116,6 +119,12 @@ check "attribute ctor survives via surviving method's attribute" \
     '[.symbols[] | select(.fqn == "Fixture.Domain.AuditAttribute..ctor")] | length == 0'
 check "chained generic converter NOT orphaned (its map survives)" \
     '[.symbols[].fqn] | map(select(contains("GadgetConverter"))) | length == 0'
+check "class with only INHERITED tests is a test class (broken-test, never broken-orphan)" \
+    '[.symbols[] | select(.fqn | startswith("Fixture.Tests.WidgetCheckTests")) | .category] | (length >= 1 and all(. == "broken-test"))'
+check "base fixture with the test survives" \
+    '[.symbols[].fqn] | map(select(startswith("Fixture.Tests.WidgetCheckBase"))) | length == 0'
+check "view mentioning an ACTION of a wholly-deleted controller warns" \
+    '[.warnings[]] | map(select(contains("WidgetsController.GetWidgetBadge is mentioned in") and contains("Index.cshtml"))) | length == 1'
 
 echo "== Case 2: remove GetSecondary (member-level, narrow cascade)"
 dotnet run --project src/DeadCodeCleaner -- analyze --config tests/Fixture/dcc-config.json \
@@ -283,9 +292,9 @@ dotnet run --project src/DeadCodeCleaner -- analyze --config tests/Fixture/dcc-c
 check "explicit class removal still cascades its test" \
     '[.symbols[] | select(.category=="broken-test") | .fqn] | index("Fixture.Tests.CollateralHelperTests") != null'
 
-echo "== Case 10: test-project classification needs evidence, never a name alone (scratch)"
+echo "== Case 10: a test project needs a test library AND a test, never a name (scratch)"
 SCRATCH4=$(mktemp -d)
-mkdir -p "$SCRATCH4/ProdUtil" "$SCRATCH4/Scratch.Test.Tools" "$SCRATCH4/Scratch.Tests"
+mkdir -p "$SCRATCH4/ProdUtil" "$SCRATCH4/Scratch.Test.Tools" "$SCRATCH4/Scratch.Tests" "$SCRATCH4/Scratch.Helpers"
 cat > "$SCRATCH4/ProdUtil/ProdUtil.csproj" <<'CSPROJ'
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
@@ -315,16 +324,25 @@ cat > "$SCRATCH4/Scratch.Tests/Scratch.Tests.csproj" <<'CSPROJ'
 </Project>
 CSPROJ
 printf 'namespace Scratch.Tests;\n\npublic class Helper\n{\n    public void Check() { }\n}\n' > "$SCRATCH4/Scratch.Tests/Helper.cs"
-(cd "$SCRATCH4" && dotnet new sln -n Scratch --force > /dev/null 2>&1 && dotnet sln Scratch.sln add ProdUtil/ProdUtil.csproj Scratch.Test.Tools/Scratch.Test.Tools.csproj Scratch.Tests/Scratch.Tests.csproj > /dev/null 2>&1)
+cat > "$SCRATCH4/Scratch.Helpers/Scratch.Helpers.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+</Project>
+CSPROJ
+printf 'namespace Scratch.Helpers;\n\npublic class Builder\n{\n    public void Build() { }\n}\n' > "$SCRATCH4/Scratch.Helpers/Builder.cs"
+(cd "$SCRATCH4" && dotnet new sln -n Scratch --force > /dev/null 2>&1 && dotnet sln Scratch.sln add ProdUtil/ProdUtil.csproj Scratch.Test.Tools/Scratch.Test.Tools.csproj Scratch.Tests/Scratch.Tests.csproj Scratch.Helpers/Scratch.Helpers.csproj > /dev/null 2>&1)
 dotnet run --project src/DeadCodeCleaner -- analyze --config tests/Fixture/dcc-config.json \
     --solution "$SCRATCH4/Scratch.sln" \
     --remove ProdUtil.Doomed --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
-check "commented-out test package is NOT evidence (both exes stay production, no test roots)" \
+check "commented-out test package, test-like names, test library without tests: all production (no test roots)" \
     '.stats.productionRoots >= 2 and .stats.testRoots == 0'
-check "name-only library classified test, with a warning" \
-    '[.warnings[]] | map(select(startswith("Scratch.Tests: classified as a TEST project by its NAME alone"))) | length == 1'
-check "name-only EXECUTABLE stays production (no warning for it)" \
-    '[.warnings[]] | map(select(startswith("Scratch.Test.Tools:"))) | length == 0'
+check "test-like NAME alone produces no classification warning" \
+    '[.warnings[]] | map(select(startswith("Scratch.Tests:") or startswith("Scratch.Test.Tools:"))) | length == 0'
+check "test library without a test warns and stays production" \
+    '[.warnings[]] | map(select(startswith("Scratch.Helpers: references a test library but contains no test"))) | length == 1'
 
 echo "== Case 11: assembly-level attribute keeps its ProjectReference and using (scratch)"
 SCRATCH5=$(mktemp -d)
@@ -433,6 +451,182 @@ check "implementation cascades (IDisposable does not pin it)" \
     '[.symbols[] | select(.category=="orphaned") | .fqn] | index("Core.Zeta") != null'
 check "registration statement reported dead" '.statements | length >= 1'
 check "verification clean" '.verificationErrors == 0'
+
+echo "== Case 13: a config keep pattern protects test code from the cascade"
+printf '{ "inSolutionRegistrations": true, "keep": ["Fixture.Tests.WidgetsControllerTests*"] }\n' > "$KEEPCFG"
+dotnet run --project src/DeadCodeCleaner -- analyze --config "$KEEPCFG" \
+    --solution tests/Fixture/Fixture.sln \
+    --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "kept test NOT deleted" \
+    '[.symbols[].fqn] | map(select(startswith("Fixture.Tests.WidgetsControllerTests"))) | length == 0'
+check "kept test referencing deleted code reported as STILL REFERENCED" \
+    '[.warnings[]] | map(select(startswith("STILL REFERENCED: config-kept Fixture.Tests.WidgetsControllerTests"))) | length >= 1'
+check "delete would refuse (counted as still referenced)" '.stillReferencedTargets >= 1'
+
+echo "== Case 14: empty-profile side effects, chained in-solution extension, marker inside a string (scratch)"
+SCRATCH7=$(mktemp -d)
+mkdir -p "$SCRATCH7/Shop"
+cat > "$SCRATCH7/Shop/Shop.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH7/Shop/Shop.cs" <<'CSFILE'
+using System.Globalization;
+
+namespace Shop;
+
+public static class Program
+{
+    public static void Main()
+    {
+        System.Console.WriteLine(Holder.Banner);
+    }
+}
+
+public class Alpha { }
+public class AlphaDto { }
+public class Beta { }
+public class BetaDto { }
+
+public class AlphaController
+{
+    public object Get()
+    {
+        return new AlphaDto().ToString() + new Alpha() + Holder.Banner;
+    }
+}
+
+public class BetaController
+{
+    public object Get()
+    {
+        Holder.Dead();
+        return new BetaDto().ToString() + new Beta();
+    }
+}
+
+public static class Doomed
+{
+    public static void Touch() { }
+}
+
+public static class Holder
+{
+    public static string Banner = @"first
+second"; public static void Dead() { }
+}
+
+public class MainProfile : Profile
+{
+    public MainProfile()
+    {
+        CreateMap<Alpha, AlphaDto>().IgnoreExtra();
+    }
+}
+
+public class CultureProfile : Profile
+{
+    public CultureProfile()
+    {
+        CreateMap<Beta, BetaDto>();
+        CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+    }
+}
+
+// Name-based stand-ins for AutoMapper.
+public class Profile
+{
+    public MappingExpression<TSource, TDest> CreateMap<TSource, TDest>()
+    {
+        return new MappingExpression<TSource, TDest>();
+    }
+}
+
+public class MappingExpression<TSource, TDest>
+{
+}
+
+public static class MappingExtensions
+{
+    public static MappingExpression<TSource, TDest> IgnoreExtra<TSource, TDest>(this MappingExpression<TSource, TDest> expression)
+    {
+        Doomed.Touch();
+        return expression;
+    }
+}
+CSFILE
+(cd "$SCRATCH7" && dotnet new sln -n Scratch --force > /dev/null 2>&1 && dotnet sln Scratch.sln add Shop/Shop.csproj > /dev/null 2>&1)
+dotnet run --project src/DeadCodeCleaner -- analyze --config tests/Fixture/dcc-config.json \
+    --solution "$SCRATCH7/Scratch.sln" \
+    --remove Shop.Doomed --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "extension method called only from a mapping chain is in use (STILL REFERENCED, not deleted)" \
+    '([.warnings[]] | map(select(startswith("STILL REFERENCED") and contains("IgnoreExtra"))) | length >= 1) and ([.symbols[].fqn] | map(select(contains("IgnoreExtra"))) | length == 0)'
+dotnet run --project src/DeadCodeCleaner -- analyze --config tests/Fixture/dcc-config.json \
+    --solution "$SCRATCH7/Scratch.sln" \
+    --remove Shop.BetaController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "dead mapping reported" '[.statements[].snippet] | map(select(contains("CreateMap<Beta, BetaDto>"))) | length == 1'
+check "profile with a static property write is NOT deleted as empty" \
+    '[.symbols[].fqn] | map(select(startswith("Shop.CultureProfile"))) | length == 0'
+check "declaration starting inside a multi-line string is flagged for mark" \
+    '[.symbols[] | select(.fqn=="Shop.Holder.Dead") | .parts[0].markerLineInsideToken] == [true]'
+dotnet run --project src/DeadCodeCleaner -- mark --config tests/Fixture/dcc-config.json --solution "$SCRATCH7/Scratch.sln" \
+    --remove Shop.BetaController --json "$REPORT" > /dev/null 2>&1 || { echo "MARK FAILED"; exit 1; }
+if grep -A1 'Banner = @"first' "$SCRATCH7/Shop/Shop.cs" | tail -1 | grep -q '^second"; public static void Dead'; then
+    pass "mark left the multi-line string intact"; else failx "mark left the multi-line string intact"; fi
+if grep -q "todo: to be deleted" "$SCRATCH7/Shop/Shop.cs"; then
+    pass "other markers still inserted"; else failx "other markers still inserted"; fi
+
+echo "== Case 15: a solution's own 'Profile' base class is not an AutoMapper root (scratch, default config)"
+SCRATCH8=$(mktemp -d)
+mkdir -p "$SCRATCH8/Plain"
+cat > "$SCRATCH8/Plain/Plain.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH8/Plain/Plain.cs" <<'CSFILE'
+namespace Plain;
+
+public static class Program
+{
+    public static void Main()
+    {
+        System.Console.WriteLine("plain");
+    }
+}
+
+public class Profile
+{
+    public string Name = "";
+}
+
+public class AdminProfile : Profile
+{
+    public void Touch()
+    {
+        Doomed.Go();
+    }
+}
+
+public static class Doomed
+{
+    public static void Go() { }
+}
+CSFILE
+(cd "$SCRATCH8" && dotnet new sln -n Scratch --force > /dev/null 2>&1 && dotnet sln Scratch.sln add Plain/Plain.csproj > /dev/null 2>&1)
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH8/Scratch.sln" \
+    --remove Plain.Doomed --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "in-solution Profile subclass is ordinary (pre-existing orphan deleted with its broken reference)" \
+    '[.symbols[] | select(.fqn=="Plain.AdminProfile") | .category] == ["broken-orphan"]'
+check "no STILL REFERENCED (it was never a root)" '.stillReferencedTargets == 0'
 
 if [ "$FAIL" = 1 ]; then echo "RESULT: FAILURES PRESENT"; exit 1; fi
 echo "RESULT: all checks passed"

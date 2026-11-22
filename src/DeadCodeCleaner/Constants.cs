@@ -133,7 +133,6 @@ public static class Constants
     public const string ReportGeneratorName = "DeadCodeCleaner";
     public const string ReportGeneratorJsonFragment = "\"generator\": \"DeadCodeCleaner\"";
 
-    public const string TestProjectNamePattern = @"(^|[._])Tests?([._]|$)";
     /// <summary>Whole package/assembly ids only (anchored): "xunit.abstractions" alone marks a
     /// LIBRARY that extends a test framework, not a test project, and must not match. Matched
     /// against the id part of parsed PackageReference/Reference Include values, never raw text.</summary>
@@ -158,8 +157,27 @@ public static class Constants
     {
         "Fact", "Theory", "Test", "TestMethod", "TestCase", "TestCaseSource", "SetUp", "TearDown",
         "OneTimeSetUp", "OneTimeTearDown", "TestInitialize", "TestCleanup", "ClassInitialize",
-        "ClassCleanup", "AssemblyInitialize", "AssemblyCleanup", "TestFixture",
+        "ClassCleanup", "AssemblyInitialize", "AssemblyCleanup",
     };
+
+    /// <summary>Method attributes that make a method an actual TEST (not setup/teardown): a project is
+    /// a test project only when it contains at least one, besides referencing a test library.</summary>
+    public static readonly HashSet<string> TestMethodAttributeNames = new(StringComparer.Ordinal)
+    {
+        "Fact", "Theory", "Test", "TestCase", "TestCaseSource", "TestMethod", "DataTestMethod",
+    };
+
+    /// <summary>Class attributes marking a test fixture (NUnit, MSTest): the class is a test-world root
+    /// even when its tests are all inherited from a base fixture.</summary>
+    public static readonly HashSet<string> TestClassAttributeNames = new(StringComparer.Ordinal)
+    {
+        "TestFixture", "TestClass",
+    };
+
+    /// <summary>Suffix of the ExternalCallRefs entry recorded for a write to an external member (static
+    /// property/field assignment, event subscription): outside the benign set, so it always blocks the
+    /// empty-container pass.</summary>
+    public const string ExternalWriteSuffix = "!write";
 
     public static readonly HashSet<string> ProdRootAttributeNames = new(StringComparer.Ordinal)
     {

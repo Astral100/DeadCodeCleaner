@@ -105,6 +105,33 @@ public class CollateralHelperTests
     }
 }
 
+// Base fixture: the runner executes its inherited test on every concrete subclass.
+public abstract class WidgetCheckBase
+{
+    [Fact]
+    public void Prefix_when_checked_then_prefix_is_returned()
+    {
+        // Arrange
+        var expectedPrefix = "shared:";
+
+        // Act
+        var actualPrefix = SharedService.Prefix();
+
+        // Assert
+        _ = expectedPrefix == actualPrefix;
+    }
+}
+
+// No attributed member of its own: a test class only through the inherited test. Uses WidgetService,
+// so it must be deleted as a BROKEN TEST (not a broken orphan) when WidgetService dies.
+public class WidgetCheckTests : WidgetCheckBase
+{
+    public WidgetCheckTests()
+    {
+        _ = new WidgetService().Describe();
+    }
+}
+
 // Used only by WidgetsControllerTests: must cascade when that test dies.
 public static class TestData
 {

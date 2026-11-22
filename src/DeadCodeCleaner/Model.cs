@@ -4,16 +4,6 @@ namespace DeadCodeCleaner;
 
 /// <summary>A pseudo-node representing a co-dependent statement (DI registration, CreateMap, ...).
 /// In use iff all guard antecedents are in use; reported for deletion when it dies in the removal run.</summary>
-/// <summary>How a project landed in the test world: by hard evidence (a test-framework reference,
-/// IsTestProject, a test ProjectTypeGuids entry) or by its name alone, which deserves a warning.</summary>
-public enum TestClassification
-{
-    Unknown,
-    Production,
-    TestByEvidence,
-    TestByName,
-}
-
 public sealed class StatementNode
 {
     public required string Kind { get; init; }
@@ -31,6 +21,12 @@ public sealed class StatementNode
     /// the call has no member-access receiver. Used when siblings on the same statement survive.</summary>
     public required int SegmentStart { get; init; }
     public required int SegmentLength { get; init; }
+    /// <summary>Char position of the registration's own method name: unique per statement and always
+    /// inside its own span, so a dead span containing it would delete this statement too.</summary>
+    public required int NameStart { get; init; }
+    /// <summary>True when the start of StartLine lies inside a multi-line token (a verbatim or raw
+    /// string ending on that line): a marker line inserted there would change the string.</summary>
+    public required bool MarkerLineInsideToken { get; init; }
     /// <summary>Length of the file's analyzed text, so the editor can detect decoding mismatches.</summary>
     public required int FileTextLength { get; init; }
     /// <summary>SHA-256 of the file's analyzed text, so the editor can detect same-length edits.</summary>
@@ -60,6 +56,8 @@ public sealed class StatementSegment
     public required string MethodName { get; init; }
     public required string Snippet { get; init; }
     public required List<string> Refs { get; init; }
+    /// <summary>See StatementNode.MarkerLineInsideToken, for this segment's Line.</summary>
+    public required bool MarkerLineInsideToken { get; init; }
 }
 
 /// <summary>Conjunctive implication: when ALL antecedents are in use, all consequents become in use.

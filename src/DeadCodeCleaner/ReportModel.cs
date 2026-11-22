@@ -62,6 +62,9 @@ public sealed class SourcePart
     public required int EndLine { get; init; }
     public required int SpanStart { get; init; }   // char offset incl. leading trivia
     public required int SpanLength { get; init; }
+    /// <summary>True when StartLine begins inside a multi-line token (a string literal ending there):
+    /// mark mode must not insert a marker line at it.</summary>
+    public bool MarkerLineInsideToken { get; init; }
 }
 
 /// <summary>A whole project whose every declaration is deleted: remove it from the solution.</summary>
@@ -69,6 +72,10 @@ public sealed class ProjectDeletion
 {
     public required string Project { get; init; }
     public required string CsprojPath { get; init; }
+    /// <summary>Every C# file under the project directory at analysis time: a file added since then
+    /// is code the plan never saw, so delete refuses instead of stranding it.</summary>
+    [JsonIgnore]
+    public List<string> SourceFiles { get; init; } = new();
 }
 
 /// <summary>A using directive whose every provider assembly is being removed.</summary>
@@ -105,6 +112,8 @@ public sealed class StatementDeletion
     public required int SpanStart { get; init; }
     public required int SpanLength { get; init; }
     public required bool WholeStatement { get; init; }
+    /// <summary>See SourcePart.MarkerLineInsideToken.</summary>
+    public bool MarkerLineInsideToken { get; init; }
 }
 
 public sealed class ReportStats
