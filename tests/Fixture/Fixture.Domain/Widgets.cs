@@ -41,6 +41,11 @@ public class WidgetService : IWidgetService
 {
     public string Describe()
     {
+        // The explicit Add call dies with this class; the initializer in GadgetService must then
+        // keep GadgetBag.Add alive on its own.
+        var bag = new GadgetBag();
+        bag.Add(new GadgetEntity());
+        _ = bag;
         return SharedService.Prefix() + "widget";
     }
 }

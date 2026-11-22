@@ -6,7 +6,8 @@ cd "$(dirname "$0")/.."
 
 REPORT=$(mktemp)
 SCRATCH=""
-trap 'rm -rf "$SCRATCH"; rm -f "$REPORT"' EXIT
+SCRATCH2=""
+trap 'rm -rf "$SCRATCH" "$SCRATCH2"; rm -f "$REPORT"' EXIT
 FAIL=0
 
 check() { # check <description> <jq filter that must output true>
@@ -69,6 +70,28 @@ check "Widgets.cs deletable in full" \
     '[.deletableFiles[]] | map(select(endswith("Widgets.cs"))) | length == 1'
 check "Controllers.cs NOT deletable" \
     '[.deletableFiles[]] | map(select(endswith("Controllers.cs"))) | length == 0'
+check "overridden base member survives (override still compiles)" \
+    '[.symbols[].fqn] | index("Fixture.Domain.ShapeBase.Render") == null'
+check "partial method deleted with BOTH parts" \
+    '[.symbols[] | select(.fqn=="Fixture.Domain.WidgetFormatter.FormatWidget") | .parts | length] == [2]'
+check "partial type itself survives (other member in use)" \
+    '[.symbols[].fqn] | index("Fixture.Domain.WidgetFormatter") == null'
+check "collection-initializer Add survives (bound-tree edge)" \
+    '[.symbols[].fqn] | index("Fixture.Domain.GadgetBag.Add") == null'
+check "assembly-attribute class survives" \
+    '[.symbols[].fqn] | index("Fixture.Domain.FixtureMarkerAttribute") == null'
+check "WidgetExtra orphaned (inactive-region trap armed)" \
+    "$orph | index(\"Fixture.Domain.WidgetExtra\") != null"
+check "file with inactive #if region NOT deletable" \
+    '[.deletableFiles[]] | map(select(endswith("Conditional.cs"))) | length == 0'
+check "inactive-region warning emitted" \
+    '[.warnings[]] | map(select(contains("inactive #if"))) | length == 1'
+check "broken test method deleted from mixed class" \
+    '[.symbols[] | select(.category=="broken-test") | .fqn] | index("Fixture.Tests.MixedTests.GetWidget_when_controller_is_removed_then_this_test_breaks") != null'
+check "healthy sibling test and its class survive" \
+    '[.symbols[].fqn] | map(select(startswith("Fixture.Tests.MixedTests"))) | length == 1'
+check "verification clean (plan introduces no compile errors)" \
+    '[.warnings[] | select(startswith("VERIFY"))] | length == 0'
 
 echo "== Case 2: remove GetSecondary (member-level, narrow cascade)"
 dotnet run --project src/DeadCodeCleaner -- analyze \
@@ -150,6 +173,35 @@ check "STILL REFERENCED warning emitted" \
     '[.warnings[]] | map(select(startswith("STILL REFERENCED"))) | length >= 1'
 check "warning names a surviving referrer" \
     '[.warnings[] | select(startswith("STILL REFERENCED"))] | map(select(contains("GadgetsController") or contains("GetGadget"))) | length >= 1'
+check "verification catches the broken plan" \
+    '[.warnings[] | select(startswith("VERIFY"))] | length >= 1'
+
+echo "== Case 7: removing an implementation kills its registration; enum member deletes cleanly"
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution tests/Fixture/Fixture.sln \
+    --remove Fixture.Domain.WidgetService --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+
+check "registration reported dead although its service survives" \
+    '[.statements[] | select(.snippet|contains("IWidgetService"))] | length == 1'
+check "deleted-but-in-use registration warning emitted" \
+    '[.warnings[]] | map(select(startswith("registration deleted although still in use"))) | length == 1'
+
+SCRATCH2=$(mktemp -d)
+cp -r tests/Fixture "$SCRATCH2/Fixture"
+dotnet restore "$SCRATCH2/Fixture/Fixture.sln" > /dev/null 2>&1
+dotnet run --project src/DeadCodeCleaner -- delete --solution "$SCRATCH2/Fixture/Fixture.sln" \
+    --remove Fixture.Domain.WidgetService --remove Fixture.Domain.WidgetKind.Fancy \
+    --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED (verification rejected the plan?)"; exit 1; }
+if ! grep -q "    Fancy" "$SCRATCH2/Fixture/Fixture.Domain/Shapes.cs"; then
+    pass "enum member deleted"; else failx "enum member deleted"; fi
+if grep -q "Legacy," "$SCRATCH2/Fixture/Fixture.Domain/Shapes.cs"; then
+    pass "following enum member intact"; else failx "following enum member intact"; fi
+if ! grep -q "AddScoped<IWidgetService" "$SCRATCH2/Fixture/Fixture.Web/Program.cs"; then
+    pass "registration removed with its implementation"; else failx "registration removed with its implementation"; fi
+if grep -q "AddFixtureLogging" "$SCRATCH2/Fixture/Fixture.Web/Program.cs"; then
+    pass "chained untracked call survives"; else failx "chained untracked call survives"; fi
+if dotnet build "$SCRATCH2/Fixture/Fixture.sln" > /dev/null 2>&1; then
+    pass "solution builds after delete"; else failx "solution builds after delete"; fi
 
 if [ "$FAIL" = 1 ]; then echo "RESULT: FAILURES PRESENT"; exit 1; fi
 echo "RESULT: all checks passed"

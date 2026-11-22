@@ -58,6 +58,36 @@ public class WidgetServiceTests
     }
 }
 
+// One broken test must not delete its healthy sibling or the class.
+public class MixedTests
+{
+    [Fact]
+    public void GetWidget_when_controller_is_removed_then_this_test_breaks()
+    {
+        // Arrange
+        var sut = new WidgetsController(new Mediator(), new WidgetService());
+
+        // Act
+        var actualWidget = sut.GetWidget();
+
+        // Assert
+        _ = actualWidget;
+    }
+
+    [Fact]
+    public void Prefix_when_called_then_this_test_stays_healthy()
+    {
+        // Arrange
+        var expectedPrefix = "shared:";
+
+        // Act
+        var actualPrefix = SharedService.Prefix();
+
+        // Assert
+        _ = expectedPrefix == actualPrefix;
+    }
+}
+
 // Used only by WidgetsControllerTests: must cascade when that test dies.
 public static class TestData
 {

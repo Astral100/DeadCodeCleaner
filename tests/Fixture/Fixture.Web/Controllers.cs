@@ -27,6 +27,14 @@ public class WidgetsController
         return SecondaryHelper.Compute();
     }
 
+    // Uses Render through the BASE type, the partial method, the conditional file's class, and the
+    // marker attribute: all must be handled correctly when this controller is removed.
+    [FixtureMarker]
+    public string GetWidgetBadge(ShapeBase shape)
+    {
+        return shape.Render() + new WidgetFormatter().FormatWidget() + new WidgetExtra().Tag();
+    }
+
     // Overload with its own private dependency: removable individually by signature.
     public string GetSecondary(int times)
     {
@@ -53,7 +61,8 @@ public class GadgetsController
 
     public string GetGadget()
     {
-        return SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter;
+        return SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter
+            + new Circle().Render() + new WidgetFormatter().Plain() + WidgetKind.Basic;
     }
 }
 

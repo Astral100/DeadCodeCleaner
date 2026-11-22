@@ -76,6 +76,11 @@ public static class Program
                     Editor.Mark(report, log);
                     break;
                 case "delete":
+                    if (report.VerificationErrors > 0)
+                    {
+                        Console.Error.WriteLine($"error: verification found {report.VerificationErrors} new compile error(s) in the deletion plan — nothing was deleted (see the VERIFY warnings; --no-verify overrides)");
+                        return 1;
+                    }
                     Editor.Delete(report, log);
                     break;
             }
@@ -115,6 +120,7 @@ public static class Program
                 case "--json": opts.JsonPath = Path.GetFullPath(Next()); break;
                 case "--config": opts.ConfigPath = Path.GetFullPath(Next()); break;
                 case "--strict-members": opts.StrictMembers = true; break;
+                case "--no-verify": opts.NoVerify = true; break;
                 case "--verbose" or "-v": opts.Verbose = true; break;
                 default: throw new ArgumentException($"unknown option '{args[i]}'");
             }
@@ -140,6 +146,7 @@ public static class Program
               --json <path>      where to write the JSON report (default ./deadcode-report.json)
               --config <path>    JSON config: { "keep": ["Ns.Type*", ...], "strictMembers": false }
               --strict-members   do not auto-keep public properties / enum members of in-use types
+              --no-verify        skip the in-memory rebuild that checks the plan compiles
               --verbose          print full lists instead of the first 100
 
             The FQN format is Namespace.Type.Member without parameters, e.g.

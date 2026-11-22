@@ -11,8 +11,12 @@ public sealed class DeletionReport
     public List<ProjectDeletion> DeletableProjects { get; } = new();
     public List<ReferenceRemoval> PackageRefRemovals { get; } = new();
     public List<ReferenceRemoval> ProjectRefRemovals { get; } = new();
+    /// <summary>Explicit &lt;Compile&gt; entries (old-style csproj) of files deleted in full.</summary>
+    public List<ReferenceRemoval> CompileEntryRemovals { get; } = new();
     public List<UsingRemoval> UsingRemovals { get; } = new();
     public List<string> Warnings { get; } = new();
+    /// <summary>New compile errors the in-memory verification found in the deletion plan (0 = safe).</summary>
+    public int VerificationErrors { get; set; }
     public ReportStats Stats { get; set; } = new();
 }
 
@@ -61,10 +65,10 @@ public sealed class ReferenceRemoval
 {
     public required string Project { get; init; }
     public required string CsprojPath { get; init; }
-    /// <summary>Package name, or referenced project name.</summary>
+    /// <summary>Package name, referenced project name, or a Compile item's include path.</summary>
     public required string Reference { get; init; }
-    /// <summary>For project references: the referenced csproj file name as written in the Include
-    /// attribute (a solution can display the project under a different name). Null for packages.</summary>
+    /// <summary>For project references: the Include attribute value as written in the csproj (a
+    /// solution can display the project under a different name). Null for packages.</summary>
     public string ReferenceFile { get; init; }
 }
 

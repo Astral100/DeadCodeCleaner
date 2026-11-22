@@ -20,11 +20,11 @@ public static class ReportWriter
         foreach (var f in report.DeletableFiles.Take(limit)) Console.WriteLine($"  {f}");
         More(report.DeletableFiles.Count, limit);
 
-        PrintCategory(report, "removed", "Requested removals", limit);
-        PrintCategory(report, "orphaned", "Newly orphaned production code", limit);
-        PrintCategory(report, "broken-orphan", "Pre-existing orphans deleted (they reference deleted code)", limit);
-        PrintCategory(report, "broken-test", "Tests referencing deleted code (deleted too)", limit);
-        PrintCategory(report, "orphaned-test-helper", "Test helpers left without callers", limit);
+        PrintCategory(report, Constants.CategoryRemoved, "Requested removals", limit);
+        PrintCategory(report, Constants.CategoryOrphaned, "Newly orphaned production code", limit);
+        PrintCategory(report, Constants.CategoryBrokenOrphan, "Pre-existing orphans deleted (they reference deleted code)", limit);
+        PrintCategory(report, Constants.CategoryBrokenTest, "Tests referencing deleted code (deleted too)", limit);
+        PrintCategory(report, Constants.CategoryOrphanedTestHelper, "Test helpers left without callers", limit);
 
         Section("Statements to remove (DI registrations, mappings)", report.Statements.Count);
         foreach (var st in report.Statements.Take(limit))
@@ -46,6 +46,11 @@ public static class ReportWriter
             Section("Project references to remove", report.ProjectRefRemovals.Count);
             foreach (var r in report.ProjectRefRemovals) Console.WriteLine($"  {r.Project}: -> {r.Reference}");
         }
+        if (report.CompileEntryRemovals.Count > 0)
+        {
+            Section("Old-style <Compile> entries to remove (their files are deleted)", report.CompileEntryRemovals.Count);
+            foreach (var r in report.CompileEntryRemovals) Console.WriteLine($"  {r.Project}: {r.Reference}");
+        }
         if (report.UsingRemovals.Count > 0)
         {
             Section("Using directives to remove (their assemblies are going away)", report.UsingRemovals.Count);
@@ -65,7 +70,7 @@ public static class ReportWriter
     static void PrintCategory(DeletionReport report, string category, string title, int limit)
     {
         var items = report.Symbols.Where(x => x.Category == category).ToList();
-        if (items.Count == 0 && category != "orphaned") return;
+        if (items.Count == 0 && category != Constants.CategoryOrphaned) return;
         Section(title, items.Count);
         foreach (var item in items.Take(limit))
         {

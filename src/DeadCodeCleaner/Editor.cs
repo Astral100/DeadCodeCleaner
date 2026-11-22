@@ -74,7 +74,12 @@ public static class Editor
         }
         foreach (var rr in report.ProjectRefRemovals)
         {
-            var n = MarkXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile ?? rr.Reference + ".csproj"));
+            var n = MarkXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"));
+            if (n > 0) { markers += n; files++; }
+        }
+        foreach (var rr in report.CompileEntryRemovals)
+        {
+            var n = MarkXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference));
             if (n > 0) { markers += n; files++; }
         }
         foreach (var pd in report.DeletableProjects)
@@ -146,8 +151,13 @@ public static class Editor
         }
         foreach (var rr in report.ProjectRefRemovals)
         {
-            var n = RemoveXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile ?? rr.Reference + ".csproj"));
+            var n = RemoveXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"));
             if (n > 0) { regions += n; log($"  removed ProjectReference {rr.Reference} from {rr.Project}"); }
+        }
+        foreach (var rr in report.CompileEntryRemovals)
+        {
+            var n = RemoveXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference));
+            if (n > 0) { regions += n; log($"  removed Compile entry {rr.Reference} from {rr.Project}"); }
         }
 
         foreach (var pd in report.DeletableProjects)
@@ -236,13 +246,22 @@ public static class Editor
             || elementText.Contains($"Include='{package}'", StringComparison.OrdinalIgnoreCase);
     }
 
-    static bool IsProjectRefElement(string elementText, string csprojFileName)
+    static bool IsProjectRefElement(string elementText, string includeValue, string fallbackFileName)
     {
-        // Exact filename match: a reference to "Core.csproj" must not match "Common.Core.csproj".
         var m = Regex.Match(elementText, "Include=[\"']([^\"']+)[\"']");
         if (!m.Success) return false;
-        var fileName = Path.GetFileName(m.Groups[1].Value.Replace('\\', '/'));
-        return StringComparer.OrdinalIgnoreCase.Equals(fileName, csprojFileName);
+        var value = m.Groups[1].Value.Replace('\\', '/');
+        // Full Include path match: two references can share a file name in different folders.
+        if (includeValue != null) return StringComparer.OrdinalIgnoreCase.Equals(value, includeValue.Replace('\\', '/'));
+        // Fallback (older reports): exact file name — "Core.csproj" must not match "Common.Core.csproj".
+        return StringComparer.OrdinalIgnoreCase.Equals(Path.GetFileName(value), fallbackFileName);
+    }
+
+    static bool IsIncludeMatch(string elementText, string includeValue)
+    {
+        var m = Regex.Match(elementText, "Include=[\"']([^\"']+)[\"']");
+        if (!m.Success) return false;
+        return StringComparer.OrdinalIgnoreCase.Equals(m.Groups[1].Value.Replace('\\', '/'), includeValue.Replace('\\', '/'));
     }
 
     /// <summary>Line ranges (inclusive) of every element named <paramref name="elementName"/> whose
@@ -253,9 +272,17 @@ public static class Editor
         var found = new List<(int, int)>();
         var open = "<" + elementName;
         var close = "</" + elementName + ">";
+        // Comment state at the START of each line, so elements inside multi-line comments are skipped.
+        var startsInComment = new bool[lines.Count];
+        bool state = false;
         for (int i = 0; i < lines.Count; i++)
         {
-            int at = FindOpenTag(lines[i], open);
+            startsInComment[i] = state;
+            state = XmlCommentStateAtEnd(lines[i], state);
+        }
+        for (int i = 0; i < lines.Count; i++)
+        {
+            int at = FindOpenTag(lines[i], open, startsInComment[i]);
             if (at < 0) continue;
             int line = i, col = at + open.Length, gt = -1;
             while (line < lines.Count)
@@ -286,16 +313,35 @@ public static class Editor
         return found;
     }
 
-    static int FindOpenTag(string lineText, string open)
+    static int FindOpenTag(string lineText, string open, bool startsInComment)
     {
         var at = lineText.IndexOf(open, StringComparison.Ordinal);
         if (at < 0) return -1;
         // Reject prefixes of longer element names, and commented-out elements.
         int after = at + open.Length;
         if (after < lineText.Length && lineText[after] is not (' ' or '\t' or '>' or '/' or '\r' or '\n')) return -1;
-        var comment = lineText.IndexOf("<!--", StringComparison.Ordinal);
-        if (comment >= 0 && comment < at) return -1;
+        if (InXmlComment(lineText, at, startsInComment)) return -1;
         return at;
+    }
+
+    static bool InXmlComment(string lineText, int pos, bool startsInComment)
+    {
+        bool inComment = startsInComment;
+        int i = 0;
+        while (i < pos)
+        {
+            var token = inComment ? "-->" : "<!--";
+            var next = lineText.IndexOf(token, i, StringComparison.Ordinal);
+            if (next < 0 || next >= pos) break;
+            inComment = !inComment;
+            i = next + token.Length;
+        }
+        return inComment;
+    }
+
+    static bool XmlCommentStateAtEnd(string lineText, bool startsInComment)
+    {
+        return InXmlComment(lineText, lineText.Length, startsInComment);
     }
 
     static int MarkXmlElements(string file, string elementName, Func<string, bool> match)
@@ -424,10 +470,19 @@ public static class Editor
         return s.Length <= max ? s : s[..(max - 3)] + "...";
     }
 
+    /// <summary>The line breaks Roslyn recognizes: analysis line numbers must map to the same lines.</summary>
+    static bool IsLineBreak(char c)
+    {
+        return c is '\n' or '\r' or '\u0085' or '\u2028' or '\u2029';
+    }
+
     static string FirstLine(string text)
     {
-        var idx = text.IndexOf('\n');
-        return idx < 0 ? text : text[..idx];
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (IsLineBreak(text[i])) return text[..i];
+        }
+        return text;
     }
 
     /// <summary>Splits into lines, each KEEPING its own terminator, so that string.Concat
@@ -438,7 +493,10 @@ public static class Editor
         int start = 0;
         for (int i = 0; i < text.Length; i++)
         {
-            if (text[i] == '\n') { lines.Add(text[start..(i + 1)]); start = i + 1; }
+            if (!IsLineBreak(text[i])) continue;
+            if (text[i] == '\r' && i + 1 < text.Length && text[i + 1] == '\n') i++;
+            lines.Add(text[start..(i + 1)]);
+            start = i + 1;
         }
         if (start < text.Length) lines.Add(text[start..]);
         return lines;
@@ -447,7 +505,7 @@ public static class Editor
     static string LineTerminator(string lineText)
     {
         if (lineText.EndsWith("\r\n")) return "\r\n";
-        if (lineText.EndsWith("\n")) return "\n";
+        if (lineText.Length > 0 && IsLineBreak(lineText[^1])) return lineText[^1..];
         return "";
     }
 
@@ -468,7 +526,11 @@ public static class Editor
     {
         var starts = new List<int> { 0 };
         for (int i = 0; i < text.Length; i++)
-            if (text[i] == '\n' && i + 1 < text.Length) starts.Add(i + 1);
+        {
+            if (!IsLineBreak(text[i])) continue;
+            if (text[i] == '\r' && i + 1 < text.Length && text[i + 1] == '\n') i++;
+            if (i + 1 < text.Length) starts.Add(i + 1);
+        }
         return starts.ToArray();
     }
 }

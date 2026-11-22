@@ -23,6 +23,9 @@ public sealed class StatementNode
     public required int SegmentLength { get; init; }
     /// <summary>Why automatic deletion is unsafe (if/else branch, inside a lambda), or null when it is safe.</summary>
     public string ManualReason { get; init; }
+    /// <summary>Node ids the statement's text references (service/implementation/mapped types, chain
+    /// lambdas): the statement cannot compile without them, so it dies when any of them dies.</summary>
+    public List<string> InvolvedNodes { get; } = new();
     /// <summary>True when deleting the whole anchor is safe: the anchor is an expression statement whose
     /// entire call chain consists of tracked registrations and their chain continuations. Set in a
     /// post-pass once every statement on the anchor is known.</summary>
@@ -86,7 +89,20 @@ public sealed class Graph
     /// <summary>Files carrying non-symbol top-level content (global usings, assembly attributes,
     /// extern aliases) that must never be deleted whole.</summary>
     public HashSet<string> FilesWithTopLevelContent { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Files containing inactive #if regions: the compiler cannot see that code, so these
+    /// files must never be deleted whole.</summary>
+    public HashSet<string> FilesWithInactiveCode { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Project name -> external assemblies referenced from places that always survive
+    /// (assembly-level attributes): their packages must never be removed.</summary>
+    public Dictionary<string, HashSet<string>> ProjectExternalRefs { get; } = new(StringComparer.OrdinalIgnoreCase);
     public int EdgeCount { get; private set; }
+
+    public void AddProjectExternalRef(string projectName, string assemblyName)
+    {
+        if (!ProjectExternalRefs.TryGetValue(projectName, out var set))
+            ProjectExternalRefs[projectName] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        set.Add(assemblyName);
+    }
 
     public void AddExternalRef(string nodeId, string assemblyName)
     {
@@ -153,6 +169,9 @@ public sealed class ProjectInfo
     public List<string> PackageReferences { get; } = new();
     /// <summary>Referenced project name -> Include path as written in the csproj.</summary>
     public Dictionary<string, string> ProjectReferences { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Explicit &lt;Compile Include&gt; items as written (old-style csproj): entries of
+    /// deleted files must be removed with the files.</summary>
+    public List<string> CompileItems { get; } = new();
     /// <summary>Package name -> compile-time assembly names it contributes (from project.assets.json).</summary>
     public Dictionary<string, List<string>> PackageAssemblies { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Package name -> names of the packages it depends on (from project.assets.json).</summary>
@@ -199,4 +218,5 @@ public sealed class CliOptions
     public string ConfigPath;
     public bool Verbose;
     public bool StrictMembers;
+    public bool NoVerify;
 }

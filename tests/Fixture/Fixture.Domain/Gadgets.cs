@@ -22,6 +22,9 @@ public class GadgetService : IGadgetService
     public string Describe()
     {
         var entity = new GadgetEntity { Id = 2, Label = "g" };
+        // Collection initializer: binds GadgetBag.Add with no identifier in the syntax tree.
+        var bag = new GadgetBag { entity };
+        _ = bag;
         return SharedService.Prefix() + entity.Label;
     }
 }

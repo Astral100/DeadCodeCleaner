@@ -20,6 +20,37 @@ public static class Constants
     public const int SnippetMaxLength = 160;
     public const int ReviewNoteMaxLength = 120;
     public const int SlnRemoveTimeoutMs = 60_000;
+    public const int VerifyShownErrors = 20;
+
+    public const string CategoryRemoved = "removed";
+    public const string CategoryOrphaned = "orphaned";
+    public const string CategoryBrokenTest = "broken-test";
+    public const string CategoryBrokenOrphan = "broken-orphan";
+    public const string CategoryOrphanedTestHelper = "orphaned-test-helper";
+
+    public const string ReasonAutoMapperProfile = "AutoMapper profile";
+    public const string ReasonAutofacModule = "Autofac module";
+    public const string CreateMapMethodName = "CreateMap";
+
+    public static readonly HashSet<string> AutofacRegisterMethodNames = new(StringComparer.Ordinal)
+    {
+        "RegisterType", "RegisterGeneric",
+    };
+
+    /// <summary>File types compiled outside the solution's C# compilations (views, WebForms, config
+    /// wiring): references from them are invisible, so their presence warrants a warning.</summary>
+    public static readonly HashSet<string> NonCompiledContentExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".cshtml", ".razor", ".aspx", ".ascx", ".master", ".asax",
+    };
+
+    /// <summary>Assemblies whose use does not block deleting an "empty" profile/module whole:
+    /// pure-data framework code with no observable side effects worth preserving.</summary>
+    public static readonly HashSet<string> EmptyContainerBenignAssemblies = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "mscorlib", "netstandard", "System.Private.CoreLib", "System.Runtime", "System", "System.Core",
+        "System.Linq", "System.Linq.Expressions", "System.Collections", "System.ObjectModel",
+    };
 
     public const string TestProjectNamePattern = @"(^|[._])Tests?([._]|$)";
     public const string TestPackagePattern = @"Include=""(xunit|nunit|NUnit|MSTest|Microsoft\.NET\.Test\.Sdk)";

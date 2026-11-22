@@ -36,7 +36,137 @@ public sealed class Engine
             graph.Warnings.Add($"workspace: ... and {loadWarnings.Count - Constants.WorkspaceWarningLimit} more load diagnostics");
 
         var report = ComputeReport(graph, solution);
+        if (_opts.Mode != "find" && !_opts.NoVerify && _opts.RemoveTargets.Count > 0)
+            await Verify(solution, graph, report);
         return (report, graph);
+    }
+
+    /// <summary>The compiler as referee on the OUTPUT: applies the whole deletion plan to the
+    /// sources in memory, rebuilds the affected compilations, and reports every compile error that
+    /// was not there before. Any hit means the plan is unsafe as-is.</summary>
+    async Task Verify(Solution solution, Graph graph, DeletionReport report)
+    {
+        _log("Verifying the deletion plan (in-memory rebuild) ...");
+        var spansByFile = new Dictionary<string, List<(int Start, int End)>>(StringComparer.OrdinalIgnoreCase);
+        void AddSpan(string file, int start, int length)
+        {
+            if (!spansByFile.TryGetValue(file, out var list)) spansByFile[file] = list = new List<(int, int)>();
+            if (length > 0) list.Add((start, start + length));
+        }
+        foreach (var sym in report.Symbols.Where(s => !s.InDeletableFile))
+            foreach (var p in sym.Parts) AddSpan(p.File, p.SpanStart, p.SpanLength);
+        foreach (var st in report.Statements) AddSpan(st.File, st.SpanStart, st.SpanLength);
+        foreach (var ur in report.UsingRemovals) AddSpan(ur.File, ur.SpanStart, ur.SpanLength);
+        var deletableFiles = new HashSet<string>(report.DeletableFiles, StringComparer.OrdinalIgnoreCase);
+
+        string PathOfProject(string name)
+        {
+            return graph.Projects.TryGetValue(name, out var pi) ? Path.GetFullPath(pi.FilePath) : null;
+        }
+        var sol2 = solution;
+        var changed = new HashSet<ProjectId>();
+        foreach (var project in solution.Projects)
+        {
+            foreach (var doc in project.Documents)
+            {
+                if (doc.FilePath == null) continue;
+                if (deletableFiles.Contains(doc.FilePath))
+                {
+                    sol2 = sol2.RemoveDocument(doc.Id);
+                    changed.Add(project.Id);
+                    continue;
+                }
+                if (!spansByFile.TryGetValue(doc.FilePath, out var spans)) continue;
+                var text = await doc.GetTextAsync();
+                var merged = MergeSpans(spans).Where(r => r.End <= text.Length).ToList();
+                if (merged.Count == 0) continue;
+                var edits = merged.Select(r => new Microsoft.CodeAnalysis.Text.TextChange(new Microsoft.CodeAnalysis.Text.TextSpan(r.Start, r.End - r.Start), "")).ToList();
+                sol2 = sol2.WithDocumentText(doc.Id, text.WithChanges(edits));
+                changed.Add(project.Id);
+            }
+        }
+        foreach (var rr in report.ProjectRefRemovals)
+        {
+            var fromPath = PathOfProject(rr.Project);
+            var toPath = PathOfProject(rr.Reference);
+            if (fromPath == null || toPath == null) continue;
+            foreach (var from in sol2.Projects.Where(p => p.FilePath != null && Path.GetFullPath(p.FilePath) == fromPath).ToList())
+            {
+                var target = sol2.Projects.FirstOrDefault(p => p.FilePath != null && Path.GetFullPath(p.FilePath) == toPath);
+                if (target == null) continue;
+                var kept = from.ProjectReferences.Where(x => x.ProjectId != target.Id).ToList();
+                if (kept.Count == from.ProjectReferences.Count()) continue;
+                sol2 = sol2.WithProjectReferences(from.Id, kept);
+                changed.Add(from.Id);
+            }
+        }
+        foreach (var pd in report.DeletableProjects)
+        {
+            var path = Path.GetFullPath(pd.CsprojPath);
+            foreach (var proj in sol2.Projects.Where(p => p.FilePath != null && Path.GetFullPath(p.FilePath) == path).ToList())
+                sol2 = sol2.RemoveProject(proj.Id);
+        }
+
+        var depGraph = sol2.GetProjectDependencyGraph();
+        var toCheck = new HashSet<ProjectId>();
+        foreach (var id in changed)
+        {
+            if (sol2.GetProject(id) == null) continue;
+            toCheck.Add(id);
+            toCheck.UnionWith(depGraph.GetProjectsThatTransitivelyDependOnThisProject(id));
+        }
+
+        int newErrors = 0;
+        foreach (var pid in toCheck.OrderBy(p => sol2.GetProject(p)?.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            var newProj = sol2.GetProject(pid);
+            var oldProj = solution.GetProject(pid);
+            if (newProj == null || oldProj == null) continue;
+            var oldComp = await oldProj.GetCompilationAsync();
+            var newComp = await newProj.GetCompilationAsync();
+            if (oldComp == null || newComp == null) continue;
+            string Key(Diagnostic d)
+            {
+                return d.Id + "|" + (d.Location.SourceTree?.FilePath ?? "") + "|" + d.GetMessage();
+            }
+            var baseline = new HashSet<string>(
+                oldComp.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).Select(Key),
+                StringComparer.Ordinal);
+            foreach (var d in newComp.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error && !baseline.Contains(Key(d))))
+            {
+                newErrors++;
+                if (newErrors > Constants.VerifyShownErrors) continue;
+                var pos = d.Location.GetLineSpan();
+                var where = pos.Path != null ? $"{pos.Path}:{pos.StartLinePosition.Line + 1}" : newProj.Name;
+                report.Warnings.Add($"VERIFY: {where}: {d.Id} {d.GetMessage()} (line refers to the text after deletion)");
+            }
+        }
+        if (newErrors > Constants.VerifyShownErrors)
+            report.Warnings.Add($"VERIFY: ... and {newErrors - Constants.VerifyShownErrors} more new compile errors");
+        if (newErrors > 0)
+            report.Warnings.Add($"VERIFY: the plan introduces {newErrors} new compile error(s) — the deletion is UNSAFE as planned; fix manually (or --no-verify to override in delete mode)");
+        else
+            _log("  verification clean: the plan introduces no new compile errors");
+        report.VerificationErrors = newErrors;
+    }
+
+    List<(int Start, int End)> MergeSpans(List<(int Start, int End)> ranges)
+    {
+        var sorted = ranges.OrderBy(r => r.Start).ToList();
+        var result = new List<(int, int)>();
+        foreach (var r in sorted)
+        {
+            if (result.Count > 0 && r.Start <= result[^1].Item2)
+            {
+                var last = result[^1];
+                result[^1] = (last.Item1, Math.Max(last.Item2, r.End));
+            }
+            else
+            {
+                result.Add(r);
+            }
+        }
+        return result;
     }
 
     DeletionReport ComputeReport(Graph graph, Solution solution)
@@ -108,20 +238,39 @@ public sealed class Engine
         foreach (var n in graph.TestNodes)
         {
             if (poisoned.Contains(n) || removed.Contains(n)) continue;
-            if (rt1.Contains(n) && !rt2.Contains(n)) orphanTestHelpers.Add(n);
+            // !r2: a node in a project the heuristics classify as test can still be used by
+            // production code (e.g. "TestCommon" shared helpers) — production liveness wins.
+            if (rt1.Contains(n) && !rt2.Contains(n) && !r2.Contains(n)) orphanTestHelpers.Add(n);
         }
 
         var allDead = new HashSet<string>(
             removed.Concat(orphanProd).Concat(poisoned).Concat(orphanTestHelpers),
             StringComparer.Ordinal);
 
-        // Statements that lost their reason to exist.
+        // Statements that lost their reason to exist. Test-world death only counts for statements
+        // production does not keep alive: integration tests may reach a production registration,
+        // and losing those tests must never delete it.
         var deadStmts = new HashSet<StatementNode>();
         foreach (var stmt in graph.Statements)
         {
             bool prodDead = r1.Contains(stmt) && !r2.Contains(stmt);
-            bool testDead = rt1.Contains(stmt) && !rt2.Contains(stmt);
+            bool testDead = rt1.Contains(stmt) && !rt2.Contains(stmt) && !r2.Contains(stmt);
             if (prodDead || testDead) deadStmts.Add(stmt);
+        }
+
+        // A statement whose text references deleted code cannot compile, whatever its own liveness:
+        // removing an implementation type must take its registration along even while the service
+        // interface stays in use elsewhere.
+        foreach (var stmt in graph.Statements)
+        {
+            if (deadStmts.Contains(stmt)) continue;
+            if (!stmt.InvolvedNodes.Any(allDead.Contains)) continue;
+            deadStmts.Add(stmt);
+            if (r2.Contains(stmt))
+            {
+                var gone = stmt.InvolvedNodes.Where(allDead.Contains).Select(n => FqnOf(graph, n)).Distinct().ToList();
+                report.Warnings.Add($"registration deleted although still in use: {stmt.FilePath}:{stmt.StartLine} references deleted {string.Join(", ", gone)} — check for a replacement: {stmt.Snippet}");
+            }
         }
 
         // Empty containers: an AutoMapper profile / Autofac module whose every mapping or
@@ -132,13 +281,18 @@ public sealed class Engine
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
         foreach (var (typeId, reason) in graph.RootReasons)
         {
-            if (reason is not ("AutoMapper profile" or "Autofac module")) continue;
+            if (reason is not (Constants.ReasonAutoMapperProfile or Constants.ReasonAutofacModule)) continue;
             if (allDead.Contains(typeId)) continue;
             if (!graph.Decl.TryGetValue(typeId, out var containerSym) || containerSym is not INamedTypeSymbol nts) continue;
             if (!membersOf.TryGetValue(typeId, out var containerMembers)) continue;
-            var allowed = new HashSet<string>(StringComparer.Ordinal);
+            var allowed = new HashSet<string>(StringComparer.Ordinal) { typeId };
+            allowed.UnionWith(containerMembers);
+            var allowedAsms = new HashSet<string>(Constants.EmptyContainerBenignAssemblies, StringComparer.OrdinalIgnoreCase);
             for (var b = nts.BaseType; b != null; b = b.BaseType)
+            {
                 if (Graph.Id(b) is { } bid) allowed.Add(bid);
+                if (b.ContainingAssembly?.Name is { } ban) allowedAsms.Add(ban);
+            }
             bool eligible = true;
             int stmtsTotal = 0;
             foreach (var m in containerMembers.Append(typeId))
@@ -153,6 +307,13 @@ public sealed class Engine
                     }
                 }
                 if (!eligible) break;
+                // External calls beyond the mapping/registration framework (a log call, say) are
+                // side effects the deletion would silently drop: keep the container.
+                if (graph.ExternalRefs.TryGetValue(m, out var exts) && exts.Any(a => !allowedAsms.Contains(a)))
+                {
+                    eligible = false;
+                    break;
+                }
                 if (stmtsByMember.TryGetValue(m, out var ss))
                 {
                     stmtsTotal += ss.Count;
@@ -184,11 +345,11 @@ public sealed class Engine
         {
             if (HasDeadContainer(graph, id, allDead)) continue;
             if (!graph.Decl.TryGetValue(id, out var symbol)) continue;
-            var category = removed.Contains(id) ? "removed"
-                : orphanProd.Contains(id) ? "orphaned"
-                : brokenTests.Contains(id) ? "broken-test"
-                : brokenOrphans.Contains(id) ? "broken-orphan"
-                : "orphaned-test-helper";
+            var category = removed.Contains(id) ? Constants.CategoryRemoved
+                : orphanProd.Contains(id) ? Constants.CategoryOrphaned
+                : brokenTests.Contains(id) ? Constants.CategoryBrokenTest
+                : brokenOrphans.Contains(id) ? Constants.CategoryBrokenOrphan
+                : Constants.CategoryOrphanedTestHelper;
             bool review = false;
             string note = null;
             if (brokenTests.Contains(id))
@@ -218,6 +379,18 @@ public sealed class Engine
             });
         }
 
+        // A kept-in-place field survives physically: anything it references must not be deleted
+        // silently, or the surviving text no longer compiles.
+        foreach (var id in keptInPlace.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+        {
+            if (!graph.Edges.TryGetValue(id, out var outs)) continue;
+            var broken = outs.Where(t => allDead.Contains(t) && !keptInPlace.Contains(t))
+                .Select(t => FqnOf(graph, t)).Distinct().OrderBy(x => x, StringComparer.Ordinal)
+                .Take(Constants.ShownSurvivingRefs).ToList();
+            if (broken.Count > 0)
+                report.Warnings.Add($"STILL REFERENCED: kept-in-place {FqnOf(graph, id)} references deleted {string.Join(", ", broken)} — adjust manually or the build will fail");
+        }
+
         // Statement entries (only when their containing member survives). Statements sharing one
         // anchor (fluent chains) delete only their own segment when a sibling survives.
         var stmtsByAnchor = graph.Statements
@@ -228,7 +401,7 @@ public sealed class Engine
         {
             if (!report.Warnings.Contains(msg)) report.Warnings.Add(msg);
         }
-        foreach (var stmt in deadStmts)
+        foreach (var stmt in deadStmts.OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.AnchorStart).ThenBy(s => s.SegmentStart))
         {
             if (allDead.Contains(stmt.ContainingMember) || HasDeadContainer(graph, stmt.ContainingMember, allDead)) continue;
             if (stmt.ManualReason != null)
@@ -292,6 +465,11 @@ public sealed class Engine
                 report.Warnings.Add($"file kept (has global usings / assembly attributes): {f} — its dead declarations are deleted individually");
                 continue;
             }
+            if (graph.FilesWithInactiveCode.Contains(f))
+            {
+                report.Warnings.Add($"file kept (contains inactive #if regions the compiler cannot see): {f} — its dead declarations are deleted individually");
+                continue;
+            }
             report.DeletableFiles.Add(f);
         }
         // Membership checks are case-insensitive: linked files can carry different path casings.
@@ -336,7 +514,20 @@ public sealed class Engine
     List<SourcePart> DeclarationParts(Graph graph, ISymbol s, string id, HashSet<string> allDead, HashSet<string> keptInPlace, List<string> warnings)
     {
         var parts = new List<SourcePart>();
-        foreach (var r in s.DeclaringSyntaxReferences)
+        // A partial method/property has a second declaration under a separate symbol: deleting only
+        // one part cannot compile, so both parts are collected.
+        var declSymbols = new List<ISymbol> { s };
+        if (s is IMethodSymbol pm)
+        {
+            if (pm.PartialImplementationPart != null) declSymbols.Add(pm.PartialImplementationPart);
+            if (pm.PartialDefinitionPart != null) declSymbols.Add(pm.PartialDefinitionPart);
+        }
+        else if (s is IPropertySymbol pp)
+        {
+            if (pp.PartialImplementationPart != null) declSymbols.Add(pp.PartialImplementationPart);
+            if (pp.PartialDefinitionPart != null) declSymbols.Add(pp.PartialDefinitionPart);
+        }
+        foreach (var r in declSymbols.SelectMany(ds => ds.DeclaringSyntaxReferences))
         {
             var node = r.GetSyntax();
             // Fields/events: the declarator sits inside a declaration that may hold several variables.
@@ -376,10 +567,18 @@ public sealed class Engine
             // counterpart lies outside the deleted span, or deletion breaks compilation.
             var span = node.FullSpan;
             int spanStart = span.Start;
+            int spanEnd = span.End;
             var leading = node.GetLeadingTrivia();
             for (int ti = leading.Count - 1; ti >= 0; ti--)
             {
                 if (leading[ti].IsDirective) { spanStart = leading[ti].FullSpan.End; break; }
+            }
+            // An enum member's separator comma belongs to the list, not the member: take the
+            // following comma along, or the deletion leaves "A,\n,\nC" behind.
+            if (node is EnumMemberDeclarationSyntax emd && emd.Parent is EnumDeclarationSyntax ed)
+            {
+                var idx = ed.Members.IndexOf(emd);
+                if (idx >= 0 && idx < ed.Members.SeparatorCount) spanEnd = ed.Members.GetSeparator(idx).FullSpan.End;
             }
             var lines = tree.GetLineSpan(node.Span);
             parts.Add(new SourcePart
@@ -388,7 +587,7 @@ public sealed class Engine
                 StartLine = lines.StartLinePosition.Line + 1,
                 EndLine = lines.EndLinePosition.Line + 1,
                 SpanStart = spanStart,
-                SpanLength = span.End - spanStart,
+                SpanLength = spanEnd - spanStart,
             });
         }
         return parts;
@@ -471,6 +670,8 @@ public sealed class Engine
         {
             var se = survivingExt[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var de = deadExt[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Assembly-attribute references survive by definition.
+            if (graph.ProjectExternalRefs.TryGetValue(pname, out var always)) se.UnionWith(always);
             var sp = survivingProjRefs[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var dp = deadProjRefs[pname] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var needs = survivingNeeds[pname] = new List<string[]>();
@@ -634,8 +835,21 @@ public sealed class Engine
                 report.PackageRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = pkg });
             foreach (var c in refCandidates[pname].OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
             {
-                var file = pi.ProjectReferences.TryGetValue(c, out var include) ? Path.GetFileName(include.Replace('\\', '/')) : c + ".csproj";
+                var file = pi.ProjectReferences.TryGetValue(c, out var include) ? include : null;
                 report.ProjectRefRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = c, ReferenceFile = file });
+            }
+        }
+
+        // Old-style csprojs list files explicitly: a deleted file's <Compile> entry must go too.
+        foreach (var file in report.DeletableFiles.OrderBy(x => x, StringComparer.Ordinal))
+        {
+            foreach (var (pname, pi) in graph.Projects.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                if (deletableProjects.Contains(pname) || pi.CompileItems.Count == 0) continue;
+                var rel = Path.GetRelativePath(Path.GetDirectoryName(pi.FilePath) ?? "", file).Replace('\\', '/');
+                var match = pi.CompileItems.FirstOrDefault(ci => StringComparer.OrdinalIgnoreCase.Equals(ci.Replace('\\', '/'), rel));
+                if (match != null)
+                    report.CompileEntryRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = match });
             }
         }
 
@@ -656,13 +870,46 @@ public sealed class Engine
             gone.UnionWith(before.Where(a => !after.Contains(a)));
             if (gone.Count > 0) goneByProject[pname] = gone;
         }
-        foreach (var u in graph.UsingRefs)
+        // A namespace (or using-static type) can die while its assembly survives: when the deletion
+        // takes the last type under a name, every "using" of that name becomes CS0234. Track, per
+        // namespace prefix and type FQN, whether anything under it stays.
+        var solutionAssemblies = new HashSet<string>(
+            graph.Projects.Values.Select(p => p.AssemblyName).Where(a => a.Length > 0),
+            StringComparer.OrdinalIgnoreCase);
+        var nameAlive = new Dictionary<string, bool>(StringComparer.Ordinal);
+        void MarkName(string name, bool alive)
         {
-            if (!goneByProject.TryGetValue(u.Project, out var gone)) continue;
-            if (deletableFiles.Contains(u.File)) continue;
-            if (u.Providers.Count == 0) continue;
-            if (u.Providers.All(gone.Contains))
-                report.UsingRemovals.Add(new UsingRemoval { File = u.File, Line = u.Line, Namespace = u.Namespace, SpanStart = u.SpanStart, SpanLength = u.SpanLength });
+            nameAlive[name] = nameAlive.TryGetValue(name, out var a) ? a || alive : alive;
+        }
+        foreach (var (id, sym) in graph.Decl)
+        {
+            if (sym is not INamedTypeSymbol t) continue;
+            bool alive = Stays(id);
+            MarkName(SymbolNames.Fqn(t), alive);
+            if (t.ContainingType != null) continue;
+            var ns = t.ContainingNamespace?.IsGlobalNamespace == false ? t.ContainingNamespace.ToDisplayString() : "";
+            for (var cur = ns; cur.Length > 0;)
+            {
+                MarkName(cur, alive);
+                var dot = cur.LastIndexOf('.');
+                cur = dot < 0 ? "" : cur[..dot];
+            }
+        }
+
+        // A linked file is compiled into several projects, one UsingRef entry each: the directive
+        // goes only when EVERY surviving project that compiles the file has lost all its providers.
+        foreach (var g in graph.UsingRefs.GroupBy(u => u.File + "#" + u.SpanStart, StringComparer.OrdinalIgnoreCase))
+        {
+            var relevant = g.Where(u => !deletableProjects.Contains(u.Project)).ToList();
+            if (relevant.Count == 0) continue;
+            var u0 = relevant[0];
+            if (deletableFiles.Contains(u0.File)) continue;
+            bool allGone = relevant.All(u => u.Providers.Count > 0
+                && goneByProject.TryGetValue(u.Project, out var gone) && u.Providers.All(gone.Contains));
+            bool nameDies = nameAlive.TryGetValue(u0.Namespace, out var stillAlive) && !stillAlive
+                && relevant.All(u => u.Providers.Count > 0 && u.Providers.All(solutionAssemblies.Contains));
+            if (allGone || nameDies)
+                report.UsingRemovals.Add(new UsingRemoval { File = u0.File, Line = u0.Line, Namespace = u0.Namespace, SpanStart = u0.SpanStart, SpanLength = u0.SpanLength });
         }
         report.UsingRemovals.Sort((a, b) => string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.Line.CompareTo(b.Line));
         report.DeletableProjects.Sort((a, b) => string.CompareOrdinal(a.Project, b.Project));
@@ -791,9 +1038,12 @@ public sealed class Engine
         {
             if (seeds.Contains(id) || !dead.Add(id)) return;
             queue.Enqueue(id);
-            // A dead member of a type that is itself out of use takes the whole type down.
+            // A dead member of a type that is itself out of use takes the whole type down — except
+            // in test classes: one broken test must not delete its healthy siblings. A test class
+            // still dies when EVERY member died (empty-shell pass below).
             if (graph.ContainerOf.TryGetValue(id, out var container)
-                && !r2.Contains(container) && !seeds.Contains(container))
+                && !r2.Contains(container) && !seeds.Contains(container)
+                && !graph.TestNodes.Contains(container))
                 Kill(container);
             // A dead type takes all its members down.
             if (membersOf.TryGetValue(id, out var members))

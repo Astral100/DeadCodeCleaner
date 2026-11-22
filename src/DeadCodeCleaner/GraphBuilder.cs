@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Operations;
 using Microsoft.CodeAnalysis.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -41,7 +42,13 @@ public sealed class GraphBuilder
         foreach (var project in solution.Projects)
         {
             if (project.Language != LanguageNames.CSharp) continue;
-            if (!seenProjects.Add(project.FilePath ?? project.Name)) continue; // multi-targeting duplicate
+            if (!seenProjects.Add(project.FilePath ?? project.Name))
+            {
+                // Multi-targeting duplicate: conditional (#if) code of the other frameworks is invisible.
+                var w = $"{project.Name}: multi-targets — only the first target framework was analyzed";
+                if (!_graph.Warnings.Contains(w)) _graph.Warnings.Add(w);
+                continue;
+            }
             var comp = await project.GetCompilationAsync();
             if (comp == null) continue;
             bool isTest = IsTestProject(project);
@@ -59,18 +66,21 @@ public sealed class GraphBuilder
             }
         }
 
+        WarnAboutNonCompiledContent();
+
         // Phase 1: collect all nodes first (rule construction needs the full node set).
         foreach (var (comp, isTest, projectName) in compilations) CollectNodes(comp, isTest, projectName);
 
         // Phase 2: structural rules and roots.
         foreach (var (type, isTest) in _types) AddStructuralRulesAndRoots(type, isTest);
-        foreach (var (comp, isTest, _) in compilations)
+        foreach (var (comp, isTest, pname) in compilations)
         {
             var ep = comp.GetEntryPoint(CancellationToken.None);
             if (ep != null && Graph.Id(ep) is { } epId)
             {
                 // The synthesized Main of top-level statements is implicit; admit it explicitly.
                 _graph.Nodes.Add(epId);
+                _graph.AddNodeProject(epId, pname);
                 _graph.Decl.TryAdd(epId, ep.OriginalDefinition);
                 if (Graph.Id(ep.ContainingType) is { } eptId) _graph.ContainerOf.TryAdd(epId, eptId);
                 if (isTest) _graph.TestNodes.Add(epId);
@@ -86,7 +96,7 @@ public sealed class GraphBuilder
         {
             foreach (var tree in comp.SyntaxTrees)
             {
-                WalkTree(comp, tree, isTest);
+                WalkTree(comp, tree, isTest, projectName);
                 CollectUsings(comp, tree, projectName);
             }
         }
@@ -144,6 +154,32 @@ public sealed class GraphBuilder
         }
     }
 
+    void WarnAboutNonCompiledContent()
+    {
+        int found = 0;
+        var scanned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pinfo in _graph.Projects.Values)
+        {
+            var dir = Path.GetDirectoryName(pinfo.FilePath);
+            if (dir == null || !scanned.Add(dir)) continue;
+            try
+            {
+                foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                {
+                    var sep = Path.DirectorySeparatorChar;
+                    if (f.Contains($"{sep}bin{sep}") || f.Contains($"{sep}obj{sep}")) continue;
+                    if (Constants.NonCompiledContentExtensions.Contains(Path.GetExtension(f))) found++;
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // Unreadable directory: content scan is best-effort.
+            }
+        }
+        if (found > 0)
+            _graph.Warnings.Add($"solution contains {found} non-compiled content file(s) (views / WebForms / config wiring) — references from them are INVISIBLE to this analysis; review the report before deleting");
+    }
+
     void CollectUsings(Compilation comp, SyntaxTree tree, string projectName)
     {
         var model = comp.GetSemanticModel(tree);
@@ -197,6 +233,8 @@ public sealed class GraphBuilder
                     info.PackageReferences.Add(include);
                 else if (el.Name.LocalName == "ProjectReference")
                     info.ProjectReferences[Path.GetFileNameWithoutExtension(include)] = include;
+                else if (el.Name.LocalName == "Compile" && !info.CompileItems.Contains(include))
+                    info.CompileItems.Add(include);
             }
             var assetsPath = Path.Combine(Path.GetDirectoryName(project.FilePath), "obj", "project.assets.json");
             if (File.Exists(assetsPath))
@@ -288,6 +326,7 @@ public sealed class GraphBuilder
                 _types.Add((type, isTest));
                 if (isTest) _graph.TestNodes.Add(typeId);
             }
+            bool divergent = false;
             foreach (var m in type.GetMembers())
             {
                 if (m.IsImplicitlyDeclared) continue;
@@ -297,11 +336,18 @@ public sealed class GraphBuilder
                 if (m.DeclaringSyntaxReferences.Length == 0) continue;
                 if (Graph.Id(m) is not { } mId) continue;
                 _graph.AddNodeProject(mId, projectName);
-                if (!firstSeen) continue;
-                _graph.Nodes.Add(mId);
+                if (!_graph.Nodes.Add(mId)) continue;
                 _graph.Decl[mId] = m;
                 _graph.ContainerOf[mId] = typeId;
                 if (isTest) _graph.TestNodes.Add(mId);
+                // A member that only this compilation declares: a same-named type with a DIFFERENT
+                // body exists in another project — analyze both so no reference goes missing.
+                if (!firstSeen) divergent = true;
+            }
+            if (!firstSeen && divergent)
+            {
+                _types.Add((type, isTest));
+                _graph.Warnings.Add($"{SymbolNames.Fqn(type)}: {projectName} declares a different type under the same full name as another project — both declarations are analyzed, verify removals in it manually");
             }
         }
     }
@@ -321,7 +367,7 @@ public sealed class GraphBuilder
             }
         }
 
-        static IEnumerable<INamedTypeSymbol> SelfAndNested(INamedTypeSymbol t)
+        IEnumerable<INamedTypeSymbol> SelfAndNested(INamedTypeSymbol t)
         {
             if (t.DeclaringSyntaxReferences.Length == 0) yield break;
             yield return t;
@@ -384,9 +430,28 @@ public sealed class GraphBuilder
             if (overridden != null)
             {
                 if (NodeId(overridden) is { } oId)
+                {
                     _graph.AddRule(new object[] { typeId, oId }, new object[] { mId }, "override dispatch");
+                    // The reverse holds for compilation: an "override" cannot survive its base member.
+                    _graph.AddEdge(mId, oId);
+                }
                 else
+                {
                     _graph.AddRule(one, new object[] { mId }, "overrides external member");
+                }
+            }
+
+            // An explicit interface implementation ("void IFoo.M()") cannot survive its interface member.
+            IEnumerable<ISymbol> explicitImpls = m switch
+            {
+                IMethodSymbol xm => xm.ExplicitInterfaceImplementations,
+                IPropertySymbol xp => xp.ExplicitInterfaceImplementations,
+                IEventSymbol xe => xe.ExplicitInterfaceImplementations,
+                _ => Array.Empty<ISymbol>(),
+            };
+            foreach (var ei in explicitImpls)
+            {
+                if (NodeId(ei) is { } eiId) _graph.AddEdge(mId, eiId);
             }
         }
 
@@ -491,11 +556,11 @@ public sealed class GraphBuilder
         }
         else if (BaseChainHasName(type, "Profile") || BaseChainHasExternalName(type, "Profile", "AutoMapper"))
         {
-            rootWholeType = true; reason = "AutoMapper profile";
+            rootWholeType = true; reason = Constants.ReasonAutoMapperProfile;
         }
         else if (BaseChainHasExternalName(type, "Module", "Autofac"))
         {
-            rootWholeType = true; reason = "Autofac module";
+            rootWholeType = true; reason = Constants.ReasonAutofacModule;
         }
 
         if (rootWholeType)
@@ -565,7 +630,7 @@ public sealed class GraphBuilder
 
     // ---------------------------------------------------------------- Phase 3
 
-    void WalkTree(Compilation comp, SyntaxTree tree, bool isTest)
+    void WalkTree(Compilation comp, SyntaxTree tree, bool isTest, string projectName)
     {
         var model = comp.GetSemanticModel(tree);
         var root = tree.GetRoot();
@@ -574,6 +639,29 @@ public sealed class GraphBuilder
         if (root is CompilationUnitSyntax cu
             && (cu.AttributeLists.Count > 0 || cu.Externs.Count > 0 || cu.Usings.Any(u => u.GlobalKeyword.RawKind != 0)))
             _graph.FilesWithTopLevelContent.Add(tree.FilePath);
+
+        // Files with inactive #if regions hold code the compiler cannot see: never delete them whole.
+        if (root.ContainsDirectives && root.DescendantTrivia(descendIntoTrivia: true).Any(t => t.IsKind(SyntaxKind.DisabledTextTrivia)))
+            _graph.FilesWithInactiveCode.Add(tree.FilePath);
+
+        // Assembly/module-level attributes reference code and packages with no containing member:
+        // root everything they resolve so none of it is ever orphaned.
+        if (root is CompilationUnitSyntax cu2)
+        {
+            foreach (var al in cu2.AttributeLists)
+            {
+                foreach (var node in al.DescendantNodesAndSelf())
+                {
+                    ISymbol sym = node switch
+                    {
+                        AttributeSyntax at => model.GetSymbolInfo(at).Symbol,
+                        IdentifierNameSyntax or GenericNameSyntax => model.GetSymbolInfo(node).Symbol,
+                        _ => null,
+                    };
+                    if (sym != null) RootCompilationUnitAttributeSymbol(sym, projectName, isTest);
+                }
+            }
+        }
 
         var globals = root.ChildNodes().OfType<GlobalStatementSyntax>().ToList();
         if (globals.Count > 0)
@@ -650,9 +738,26 @@ public sealed class GraphBuilder
         foreach (var al in attrs) WalkMember(al, first, model);
     }
 
+    void RootCompilationUnitAttributeSymbol(ISymbol sym, string projectName, bool isTest)
+    {
+        if (sym is IAliasSymbol alias) sym = alias.Target;
+        sym = sym.OriginalDefinition;
+        if (sym is IMethodSymbol acc && acc.AssociatedSymbol != null) sym = acc.AssociatedSymbol.OriginalDefinition;
+        if (NodeId(sym) is { } id)
+        {
+            _graph.AddRoot(id, "assembly attribute", isTest);
+            return;
+        }
+        if (NodeId(sym.ContainingType) is { } tid) _graph.AddRoot(tid, "assembly attribute", isTest);
+        var asm = sym.ContainingAssembly?.Name;
+        if (asm != null && !_solutionAssemblies.Contains(asm)) _graph.AddProjectExternalRef(projectName, asm);
+    }
+
     void WalkMember(SyntaxNode subtree, string sourceId, SemanticModel model)
     {
         var skipSpans = MatchStatements(subtree, sourceId, model);
+
+        WalkOperations(subtree, sourceId, model, skipSpans);
 
         foreach (var node in subtree.DescendantNodesAndSelf())
         {
@@ -701,6 +806,60 @@ public sealed class GraphBuilder
         if (spans == null) return false;
         foreach (var s in spans) if (s.Contains(span)) return true;
         return false;
+    }
+
+    /// <summary>Harvests references from the compiler's bound tree (IOperation). Unlike the syntax
+    /// walk, the bound tree contains EVERY symbol the compiler resolved — including the ones with no
+    /// identifier in source: query-syntax operators, collection-initializer Add, conditional element
+    /// access, user-defined operators and conversions, inferred ("var") types.</summary>
+    void WalkOperations(SyntaxNode subtree, string sourceId, SemanticModel model, List<TextSpan> skipSpans)
+    {
+        var rootOp = model.GetOperation(subtree)
+            ?? (subtree is GlobalStatementSyntax gs ? model.GetOperation(gs.Statement) : null);
+        if (rootOp != null)
+        {
+            HarvestOperation(rootOp, sourceId, skipSpans);
+            return;
+        }
+        // Not itself an operation root (property/type declarations): find the roots inside it.
+        foreach (var node in subtree.DescendantNodes())
+        {
+            bool candidate = node is BaseMethodDeclarationSyntax or AccessorDeclarationSyntax
+                or ArrowExpressionClauseSyntax or EqualsValueClauseSyntax or AttributeSyntax;
+            if (!candidate) continue;
+            var op = model.GetOperation(node);
+            if (op == null || op.Parent != null) continue;
+            HarvestOperation(op, sourceId, skipSpans);
+        }
+    }
+
+    void HarvestOperation(IOperation op, string sourceId, List<TextSpan> skipSpans)
+    {
+        // Tracked registration calls and suppressed spans: their references live and die with the
+        // STATEMENT (claimed chains, type arguments), so they only pin external packages here.
+        bool suppressed = InSkip(skipSpans, op.Syntax.Span)
+            || (op is IInvocationOperation pi && pi.Syntax is InvocationExpressionSyntax pis && _processedInvocations.Contains(pis));
+        void Emit(ISymbol s)
+        {
+            if (s == null) return;
+            if (suppressed) RecordExternal(sourceId, s);
+            else AddEdgeTo(sourceId, s);
+        }
+        switch (op)
+        {
+            case IInvocationOperation iv: Emit(iv.TargetMethod); break;
+            case IObjectCreationOperation oc: Emit(oc.Constructor); break;
+            case IMemberReferenceOperation mr: Emit(mr.Member); break;
+            case IUnaryOperation u: Emit(u.OperatorMethod); break;
+            case IBinaryOperation b: Emit(b.OperatorMethod); break;
+            case ICompoundAssignmentOperation ca: Emit(ca.OperatorMethod); break;
+            case IIncrementOrDecrementOperation incr: Emit(incr.OperatorMethod); break;
+            case IConversionOperation cv: Emit(cv.OperatorMethod); break;
+            case ITypeOfOperation to: Emit(to.TypeOperand); break;
+            case IIsTypeOperation it: Emit(it.TypeOperand); break;
+        }
+        if (op.Type is INamedTypeSymbol named) Emit(named);
+        foreach (var child in op.ChildOperations) HarvestOperation(child, sourceId, skipSpans);
     }
 
     void AddSymbolInfoEdges(string sourceId, SymbolInfo info)
@@ -754,11 +913,11 @@ public sealed class GraphBuilder
             var id = name.Identifier.Text;
             var typeArgs = (name as GenericNameSyntax)?.TypeArgumentList.Arguments;
 
-            if (id == "CreateMap" && typeArgs is { Count: 2 })
+            if (id == Constants.CreateMapMethodName && typeArgs is { Count: 2 })
                 HandleCreateMap(inv, typeArgs.Value, sourceId, model, ref skip);
             else if (Constants.MsDiMethodNames.Contains(id))
                 HandleMsDi(inv, typeArgs, sourceId, model, ref skip);
-            else if (id is "RegisterType" or "RegisterGeneric")
+            else if (Constants.AutofacRegisterMethodNames.Contains(id))
                 HandleAutofac(inv, typeArgs, sourceId, model, ref skip);
         }
         return skip;
@@ -781,7 +940,7 @@ public sealed class GraphBuilder
         return sym is ITypeSymbol t ? NodeId(t) : null;
     }
 
-    StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember, IEnumerable<InvocationExpressionSyntax> claimed, bool allowSegment = true)
+    StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember, IEnumerable<InvocationExpressionSyntax> claimed, IEnumerable<string> involved, bool allowSegment = true)
     {
         var innerStatement = inv.FirstAncestorOrSelf<StatementSyntax>();
         SyntaxNode anchor = innerStatement ?? (SyntaxNode)inv;
@@ -842,6 +1001,10 @@ public sealed class GraphBuilder
             SegmentLength = segmentLength,
             ManualReason = manualReason,
         };
+        foreach (var nid in involved)
+        {
+            if (nid != null && !stmt.InvolvedNodes.Contains(nid)) stmt.InvolvedNodes.Add(nid);
+        }
         _graph.Statements.Add(stmt);
         if (!_anchors.TryGetValue(anchor, out var ai)) _anchors[anchor] = ai = new AnchorInfo { InnerStatement = innerStatement };
         ai.Statements.Add(stmt);
@@ -867,18 +1030,31 @@ public sealed class GraphBuilder
         foreach (var ta in typeArgs) AddSkip(ref skip, ta.Span);
 
         // The whole fluent chain hanging off CreateMap (ForMember, ReverseMap, ...) is map
-        // configuration: it lives and dies with the mapping, so the statement claims it.
+        // configuration: it lives and dies with the mapping, so the statement claims it — including
+        // every reference inside its lambdas. Those must NOT become edges from the containing member
+        // (a rooted profile would keep the mapped members alive forever); they belong to the
+        // statement, which keeps them while it lives and releases them when it dies.
         var claimed = new List<InvocationExpressionSyntax> { inv };
+        var chainRefs = new List<string>();
         var chainTop = (SyntaxNode)inv;
         while (chainTop.Parent is MemberAccessExpressionSyntax cma && cma.Parent is InvocationExpressionSyntax cInv)
         {
             claimed.Add(cInv);
+            _processedInvocations.Add(cInv);
+            AddSkip(ref skip, TextSpan.FromBounds(cma.Name.SpanStart, cInv.Span.End));
+            foreach (var idn in cInv.ArgumentList.DescendantNodes())
+            {
+                if (idn is not (IdentifierNameSyntax or GenericNameSyntax)) continue;
+                if (Normalize(model.GetSymbolInfo(idn).Symbol) is { } nid && !chainRefs.Contains(nid)) chainRefs.Add(nid);
+            }
             chainTop = cInv;
         }
-        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed);
+        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed, involved.Concat(chainRefs));
         var guards = new List<object> { sourceId };
         guards.AddRange(involved);
         _graph.AddRule(guards, new object[] { stmt }, "CreateMap in use iff both types in use");
+        if (chainRefs.Count > 0)
+            _graph.AddRule(new object[] { stmt }, chainRefs.Cast<object>().ToList(), "map configuration references");
 
         if (!_config.StrictMembers)
         {
@@ -925,7 +1101,7 @@ public sealed class GraphBuilder
         _processedInvocations.Add(inv);
         foreach (var s in spansToSkip) AddSkip(ref skip, s);
 
-        var stmt = NewStatement("DI.Register", inv, sourceId, new[] { inv });
+        var stmt = NewStatement("DI.Register", inv, sourceId, new[] { inv }, new[] { service, impl });
         var guards = new List<object> { sourceId };
         if (service != null) guards.Add(service);
         else if (impl != null) guards.Add(impl); // external service type: tie to the implementation
@@ -962,6 +1138,7 @@ public sealed class GraphBuilder
 
         // Follow the fluent chain upward: .As<T>(), .AsSelf(), .AsImplementedInterfaces(), lifetimes.
         var services = new List<string>();
+        var textualRefs = new List<string>();
         var claimed = new List<InvocationExpressionSyntax> { inv };
         bool asSelf = false, hasExternalService = false;
         var cur = inv;
@@ -973,7 +1150,7 @@ public sealed class GraphBuilder
             {
                 foreach (var ta in g.TypeArgumentList.Arguments)
                 {
-                    if (ResolveTypeNode(ta, model) is { } s) { services.Add(s); AddSkip(ref skip, ta.Span); }
+                    if (ResolveTypeNode(ta, model) is { } s) { services.Add(s); textualRefs.Add(s); AddSkip(ref skip, ta.Span); }
                     else hasExternalService = true;
                 }
             }
@@ -997,7 +1174,7 @@ public sealed class GraphBuilder
 
         // No segment: a chain segment of the outermost call would delete only the lifetime call,
         // not the registration, so a partially surviving anchor falls back to a manual warning.
-        var stmt = NewStatement("DI.Register", outermost, sourceId, claimed, allowSegment: false);
+        var stmt = NewStatement("DI.Register", outermost, sourceId, claimed, textualRefs.Append(impl), allowSegment: false);
         if (services.Count > 0)
         {
             foreach (var s in services)
