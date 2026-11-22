@@ -40,6 +40,9 @@ public static class Constants
     /// casing) but case-sensitive on Linux, where Foo.cs and foo.cs are different files.</summary>
     public static readonly StringComparer PathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
+    /// <summary>StartsWith/EndsWith companion to PathComparer.</summary>
+    public static readonly StringComparison PathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
     public static readonly HashSet<string> AutofacRegisterMethodNames = new(StringComparer.Ordinal)
     {
         "RegisterType", "RegisterGeneric",

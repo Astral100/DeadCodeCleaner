@@ -69,6 +69,7 @@ public class GadgetsController
         _svc = svc;
     }
 
+    [Audit("gadget")]
     public string GetGadget()
     {
         return SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter

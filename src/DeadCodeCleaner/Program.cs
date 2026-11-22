@@ -78,6 +78,16 @@ public static class Program
                     Editor.Mark(report, log);
                     break;
                 case "delete":
+                    if (report.ProjectsWithCompileErrors > 0 && !opts.AllowCompileErrors)
+                    {
+                        Console.Error.WriteLine($"error: {report.ProjectsWithCompileErrors} project(s) had compile errors during analysis — references in them are invisible and the cascade may over-delete; fix the build first, or pass --allow-compile-errors; nothing was deleted");
+                        return 1;
+                    }
+                    if (report.StillReferencedTargets > 0 && !opts.NoVerify)
+                    {
+                        Console.Error.WriteLine($"error: {report.StillReferencedTargets} removal target(s) are still referenced by surviving code (see the STILL REFERENCED warnings) — deleting them breaks the callers, or silently rebinds them to another overload; fix the callers first (--no-verify overrides); nothing was deleted");
+                        return 1;
+                    }
                     var reviewTests = report.Symbols.Count(s => s.Review);
                     if (reviewTests > 0 && !opts.DeleteReviewTests)
                     {
@@ -131,6 +141,7 @@ public static class Program
                 case "--config": opts.ConfigPath = Path.GetFullPath(Next()); break;
                 case "--strict-members": opts.StrictMembers = true; break;
                 case "--no-verify": opts.NoVerify = true; break;
+                case "--allow-compile-errors": opts.AllowCompileErrors = true; break;
                 case "--delete-review-tests": opts.DeleteReviewTests = true; break;
                 case "--verbose" or "-v": opts.Verbose = true; break;
                 default: throw new ArgumentException($"unknown option '{args[i]}'");
@@ -162,6 +173,7 @@ public static class Program
               --config <path>         JSON config: { "keep": ["Ns.Type*", ...], "strictMembers": false }
               --strict-members        do not auto-keep public properties / enum members of in-use types
               --no-verify             skip the in-memory rebuild that checks the plan compiles
+              --allow-compile-errors  let delete run although some projects failed to compile during analysis
               --delete-review-tests   delete review-flagged tests too (default: delete refuses while any exist)
               --verbose               print full lists instead of the first 100
 

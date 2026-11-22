@@ -66,7 +66,17 @@ public static class ReportWriter
         if (report.Warnings.Count > 0)
         {
             Section("Warnings", report.Warnings.Count);
+            bool Critical(string w)
+            {
+                return w.StartsWith("VERIFY", StringComparison.Ordinal) || w.StartsWith("STILL REFERENCED", StringComparison.Ordinal);
+            }
             foreach (var w in report.Warnings.Take(limit)) { Console.WriteLine($"  {w}"); }
+            // VERIFY and STILL REFERENCED lines are the ones that make a plan unsafe: they are
+            // printed even past the cap, so the cap can never hide them.
+            var rest = report.Warnings.Skip(limit).ToList();
+            foreach (var w in rest.Where(Critical)) { Console.WriteLine($"  {w}"); }
+            int hidden = rest.Count(w => !Critical(w));
+            if (hidden > 0) { Console.WriteLine($"  ... and {hidden} more (use --verbose or the JSON report)"); }
         }
         Console.WriteLine("=======================================================");
     }

@@ -106,6 +106,10 @@ check "verification clean (plan introduces no compile errors)" \
     '[.warnings[] | select(startswith("VERIFY"))] | length == 0'
 check "deleted member accessed via dynamic warns" \
     '[.warnings[]] | map(select(contains("accessed dynamically"))) | length >= 1'
+check "attribute ctor survives via surviving method's attribute" \
+    '[.symbols[] | select(.fqn == "Fixture.Domain.AuditAttribute..ctor")] | length == 0'
+check "chained generic converter NOT orphaned (its map survives)" \
+    '[.symbols[].fqn] | map(select(contains("GadgetConverter"))) | length == 0'
 
 echo "== Case 2: remove GetSecondary (member-level, narrow cascade)"
 dotnet run --project src/DeadCodeCleaner -- analyze \
@@ -146,6 +150,8 @@ check "Tests->Web project reference removable" \
 check "no NuGet removals (fixture has none)" '.packageRefRemovals | length == 0'
 check "no whole project deletable (pre-existing orphans remain)" '.deletableProjects | length == 0'
 check "DeadLegacyHelper still untouched"  '[.symbols[].fqn] | index("Fixture.Domain.DeadLegacyHelper") == null'
+check "chained generic converter dies with its mapping" \
+    "$orph | index(\"Fixture.Domain.GadgetConverter\") != null"
 
 echo "== Case 5: mark idempotency and delete round-trip (scratch copy)"
 SCRATCH=$(mktemp -d)

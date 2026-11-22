@@ -95,6 +95,11 @@ public static class Editor
         }
         foreach (var pd in report.DeletableProjects)
         {
+            if (!File.Exists(pd.CsprojPath))
+            {
+                log($"  WARNING: {pd.CsprojPath} does not exist on disk — skipped");
+                continue;
+            }
             var text = ReadFileText(pd.CsprojPath, out var encoding);
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
             var lines = SplitLinesKeepEnds(text);
@@ -137,36 +142,75 @@ public static class Editor
         foreach (var st in report.Statements) { Range(st.File, st.SpanStart, st.SpanStart + st.SpanLength, st.StartLine); }
         foreach (var ur in report.UsingRemovals) { Range(ur.File, ur.SpanStart, ur.SpanStart + ur.SpanLength, ur.Line); }
 
-        // Every span file is read and validated BEFORE anything touches the disk: a missing or
-        // mismatched file is skipped up front, and a hard IO error aborts with the tree untouched.
-        var pending = new List<(string File, string NewText, Encoding Encoding, int Regions)>();
+        // Every span file is read and validated BEFORE anything touches the disk. Any failure is
+        // FATAL: the verifier approved the plan as a whole, so applying it minus one file could
+        // over-delete what that file still uses. Nothing is written until everything checks out.
+        var pending = new List<(string File, string NewText, string OldText, Encoding Encoding, int Regions)>();
         foreach (var file in perFile.Keys.OrderBy(x => x, Constants.PathComparer))
         {
             if (!File.Exists(file))
             {
-                log($"  WARNING: {file} does not exist on disk (source-generated?) — skipped");
-                continue;
+                log($"error: {file} no longer exists on disk — the analysis is stale; NOTHING was deleted, re-run delete");
+                return;
             }
             var text = ReadFileText(file, out var encoding);
             if (report.FileTextLengths.TryGetValue(file, out var expected) && expected != text.Length)
             {
-                log($"  WARNING: {file} decodes to {text.Length} chars but the analysis saw {expected} (encoding mismatch, or the file changed since the analysis) — skipped, delete manually");
-                continue;
+                log($"error: {file} decodes to {text.Length} chars but the analysis saw {expected} (encoding mismatch, or the file changed since the analysis) — NOTHING was deleted");
+                return;
             }
             var ranges = perFile[file];
             if (ranges.Count > 0 && ranges.Max(r => r.End) > text.Length)
             {
-                log($"  WARNING: {file} is shorter than the computed spans (encoding mismatch?) — skipped, delete manually");
-                continue;
+                log($"error: {file} is shorter than the computed spans (encoding mismatch?) — NOTHING was deleted");
+                return;
             }
             var starts = LineStarts(text);
             foreach (var line in markerLines[file]) { AddMarkerLineAbove(line, text, starts, ranges); }
             var (newText, n) = ComputeDeletions(text, ranges);
-            if (n > 0) { pending.Add((file, newText, encoding, n)); }
+            if (n > 0) { pending.Add((file, newText, text, encoding, n)); }
         }
-        foreach (var (file, newText, encoding, n) in pending)
+        // Whole files are validated too: a file that changed since the analysis may hold code the
+        // plan never accounted for.
+        foreach (var file in report.DeletableFiles)
         {
-            WriteFileText(file, newText, encoding);
+            if (!File.Exists(file) || !report.FileTextLengths.TryGetValue(file, out var expected)) { continue; }
+            var text = ReadFileText(file, out _);
+            if (text.Length != expected)
+            {
+                log($"error: {file} decodes to {text.Length} chars but the analysis saw {expected} — it changed since the analysis; NOTHING was deleted");
+                return;
+            }
+        }
+        // Writes restore the already-written files on failure, so a half-applied plan never sticks.
+        var written = new List<(string File, string OldText, Encoding Encoding)>();
+        for (int wi = 0; wi < pending.Count; wi++)
+        {
+            var (file, newText, oldText, encoding, n) = pending[wi];
+            try
+            {
+                WriteFileText(file, newText, encoding);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                log($"error: could not write {file}: {e.Message} — restoring the {written.Count} file(s) already edited");
+                int restored = 0;
+                foreach (var (wf, old, enc) in written)
+                {
+                    try
+                    {
+                        WriteFileText(wf, old, enc);
+                        restored++;
+                    }
+                    catch (Exception re) when (re is IOException or UnauthorizedAccessException)
+                    {
+                        log($"  WARNING: could not restore {wf}: {re.Message}");
+                    }
+                }
+                log($"  restored {restored}/{written.Count}; nothing else was changed");
+                return;
+            }
+            written.Add((file, oldText, encoding));
             regions += n;
         }
 
@@ -331,9 +375,10 @@ public static class Editor
             int at = FindOpenTag(lines[i], open, startsInComment[i]);
             if (at < 0) { continue; }
             int line = i, col = at + open.Length, gt = -1;
+            char quote = '\0';
             while (line < lines.Count)
             {
-                gt = lines[line].IndexOf('>', col);
+                gt = IndexOfTagEnd(lines[line], col, ref quote);
                 if (gt >= 0) { break; }
                 line++;
                 col = 0;
@@ -369,6 +414,25 @@ public static class Editor
             i = to;
         }
         return found;
+    }
+
+    /// <summary>Index of the '>' ending an opening tag, skipping any '>' inside a quoted attribute
+    /// value (XML allows them raw there, e.g. Condition="'$(V)' &gt; '1'"). Quote state carries
+    /// across lines via <paramref name="quote"/> for multi-line opening tags.</summary>
+    static int IndexOfTagEnd(string lineText, int from, ref char quote)
+    {
+        for (int i = from; i < lineText.Length; i++)
+        {
+            var c = lineText[i];
+            if (quote != '\0')
+            {
+                if (c == quote) { quote = '\0'; }
+                continue;
+            }
+            if (c is '"' or '\'') { quote = c; continue; }
+            if (c == '>') { return i; }
+        }
+        return -1;
     }
 
     static int FindOpenTag(string lineText, string open, bool startsInComment)
@@ -497,8 +561,21 @@ public static class Editor
         var bytes = File.ReadAllBytes(path);
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
         {
-            encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
-            return new UTF8Encoding(false).GetString(bytes, 3, bytes.Length - 3);
+            // Strict after the BOM too: silently replacing invalid bytes with U+FFFD would corrupt
+            // the untouched parts on write-back. Invalid content falls back to Latin-1 over ALL
+            // bytes (BOM included), which round-trips exactly — and then differs from the analyzed
+            // text, so the length guard skips the file instead of mangling it.
+            try
+            {
+                var text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(bytes, 3, bytes.Length - 3);
+                encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
+                return text;
+            }
+            catch (DecoderFallbackException)
+            {
+                encoding = Encoding.Latin1;
+                return Encoding.Latin1.GetString(bytes);
+            }
         }
         // UTF-32 LE shares its first two bytes with UTF-16 LE, so it must be checked first.
         if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0x00 && bytes[3] == 0x00)

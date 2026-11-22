@@ -82,6 +82,14 @@ public sealed class Graph
     public List<string> Warnings { get; } = new();
     /// <summary>Node id -> external (out-of-solution) assembly names it references.</summary>
     public Dictionary<string, HashSet<string>> ExternalRefs { get; } = new(StringComparer.Ordinal);
+    /// <summary>Node id -> external assemblies it CALLS INTO (invocations/constructions) outside any
+    /// claimed registration: an untracked framework call (RegisterInstance, assembly scanning) leaves
+    /// no edge and no statement, so the empty-container pass needs this to see the side effect.</summary>
+    public Dictionary<string, HashSet<string>> ExternalCallRefs { get; } = new(StringComparer.Ordinal);
+    /// <summary>Nodes matched by a config keep/roots pattern: never orphaned, by ANY pass.</summary>
+    public HashSet<string> ConfigKeptIds { get; } = new(StringComparer.Ordinal);
+    /// <summary>Projects whose analysis compilation had errors: their references are incomplete.</summary>
+    public List<string> ProjectsWithCompileErrors { get; } = new();
     /// <summary>Node id -> names of the projects that compile it (more than one for linked files).</summary>
     public Dictionary<string, HashSet<string>> ProjectsOf { get; } = new(StringComparer.Ordinal);
     /// <summary>Project name -> csproj facts.</summary>
@@ -128,6 +136,15 @@ public sealed class Graph
         if (!ExternalRefs.TryGetValue(nodeId, out var set))
         {
             ExternalRefs[nodeId] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+        set.Add(assemblyName);
+    }
+
+    public void AddExternalCallRef(string nodeId, string assemblyName)
+    {
+        if (!ExternalCallRefs.TryGetValue(nodeId, out var set))
+        {
+            ExternalCallRefs[nodeId] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
         set.Add(assemblyName);
     }
@@ -256,6 +273,9 @@ public sealed class CliOptions
     public bool Verbose;
     public bool StrictMembers;
     public bool NoVerify;
+    /// <summary>Let delete run although some projects had compile errors during analysis (their
+    /// references are invisible, so the cascade may over-delete). Default: delete refuses.</summary>
+    public bool AllowCompileErrors;
     /// <summary>Delete review-flagged tests (tests that also reference surviving code) without
     /// refusing. Default: delete mode stops while any exist, so they can be adjusted first.</summary>
     public bool DeleteReviewTests;

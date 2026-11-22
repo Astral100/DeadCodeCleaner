@@ -64,6 +64,7 @@ public sealed class GraphBuilder
             if (errors.Count > 0)
             {
                 _graph.Warnings.Add($"{project.Name}: {errors.Count} compile errors — analysis may miss references (first: {errors[0].GetMessage()})");
+                _graph.ProjectsWithCompileErrors.Add(project.Name);
                 foreach (var e in errors.Take(Constants.ShownCompileErrors)) { _log($"      error: {e.GetMessage()}"); }
             }
         }
@@ -239,7 +240,11 @@ public sealed class GraphBuilder
         try
         {
             var fi = new FileInfo(path);
-            if (fi.Length > Constants.MaxScannedConfigFileBytes) { return ""; }
+            if (fi.Length > Constants.MaxScannedConfigFileBytes)
+            {
+                _graph.Warnings.Add($"config file not scanned (over {Constants.MaxScannedConfigFileBytes} bytes): {path} — type/package mentions in it go unnoticed");
+                return "";
+            }
             return File.ReadAllText(path);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -775,6 +780,7 @@ public sealed class GraphBuilder
             if (regexes.Any(r => r.IsMatch(fqn)))
             {
                 _graph.AddRoot(id, "config keep/root", _graph.TestNodes.Contains(id));
+                _graph.ConfigKeptIds.Add(id);
             }
         }
     }
@@ -893,17 +899,21 @@ public sealed class GraphBuilder
 
     void WalkFieldLike(VariableDeclarationSyntax decl, SyntaxList<AttributeListSyntax> attrs, SemanticModel model)
     {
-        string first = null;
+        // The declaration's type and attributes are shared by EVERY sibling: each needs the edges,
+        // or a surviving sibling could not keep the field type alive when another sibling dies.
+        var ids = new List<string>();
         foreach (var v in decl.Variables)
         {
             if (NodeId(model.GetDeclaredSymbol(v)) is not { } fId) { continue; }
-            first ??= fId;
+            ids.Add(fId);
             if (v.Initializer != null) { WalkMember(v.Initializer, fId, model); }
             if (v.ArgumentList != null) { WalkMember(v.ArgumentList, fId, model); }
         }
-        if (first == null) { return; }
-        WalkMember(decl.Type, first, model);
-        foreach (var al in attrs) { WalkMember(al, first, model); }
+        foreach (var fId in ids)
+        {
+            WalkMember(decl.Type, fId, model);
+            foreach (var al in attrs) { WalkMember(al, fId, model); }
+        }
     }
 
     void RootCompilationUnitAttributeSymbol(ISymbol sym, string projectName, bool isTest)
@@ -940,19 +950,20 @@ public sealed class GraphBuilder
                     }
                     AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(node));
                     break;
-                case BaseObjectCreationExpressionSyntax oc:
-                    AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(oc));
-                    break;
-                case ConstructorInitializerSyntax ci:
-                    AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(ci));
+                case BaseObjectCreationExpressionSyntax or ConstructorInitializerSyntax or ElementAccessExpressionSyntax:
+                    if (InSkip(skipSpans, node.Span))
+                    {
+                        // Inside a claimed chain these belong to the statement (its InvolvedNodes and
+                        // chain references), never to the containing member: only pin packages here.
+                        RecordExternal(sourceId, model.GetSymbolInfo(node).Symbol);
+                        break;
+                    }
+                    AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(node));
                     break;
                 case PrimaryConstructorBaseTypeSyntax pbt:
                     // ": Base(x)" of a primary constructor — the only reference to the base
                     // constructor, with no identifier naming it.
                     AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(pbt));
-                    break;
-                case ElementAccessExpressionSyntax ea:
-                    AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(ea));
                     break;
                 case ForEachStatementSyntax fe:
                 {
@@ -1027,8 +1038,14 @@ public sealed class GraphBuilder
         }
         switch (op)
         {
-            case IInvocationOperation iv: Emit(iv.TargetMethod); break;
-            case IObjectCreationOperation oc: Emit(oc.Constructor); break;
+            case IInvocationOperation iv:
+                Emit(iv.TargetMethod);
+                if (!suppressed) { RecordExternalCall(sourceId, iv.TargetMethod); }
+                break;
+            case IObjectCreationOperation oc:
+                Emit(oc.Constructor);
+                if (!suppressed) { RecordExternalCall(sourceId, oc.Constructor); }
+                break;
             case IMemberReferenceOperation mr: Emit(mr.Member); break;
             case IUnaryOperation u: Emit(u.OperatorMethod); break;
             case IBinaryOperation b: Emit(b.OperatorMethod); break;
@@ -1055,6 +1072,16 @@ public sealed class GraphBuilder
     {
         if (Normalize(target) is { } targetId) { _graph.AddEdge(sourceId, targetId); }
         else { RecordExternal(sourceId, target); }
+    }
+
+    /// <summary>Records a CALL into an external assembly (invocation or construction) that no claimed
+    /// statement owns: a side effect the empty-container pass must respect, invisible as an edge.</summary>
+    void RecordExternalCall(string sourceId, ISymbol target)
+    {
+        if (target == null) { return; }
+        var asm = target.OriginalDefinition.ContainingAssembly?.Name;
+        if (asm == null || _solutionAssemblies.Contains(asm)) { return; }
+        _graph.AddExternalCallRef(sourceId, asm);
     }
 
     void RecordExternal(string sourceId, ISymbol target)
@@ -1288,6 +1315,9 @@ public sealed class GraphBuilder
         }
         if (involved.Count == 0) { return; }
         _processedInvocations.Add(inv);
+        // The suppressed call still references its target method: when that is the solution's OWN
+        // look-alike (not the framework's), the suppression must not orphan it.
+        AddEdgeTo(sourceId, model.GetSymbolInfo(inv).Symbol);
         foreach (var ta in typeArgs) { AddSkip(ref skip, ta.Span); }
 
         // The whole fluent chain hanging off CreateMap (ForMember, ReverseMap, ...) is map
@@ -1307,6 +1337,13 @@ public sealed class GraphBuilder
             {
                 if (idn is not (IdentifierNameSyntax or GenericNameSyntax)) { continue; }
                 if (Normalize(model.GetSymbolInfo(idn).Symbol) is { } nid && !chainRefs.Contains(nid)) { chainRefs.Add(nid); }
+            }
+            // Generic type arguments on the chained call's NAME (ConvertUsing<TConverter>,
+            // Include<TDerived,TOther>) sit inside the suppressed span and appear in no argument
+            // list: claim them as statement references or they are lost entirely.
+            if (cma.Name is GenericNameSyntax chainedGeneric)
+            {
+                foreach (var ta in chainedGeneric.TypeArgumentList.Arguments) { CollectTypeRefNodes(ta, model, chainRefs); }
             }
             chainTop = cInv;
         }
@@ -1381,6 +1418,8 @@ public sealed class GraphBuilder
         if (service == null && impl == null) { return; }
 
         _processedInvocations.Add(inv);
+        // See HandleCreateMap: a solution-declared look-alike target must keep its call edge.
+        AddEdgeTo(sourceId, model.GetSymbolInfo(inv).Symbol);
         foreach (var s in spansToSkip) { AddSkip(ref skip, s); }
 
         var stmt = NewStatement("DI.Register", inv, sourceId, new[] { inv }, new[] { service, impl }.Concat(argNodes));
@@ -1429,6 +1468,8 @@ public sealed class GraphBuilder
             }
         }
         _processedInvocations.Add(inv);
+        // See HandleCreateMap: a solution-declared look-alike target must keep its call edge.
+        AddEdgeTo(sourceId, model.GetSymbolInfo(inv).Symbol);
 
         // Follow the fluent chain upward: .As<T>(), .AsSelf(), .AsImplementedInterfaces(), lifetimes.
         var services = new List<string>();

@@ -2,6 +2,7 @@ namespace Fixture.Domain;
 
 // Inactive-region trap: when WidgetExtra orphans, this file looks fully dead to the compiler —
 // but the #if block below holds code it cannot see, so the file must never be deleted whole.
+[Audit("extra")]
 public class WidgetExtra
 {
     public string Tag()

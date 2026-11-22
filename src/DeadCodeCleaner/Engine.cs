@@ -208,6 +208,7 @@ public sealed class Engine
             RemoveTargets = _opts.RemoveTargets.ToArray(),
         };
         report.Warnings.AddRange(graph.Warnings);
+        report.ProjectsWithCompileErrors = graph.ProjectsWithCompileErrors.Count;
 
         if (graph.Roots.Count == 0)
         {
@@ -249,6 +250,7 @@ public sealed class Engine
             var more = shown.Count > Constants.ShownSurvivingRefs ? $" (+{shown.Count - Constants.ShownSurvivingRefs} more)" : "";
             report.Warnings.Add($"STILL REFERENCED: removing {FqnOf(graph, target)} breaks surviving code — the build will fail: {string.Join(", ", shown.Take(Constants.ShownSurvivingRefs))}{more}");
         }
+        report.StillReferencedTargets = stillReferenced.Count;
 
         // Poison: any code that is not in use after the removal (tests, and pre-existing orphans)
         // but references deleted code can no longer compile — it is deleted too, transitively.
@@ -325,6 +327,8 @@ public sealed class Engine
             if (allDead.Contains(typeId)) { continue; }
             if (!graph.Decl.TryGetValue(typeId, out var containerSym) || containerSym is not INamedTypeSymbol nts) { continue; }
             if (!membersOf.TryGetValue(typeId, out var containerMembers)) { continue; }
+            // An explicit config keep/root wins over everything, this pass included.
+            if (graph.ConfigKeptIds.Contains(typeId) || containerMembers.Any(graph.ConfigKeptIds.Contains)) { continue; }
             var allowed = new HashSet<string>(StringComparer.Ordinal) { typeId };
             allowed.UnionWith(containerMembers);
             var allowedAsms = new HashSet<string>(Constants.EmptyContainerBenignAssemblies, StringComparer.OrdinalIgnoreCase);
@@ -354,6 +358,15 @@ public sealed class Engine
                 // External calls beyond the mapping/registration framework (a log call, say) are
                 // side effects the deletion would silently drop: keep the container.
                 if (graph.ExternalRefs.TryGetValue(m, out var exts) && exts.Any(a => !allowedAsms.Contains(a)))
+                {
+                    eligible = false;
+                    break;
+                }
+                // An unclaimed CALL into any external assembly beyond the truly benign list — the
+                // mapping/registration framework's own included: untracked registrations
+                // (RegisterInstance, assembly scanning, Register(c => ...)) leave no edge and no
+                // statement, but deleting the container would silently drop them.
+                if (graph.ExternalCallRefs.TryGetValue(m, out var extCalls) && extCalls.Any(a => !Constants.EmptyContainerBenignAssemblies.Contains(a)))
                 {
                     eligible = false;
                     break;
@@ -744,8 +757,8 @@ public sealed class Engine
                         if (!warnings.Contains(msg)) { warnings.Add(msg); }
                         continue;
                     }
-                    // The first sibling's entry carries the whole-declaration span.
-                    if (variables.Value[0].Identifier.Text != s.Name) { continue; }
+                    // Every dead sibling emits the whole-declaration span (identical spans merge at
+                    // edit time), so the report lists each deleted field, not just the first.
                     node = container;
                 }
             }
@@ -808,6 +821,29 @@ public sealed class Engine
             });
         }
         return parts;
+    }
+
+    /// <summary>A file that blocks deleting the whole project: inactive #if regions and duplicate
+    /// full names make the deletion's accounting incomplete for it. Checked both by directory (for
+    /// declaration-less files) and by the dead nodes' declaring paths (for linked-in files).</summary>
+    string ProtectedProjectFile(Graph graph, ProjectInfo pi, List<string> nodeIds)
+    {
+        var pdir = Path.GetDirectoryName(Path.GetFullPath(pi.FilePath)) ?? "";
+        var prefix = pdir + Path.DirectorySeparatorChar;
+        foreach (var f in graph.FilesWithInactiveCode.Concat(graph.FilesWithDuplicateDecls))
+        {
+            if (f.StartsWith(prefix, Constants.PathComparison)) { return f; }
+        }
+        foreach (var n in nodeIds)
+        {
+            if (!graph.Decl.TryGetValue(n, out var d)) { continue; }
+            foreach (var r in d.DeclaringSyntaxReferences)
+            {
+                var f = r.SyntaxTree.FilePath;
+                if (graph.FilesWithInactiveCode.Contains(f) || graph.FilesWithDuplicateDecls.Contains(f)) { return f; }
+            }
+        }
+        return null;
     }
 
     string SiblingFieldId(Graph graph, string memberId, string siblingName)
@@ -877,6 +913,13 @@ public sealed class Engine
         {
             if (nodeIds.Count == 0 || nodeIds.Any(Stays)) { continue; }
             if (!graph.Projects.TryGetValue(pname, out var pi)) { continue; }
+            // The file-level protections hold at project level too: removing the csproj would drop a
+            // protected file from the build as surely as deleting it.
+            if (ProtectedProjectFile(graph, pi, nodeIds) is { } protectedFile)
+            {
+                report.Warnings.Add($"{pname}: every declaration is dead, but the project is NOT removed — {protectedFile} has inactive #if regions or duplicate type names; its code is deleted file by file, remove the project manually");
+                continue;
+            }
             deletableProjects.Add(pname);
             report.DeletableProjects.Add(new ProjectDeletion { Project = pname, CsprojPath = pi.FilePath });
         }
@@ -1242,6 +1285,14 @@ public sealed class Engine
                             .OfType<IMethodSymbol>()
                             .Select(ms => key + ShortSignature(ms))));
                 }
+                if (narrowed.Count > 1)
+                {
+                    // Same parameter list on several overloads (they differ only by generic type
+                    // parameters): removing all of them on a signature the user meant for one is over-deletion.
+                    throw new InvalidOperationException(
+                        $"'{key}{signature}' matches {narrowed.Count} overloads — they differ only by generic type parameters:\n  " +
+                        string.Join("\n  ", narrowed.Select(m => SymbolNames.Detailed(graph.Decl[m]))));
+                }
                 matches = narrowed;
             }
             var containers = matches
@@ -1265,11 +1316,24 @@ public sealed class Engine
         return seeds;
     }
 
-    /// <summary>"(Invoice,int)" — parameter types with minimal qualification, no spaces.</summary>
+    /// <summary>"(Invoice,int)" / "(refint)" — parameter types with ref kinds, minimal qualification,
+    /// no spaces (the user's signature has its spaces stripped before comparing, so "(ref int)" matches).</summary>
     string ShortSignature(IMethodSymbol ms)
     {
         // Nullable reference annotations are dropped ("string?" matches "string"); Nullable<T> value types keep their "?".
-        return "(" + string.Join(",", ms.Parameters.Select(p => p.Type.WithNullableAnnotation(NullableAnnotation.None).ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat).Replace(" ", ""))) + ")";
+        return "(" + string.Join(",", ms.Parameters.Select(p => (RefPrefix(p.RefKind) + p.Type.WithNullableAnnotation(NullableAnnotation.None).ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)).Replace(" ", ""))) + ")";
+    }
+
+    string RefPrefix(RefKind kind)
+    {
+        return kind switch
+        {
+            RefKind.Ref => "ref ",
+            RefKind.Out => "out ",
+            RefKind.In => "in ",
+            RefKind.RefReadOnlyParameter => "ref readonly ",
+            _ => "",
+        };
     }
 
     HashSet<string> ExpandRemovals(Graph graph, HashSet<string> seeds)

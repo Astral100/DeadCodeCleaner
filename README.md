@@ -55,14 +55,21 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   implementation type takes its registration along even while the service interface stays in use
   (with a warning, since behavior changes).
 - **Empty containers**: an AutoMapper profile or Autofac module whose every mapping/registration
-  died (and that nothing surviving references) is deleted whole.
+  died (and that nothing surviving references) is deleted whole — unless a config `keep` pattern
+  matches it, or any of its members still calls into an external assembly beyond a small benign
+  list: an untracked registration (`RegisterInstance`, `Register(c => ...)`, assembly scanning)
+  leaves no graph edge, and deleting the container would silently drop it. Chained generic type
+  arguments (`ConvertUsing<TConverter>()`, `Include<TDerived, TOther>()`) are statement references
+  too: they stay alive while the map lives and die with it.
 - **Build plumbing cascades too**: a NuGet `PackageReference` or `ProjectReference` whose last
   surviving user was deleted is removed from the csproj (entries under a `Condition` are left in
   place with a warning — only one build configuration is analyzed); `using` directives that no
   assembly can satisfy any more are removed (matched under their RESOLVED names, so `using Sub;`
   inside `namespace A` means `A.Sub`; a file banner above the first using is never deleted with
   it); a project whose every declaration is deleted is removed from the
-  solution and its csproj deleted (directory too, when nothing but code remained). Transitive
+  solution and its csproj deleted (directory too, when nothing but code remained) — unless one of
+  its files carries inactive `#if` regions or duplicate type names; then the project stays, with a
+  warning, and only its code is deleted file by file. Transitive
   reachability is respected for both kinds and ACROSS projects — SDK-style references are
   transitive, so a reference in project B is kept when a dependent project A reaches code or
   package assemblies only through it (e.g. `EFCore` via `EFCore.SqlServer`, or A → B → C where
@@ -107,26 +114,34 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 
 - `--remove` takes `Namespace.Type` or `Namespace.Type.Member` (all overloads together), or a
   specific overload: `"Namespace.Type.Render(Invoice, int)"` (short type names, as the IDE shows
-  them; nullable reference annotations are ignored, so `(string)` matches `(string?)`). A generic
+  them; nullable reference annotations are ignored, so `(string)` matches `(string?)`; `ref`/`out`/
+  `in` are part of the signature, so `(ref int)` and `(int)` select different overloads). A generic
   type that shares its name with a non-generic one is selected with an arity suffix:
-  ``Ns.Result`2`` for `Result<T1,T2>`. Any other name collision is reported as ambiguous instead
+  ``Ns.Result`2`` for `Result<T1,T2>`. Any other name collision — overloads that differ only by
+  generic type parameters included — is reported as ambiguous instead
   of removing both. Removing a type removes all its members and nested types.
 - `mark` and `delete` re-run the analysis, so they always operate on current file content; `mark`
   is idempotent, and `delete` removes marker comments along with the code. Whole-file deletions get
   one marker at the top of the file (or the file itself is deleted). `delete` reads and validates
-  every file BEFORE touching the disk — a file that is missing, or whose decoded text length no
-  longer matches what the analysis saw (encoding mismatch, concurrent edit), is skipped with a
-  warning, and a hard IO error aborts with the tree untouched; span edits are applied before any
-  whole file is deleted. Edits preserve each file's
+  every file BEFORE touching the disk — whole-file deletions included — and any file that is
+  missing or whose decoded text length no longer matches what the analysis saw (encoding mismatch,
+  concurrent edit) aborts the WHOLE delete with nothing changed: the verified plan applies in full
+  or not at all. A write that fails midway restores the files already edited. Span edits are
+  applied before any whole file is deleted. Edits preserve each file's
   encoding (BOMs, UTF-32 included; non-UTF-8 files are handled byte-preserving via Latin-1) and every untouched
   line's own line ending, never swallow a `#region`/`#if` directive whose counterpart survives,
   and never delete a file whole when it carries global usings, assembly attributes, or inactive
   `#if` regions (code the compiler cannot see). Deleting an enum member takes its separator comma;
   deleting a partial method/property deletes BOTH parts; old-style csproj `<Compile>` entries of
   deleted files are removed too. `delete` refuses to run while verification reports new compile
-  errors, and while review-flagged tests exist (`--delete-review-tests` overrides the latter).
+  errors, while review-flagged tests exist (`--delete-review-tests` overrides the latter), while
+  any analyzed project itself has compile errors — references in it are invisible, so the cascade
+  may over-delete (`--allow-compile-errors` overrides) — and while any removal target is still
+  referenced by surviving code, which would break the callers or silently rebind them to another
+  overload (`--no-verify` overrides).
 - `--config cfg.json` supports `{ "keep": ["Ns.Something*", ...], "strictMembers": false }` —
-  `keep` patterns are extra entry points that are never orphaned (use for reflection-only code).
+  `keep` patterns are extra entry points that are never orphaned, by any pass (use for
+  reflection-only code).
 - By default, public properties and enum members of in-use types are kept (serializers and model
   binding reach them via reflection); `--strict-members` disables that.
 
@@ -142,10 +157,12 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 - Runtime-only references get targeted warnings, since neither the analysis nor the verifier can
   decide them: a deleted member whose name is accessed through `dynamic` anywhere; a deleted type
   or removed package whose name appears in a `.config`/`.json` file under a project directory
-  (such packages are left in place); DI registration by assembly scanning (`RegisterAssemblyTypes`,
+  (such packages are left in place; a config file over 1 MB is not scanned, with a warning); DI
+  registration by assembly scanning (`RegisterAssemblyTypes`,
   `Scan`, ...) anywhere in the solution; and a constructor deleted while its type stays in use
   (DI or reflection may construct through it). A solution in which no production entry points are
-  detected warns loudly — everything would count as already orphaned.
+  detected warns loudly — everything would count as already orphaned. On the console, `VERIFY` and
+  `STILL REFERENCED` warnings are always printed, even past the 100-warning cap.
 - Deleting an enum member that is not the last renumbers every later member without an explicit
   `= value`; a warning says so (persisted or serialized numeric values change).
 - Declarations in source-generated trees are never edited — the generated text regenerates from
@@ -166,12 +183,13 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 
 ## Tests
 
-`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (80 checks covering
+`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (83 checks covering
 MediatR, AutoMapper (incl. `ForMember` chains), DI (generic and `typeof` forms), test poisoning,
 broken-test isolation, pre-existing orphans, member/overload-level removal, project-reference
 cleanup, chain-segment deletion, override and partial-method survival, enum-member removal,
 collection-initializer, deconstruction, enum-member-attribute and assembly-attribute edges,
 primary-constructor and primary-base-call safety, inactive `#if` protection and its mention
 warning, the still-referenced warning, the dynamic-access warning, the enum-renumber warning,
+chained generic type arguments living and dying with their map, attribute-constructor survival,
 the in-memory verification, the review-test delete refusal,
 mark idempotency, and two delete round-trips that must rebuild).
