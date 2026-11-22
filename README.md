@@ -57,8 +57,10 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
 - **Empty containers**: an AutoMapper profile or Autofac module whose every mapping/registration
   died (and that nothing surviving references) is deleted whole — unless a config `keep` pattern
   matches it, or any of its members still calls into an external assembly beyond a small benign
-  list: an untracked registration (`RegisterInstance`, `Register(c => ...)`, assembly scanning)
-  leaves no graph edge, and deleting the container would silently drop it. Chained generic type
+  list: an untracked registration (`RegisterInstance`, `Register(c => ...)`, an unresolvable
+  `RegisterType(variable)`, assembly scanning) leaves no graph edge, and deleting the container
+  would silently drop it. Constructor initializers (`: base("name")`, explicit or the implicit base
+  call) do NOT count as such calls — they die with the type. Chained generic type
   arguments (`ConvertUsing<TConverter>()`, `Include<TDerived, TOther>()`) are statement references
   too: they stay alive while the map lives and die with it.
 - **Build plumbing cascades too**: a NuGet `PackageReference` or `ProjectReference` whose last
@@ -126,8 +128,13 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   every file BEFORE touching the disk — whole-file deletions included — and any file that is
   missing or whose decoded text length no longer matches what the analysis saw (encoding mismatch,
   concurrent edit) aborts the WHOLE delete with nothing changed: the verified plan applies in full
-  or not at all. A write that fails midway restores the files already edited. Span edits are
-  applied before any whole file is deleted. Edits preserve each file's
+  or not at all. A write that fails midway restores the files already edited (the failed file
+  included — a truncating write must not mangle it), and a whole file that cannot be deleted
+  (locked, read-only checkout) rolls the entire plan back: the files already deleted and every
+  span edit are restored. Every abort or rollback exits non-zero, so scripts never mistake it for
+  success; a csproj that cannot be written degrades to a warning asking for a manual edit. `mark`
+  skips (with a warning) any file whose decoded length no longer matches the analysis. Span edits
+  are applied before any whole file is deleted. Edits preserve each file's
   encoding (BOMs, UTF-32 included; non-UTF-8 files are handled byte-preserving via Latin-1) and every untouched
   line's own line ending, never swallow a `#region`/`#if` directive whose counterpart survives,
   and never delete a file whole when it carries global usings, assembly attributes, or inactive
@@ -161,8 +168,9 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   registration by assembly scanning (`RegisterAssemblyTypes`,
   `Scan`, ...) anywhere in the solution; and a constructor deleted while its type stays in use
   (DI or reflection may construct through it). A solution in which no production entry points are
-  detected warns loudly — everything would count as already orphaned. On the console, `VERIFY` and
-  `STILL REFERENCED` warnings are always printed, even past the 100-warning cap.
+  detected warns loudly — everything would count as already orphaned. On the console, `VERIFY`,
+  `STILL REFERENCED` and "registration deleted although still in use" warnings are always printed,
+  even past the 100-warning cap.
 - Deleting an enum member that is not the last renumbers every later member without an explicit
   `= value`; a warning says so (persisted or serialized numeric values change).
 - Declarations in source-generated trees are never edited — the generated text regenerates from

@@ -68,7 +68,8 @@ public static class ReportWriter
             Section("Warnings", report.Warnings.Count);
             bool Critical(string w)
             {
-                return w.StartsWith("VERIFY", StringComparison.Ordinal) || w.StartsWith("STILL REFERENCED", StringComparison.Ordinal);
+                return w.StartsWith("VERIFY", StringComparison.Ordinal) || w.StartsWith("STILL REFERENCED", StringComparison.Ordinal)
+                    || w.StartsWith("registration deleted although still in use", StringComparison.Ordinal);
             }
             foreach (var w in report.Warnings.Take(limit)) { Console.WriteLine($"  {w}"); }
             // VERIFY and STILL REFERENCED lines are the ones that make a plan unsafe: they are

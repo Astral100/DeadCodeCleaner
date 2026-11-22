@@ -22,6 +22,11 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(file, out var encoding);
+            if (report.FileTextLengths.TryGetValue(file, out var expectedLen) && expectedLen != text.Length)
+            {
+                log($"  WARNING: {file} decodes to {text.Length} chars but the analysis saw {expectedLen} (changed since the analysis, or encoding mismatch) — skipped");
+                continue;
+            }
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
             if (FirstLine(text).Trim().StartsWith(Constants.Marker, StringComparison.Ordinal)) { continue; }
             WriteFileText(file, Constants.Marker + nl + text, encoding);
@@ -54,6 +59,11 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(file, out var encoding);
+            if (report.FileTextLengths.TryGetValue(file, out var expectedLen) && expectedLen != text.Length)
+            {
+                log($"  WARNING: {file} decodes to {text.Length} chars but the analysis saw {expectedLen} (changed since the analysis, or encoding mismatch) — skipped");
+                continue;
+            }
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
             var starts = LineStarts(text);
             var sb = new StringBuilder(text);
@@ -80,17 +90,17 @@ public static class Editor
         // csproj markers: references to remove, and fully deletable projects.
         foreach (var rr in report.PackageRefRemovals)
         {
-            var n = MarkXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference));
+            var n = MarkXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference), log);
             if (n > 0) { markers += n; files++; }
         }
         foreach (var rr in report.ProjectRefRemovals)
         {
-            var n = MarkXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"));
+            var n = MarkXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"), log);
             if (n > 0) { markers += n; files++; }
         }
         foreach (var rr in report.CompileEntryRemovals)
         {
-            var n = MarkXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference));
+            var n = MarkXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference), log);
             if (n > 0) { markers += n; files++; }
         }
         foreach (var pd in report.DeletableProjects)
@@ -118,7 +128,9 @@ public static class Editor
 
     // ---------------------------------------------------------------- delete
 
-    public static void Delete(DeletionReport report, Action<string> log)
+    /// <summary>Applies the plan. False when nothing was applied (a validation abort) or a failure
+    /// forced a rollback: the caller must exit non-zero so scripts never mistake it for success.</summary>
+    public static bool Delete(DeletionReport report, Action<string> log)
     {
         int deletedFiles = 0, regions = 0;
         var deletableFiles = new HashSet<string>(report.DeletableFiles, Constants.PathComparer);
@@ -151,19 +163,19 @@ public static class Editor
             if (!File.Exists(file))
             {
                 log($"error: {file} no longer exists on disk — the analysis is stale; NOTHING was deleted, re-run delete");
-                return;
+                return false;
             }
             var text = ReadFileText(file, out var encoding);
             if (report.FileTextLengths.TryGetValue(file, out var expected) && expected != text.Length)
             {
                 log($"error: {file} decodes to {text.Length} chars but the analysis saw {expected} (encoding mismatch, or the file changed since the analysis) — NOTHING was deleted");
-                return;
+                return false;
             }
             var ranges = perFile[file];
             if (ranges.Count > 0 && ranges.Max(r => r.End) > text.Length)
             {
                 log($"error: {file} is shorter than the computed spans (encoding mismatch?) — NOTHING was deleted");
-                return;
+                return false;
             }
             var starts = LineStarts(text);
             foreach (var line in markerLines[file]) { AddMarkerLineAbove(line, text, starts, ranges); }
@@ -171,18 +183,37 @@ public static class Editor
             if (n > 0) { pending.Add((file, newText, text, encoding, n)); }
         }
         // Whole files are validated too: a file that changed since the analysis may hold code the
-        // plan never accounted for.
+        // plan never accounted for. Their text is kept, so a failed deletion can restore them.
+        var wholeFiles = new List<(string File, string OldText, Encoding Encoding)>();
         foreach (var file in report.DeletableFiles)
         {
-            if (!File.Exists(file) || !report.FileTextLengths.TryGetValue(file, out var expected)) { continue; }
-            var text = ReadFileText(file, out _);
-            if (text.Length != expected)
+            if (!File.Exists(file)) { continue; }
+            var text = ReadFileText(file, out var wenc);
+            if (report.FileTextLengths.TryGetValue(file, out var expected) && text.Length != expected)
             {
                 log($"error: {file} decodes to {text.Length} chars but the analysis saw {expected} — it changed since the analysis; NOTHING was deleted");
-                return;
+                return false;
             }
+            wholeFiles.Add((file, text, wenc));
         }
         // Writes restore the already-written files on failure, so a half-applied plan never sticks.
+        int RestoreFiles(List<(string File, string OldText, Encoding Encoding)> files)
+        {
+            int restored = 0;
+            foreach (var (rf, old, enc) in files)
+            {
+                try
+                {
+                    WriteFileText(rf, old, enc);
+                    restored++;
+                }
+                catch (Exception re) when (re is IOException or UnauthorizedAccessException)
+                {
+                    log($"  WARNING: could not restore {rf}: {re.Message}");
+                }
+            }
+            return restored;
+        }
         var written = new List<(string File, string OldText, Encoding Encoding)>();
         for (int wi = 0; wi < pending.Count; wi++)
         {
@@ -193,53 +224,56 @@ public static class Editor
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                log($"error: could not write {file}: {e.Message} — restoring the {written.Count} file(s) already edited");
-                int restored = 0;
-                foreach (var (wf, old, enc) in written)
-                {
-                    try
-                    {
-                        WriteFileText(wf, old, enc);
-                        restored++;
-                    }
-                    catch (Exception re) when (re is IOException or UnauthorizedAccessException)
-                    {
-                        log($"  WARNING: could not restore {wf}: {re.Message}");
-                    }
-                }
-                log($"  restored {restored}/{written.Count}; nothing else was changed");
-                return;
+                // WriteAllText truncates before writing, so the failed file itself may be mangled:
+                // it is restored along with the files already edited.
+                var toRestore = new List<(string File, string OldText, Encoding Encoding)>(written) { (file, oldText, encoding) };
+                log($"error: could not write {file}: {e.Message} — restoring it and the {written.Count} file(s) already edited");
+                int restored = RestoreFiles(toRestore);
+                log($"  restored {restored}/{toRestore.Count}; nothing else was changed");
+                return false;
             }
             written.Add((file, oldText, encoding));
             regions += n;
         }
 
-        // Whole files go only after every edit is in place, so a failure above deletes nothing.
-        foreach (var file in report.DeletableFiles)
+        // Whole files go only after every edit is in place. A file that cannot be deleted (locked,
+        // or a read-only source-control checkout) rolls back EVERYTHING: the files already deleted
+        // and every span edit, so the plan is never left half-applied.
+        var deletedWhole = new List<(string File, string OldText, Encoding Encoding)>();
+        foreach (var (file, oldText, encoding) in wholeFiles)
         {
-            if (File.Exists(file))
+            try
             {
                 File.Delete(file);
-                deletedFiles++;
             }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                var toRestore = deletedWhole.Concat(written).ToList();
+                log($"error: could not delete {file}: {e.Message} — restoring the {deletedWhole.Count} file(s) already deleted and the {written.Count} edit(s)");
+                int restored = RestoreFiles(toRestore);
+                log($"  restored {restored}/{toRestore.Count}; the plan was rolled back");
+                return false;
+            }
+            deletedWhole.Add((file, oldText, encoding));
+            deletedFiles++;
         }
 
         // csproj cleanup: packages, project references, whole projects.
         foreach (var rr in report.PackageRefRemovals)
         {
-            var n = RemoveXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference));
+            var n = RemoveXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference), log);
             if (n > 0) { regions += n; log($"  removed PackageReference {rr.Reference} from {rr.Project}"); }
             else { log($"  WARNING: PackageReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually"); }
         }
         foreach (var rr in report.ProjectRefRemovals)
         {
-            var n = RemoveXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"));
+            var n = RemoveXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"), log);
             if (n > 0) { regions += n; log($"  removed ProjectReference {rr.Reference} from {rr.Project}"); }
             else { log($"  WARNING: ProjectReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually"); }
         }
         foreach (var rr in report.CompileEntryRemovals)
         {
-            var n = RemoveXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference));
+            var n = RemoveXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference), log);
             if (n > 0) { regions += n; log($"  removed Compile entry {rr.Reference} from {rr.Project}"); }
             else { log($"  WARNING: Compile entry {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually"); }
         }
@@ -253,14 +287,23 @@ public static class Editor
             }
             if (File.Exists(pd.CsprojPath))
             {
-                File.Delete(pd.CsprojPath);
-                deletedFiles++;
+                try
+                {
+                    File.Delete(pd.CsprojPath);
+                    deletedFiles++;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    log($"  WARNING: {pd.Project} was removed from the solution but {pd.CsprojPath} could not be deleted: {e.Message} — delete it manually");
+                    continue;
+                }
             }
             TryRemoveProjectDirectory(pd.CsprojPath, log);
         }
 
         log($"Deleted: {deletedFiles} file(s), {regions} code region(s)/reference(s), {report.DeletableProjects.Count} project(s).");
         log("Build the solution to verify. (Usings that would no longer compile were removed; merely-unused ones are left for IDE cleanup.)");
+        return true;
     }
 
     static bool RemoveProjectFromSolution(string solution, string csprojPath, string projectName, Action<string> log)
@@ -466,43 +509,59 @@ public static class Editor
         return InXmlComment(lineText, lineText.Length, startsInComment);
     }
 
-    static int MarkXmlElements(string file, string elementName, Func<string, bool> match)
+    static int MarkXmlElements(string file, string elementName, Func<string, bool> match, Action<string> log)
     {
         if (!File.Exists(file)) { return 0; }
-        var text = ReadFileText(file, out var encoding);
-        var nl = text.Contains("\r\n") ? "\r\n" : "\n";
-        var lines = SplitLinesKeepEnds(text);
-        var found = FindXmlElements(lines, elementName, match);
-        int inserted = 0;
-        for (int fi = found.Count - 1; fi >= 0; fi--)
+        try
         {
-            var (from, _) = found[fi];
-            if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) { continue; }
-            var terminator = LineTerminator(lines[from]);
-            if (terminator.Length == 0) { terminator = nl; }
-            lines.Insert(from, Indent(lines[from]) + Constants.XmlMarker + terminator);
-            inserted++;
+            var text = ReadFileText(file, out var encoding);
+            var nl = text.Contains("\r\n") ? "\r\n" : "\n";
+            var lines = SplitLinesKeepEnds(text);
+            var found = FindXmlElements(lines, elementName, match);
+            int inserted = 0;
+            for (int fi = found.Count - 1; fi >= 0; fi--)
+            {
+                var (from, _) = found[fi];
+                if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) { continue; }
+                var terminator = LineTerminator(lines[from]);
+                if (terminator.Length == 0) { terminator = nl; }
+                lines.Insert(from, Indent(lines[from]) + Constants.XmlMarker + terminator);
+                inserted++;
+            }
+            if (inserted > 0) { WriteFileText(file, string.Concat(lines), encoding); }
+            return inserted;
         }
-        if (inserted > 0) { WriteFileText(file, string.Concat(lines), encoding); }
-        return inserted;
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            log($"  WARNING: could not edit {file}: {e.Message}");
+            return 0;
+        }
     }
 
-    static int RemoveXmlElements(string file, string elementName, Func<string, bool> match)
+    static int RemoveXmlElements(string file, string elementName, Func<string, bool> match, Action<string> log)
     {
         if (!File.Exists(file)) { return 0; }
-        var text = ReadFileText(file, out var encoding);
-        var lines = SplitLinesKeepEnds(text);
-        var found = FindXmlElements(lines, elementName, match);
-        int removed = 0;
-        for (int fi = found.Count - 1; fi >= 0; fi--)
+        try
         {
-            var (from, to) = found[fi];
-            if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) { from--; }
-            lines.RemoveRange(from, to - from + 1);
-            removed++;
+            var text = ReadFileText(file, out var encoding);
+            var lines = SplitLinesKeepEnds(text);
+            var found = FindXmlElements(lines, elementName, match);
+            int removed = 0;
+            for (int fi = found.Count - 1; fi >= 0; fi--)
+            {
+                var (from, to) = found[fi];
+                if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) { from--; }
+                lines.RemoveRange(from, to - from + 1);
+                removed++;
+            }
+            if (removed > 0) { WriteFileText(file, string.Concat(lines), encoding); }
+            return removed;
         }
-        if (removed > 0) { WriteFileText(file, string.Concat(lines), encoding); }
-        return removed;
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            log($"  WARNING: could not edit {file}: {e.Message}");
+            return 0;
+        }
     }
 
     // ---------------------------------------------------------- text helpers

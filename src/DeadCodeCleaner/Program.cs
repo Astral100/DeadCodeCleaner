@@ -99,7 +99,7 @@ public static class Program
                         Console.Error.WriteLine($"error: verification found {report.VerificationErrors} new compile error(s) in the deletion plan — nothing was deleted (see the VERIFY warnings; --no-verify overrides)");
                         return 1;
                     }
-                    Editor.Delete(report, log);
+                    if (!Editor.Delete(report, log)) { return 1; }
                     break;
             }
             return 0;

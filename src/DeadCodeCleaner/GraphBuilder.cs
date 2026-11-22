@@ -1040,7 +1040,11 @@ public sealed class GraphBuilder
         {
             case IInvocationOperation iv:
                 Emit(iv.TargetMethod);
-                if (!suppressed) { RecordExternalCall(sourceId, iv.TargetMethod); }
+                // An invocation of a CONSTRUCTOR is a ": base(...)"/": this(...)" initializer —
+                // explicit, or the implicit base call Roslyn synthesizes for every constructor
+                // body. That is construction of the object itself, not a droppable side effect,
+                // and it must not block the empty-container pass.
+                if (!suppressed && iv.TargetMethod?.MethodKind != MethodKind.Constructor) { RecordExternalCall(sourceId, iv.TargetMethod); }
                 break;
             case IObjectCreationOperation oc:
                 Emit(oc.Constructor);
@@ -1513,7 +1517,14 @@ public sealed class GraphBuilder
             cur = pInv;
         }
 
-        if (impl == null && services.Count == 0) { return; }
+        if (impl == null && services.Count == 0)
+        {
+            // Unresolvable registration (RegisterType(variable), external-only services): the chain
+            // is already claimed and suppressed, so no edge and no statement will track it. Record
+            // the CALL, or the empty-container pass could delete the container around it.
+            RecordExternalCall(sourceId, model.GetSymbolInfo(inv).Symbol);
+            return;
+        }
 
         // No segment: a chain segment of the outermost call would delete only the lifetime call,
         // not the registration, so a partially surviving anchor falls back to a manual warning.
