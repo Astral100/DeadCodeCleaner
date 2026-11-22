@@ -15,8 +15,7 @@ public class WidgetsController
 
     public object GetWidget()
     {
-        SharedService.WidgetCounter++;
-        SharedService.WidgetOnlyA += SharedService.WidgetOnlyB;
+        SharedService.WidgetPublicTally++;
         var description = _svc.Describe();
         _ = description;
         return _mediator.Send(new GetWidgetQuery());
@@ -72,7 +71,7 @@ public class GadgetsController
     [Audit("gadget")]
     public string GetGadget()
     {
-        return SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter
+        return SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label
             + new Circle().Render() + new WidgetFormatter().Plain() + WidgetKind.Basic + new NamedTagHolder("n").Name();
     }
 

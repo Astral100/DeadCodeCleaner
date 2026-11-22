@@ -21,8 +21,12 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
    whatever their accessibility. A primary constructor is never tracked as a deletable symbol of
    its own — its declaring syntax IS the type declaration, so uses of it count as uses of the type.
 2. Entry points ("roots") are detected: `Main`, controllers (name or base class), hosted services,
-   `Startup`/`Program`, AutoMapper profiles, Autofac modules, plus anything matched by the config's
-   `keep` patterns.
+   `Startup`/`Program`, AutoMapper profiles, Autofac modules, and framework-discovered code that has
+   no static references by design — EF migrations and `IEntityTypeConfiguration<>` classes,
+   ViewComponents, TagHelpers, Razor PageModels, Blazor components, SignalR hubs, middleware
+   (`IMiddleware` or a `RequestDelegate` constructor), Quartz jobs, and the WebForms/legacy surface
+   (`Page`/`UserControl`/`MasterPage` code-behind, `HttpApplication`, `IHttpModule`, `IHttpHandler`)
+   — plus anything matched by the config's `keep` patterns.
 3. Reachability ("in use") is computed twice: from all roots, and from all roots with the removal
    targets treated as deleted. The difference is the complete cascade. Code unreachable in the
    baseline is pre-existing dead code and is never reported.
@@ -41,8 +45,9 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   etc.). While a handler exists, the binder interface's members (`Handle`) count as used.
 - **AutoMapper `CreateMap<A,B>()`** and **DI registrations** (`AddScoped/AddTransient/AddSingleton`,
   Autofac `RegisterType<T>().As<I>()` chains, `typeof` overloads) are *co-dependent statements*:
-  they do not keep their types in use, but die when their types die — and are then reported as
-  individual statements to remove. The whole statement is deleted only when it is a plain expression
+  a registration lives only while its SERVICE type is in use (it cannot revive the service), and
+  while it lives it keeps its implementation constructible; when the service dies, the statement
+  dies with it and is reported as an individual statement to remove. The whole statement is deleted only when it is a plain expression
   statement whose entire call chain belongs to dead registrations (AutoMapper's `ForMember`/
   `ReverseMap` and Autofac's lifetime calls count as part of theirs); otherwise only the dead call's
   chain segment is removed (`services.AddScoped<IA,A>().AddLogging()` keeps `AddLogging`, and
@@ -51,15 +56,25 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   header has side effects (a call, assignment, or increment), which, like an if/else branch or a
   lambda, is reported as a warning for manual removal instead. References inside a map's `ForMember` lambdas
   belong to the statement, not the profile, so they cannot keep the mapped types alive forever. A
-  statement whose text references deleted code dies with it in every case: removing an
+  statement whose text references deleted code dies with it: removing an
   implementation type takes its registration along even while the service interface stays in use
-  (with a warning, since behavior changes).
+  (with a warning, since behavior changes). One refinement: member-level map configuration
+  (`ForMember`/`ForPath`/`ForSourceMember`) dies ALONE — removing a mapped member removes just that
+  `.ForMember(...)` segment and the rest of the mapping stands; structural calls (`ConvertUsing`,
+  `Include`) still take the whole mapping. A registration whose SERVICE type lives outside the
+  solution (`AddSingleton<IAuthorizationHandler, MinAgeHandler>()`, Autofac `As<IExternal>()`,
+  `Keyed<T>`/`Named<T>`, or `AsImplementedInterfaces()` over external interfaces) is resolved by
+  the framework at runtime, so no in-solution reference to it can exist: it stays alive (and keeps
+  its implementation alive) while its registering member does.
 - **Empty containers**: an AutoMapper profile or Autofac module whose every mapping/registration
   died (and that nothing surviving references) is deleted whole — unless a config `keep` pattern
   matches it, or any of its members still calls into an external assembly beyond a small benign
   list: an untracked registration (`RegisterInstance`, `Register(c => ...)`, an unresolvable
   `RegisterType(variable)`, assembly scanning) leaves no graph edge, and deleting the container
-  would silently drop it. Constructor initializers (`: base("name")`, explicit or the implicit base
+  would silently drop it. The benign list is type-aware, not assembly-wide: `mscorlib` and
+  `System.Runtime` also hold `File`, `Environment` and `Process`, so only calls to a pure surface
+  (LINQ, collections, text, and specific `System` types) pass — `File.WriteAllText` in a module's
+  `Load` blocks the deletion even on .NET Framework, where everything lives in `mscorlib`. Constructor initializers (`: base("name")`, explicit or the implicit base
   call) do NOT count as such calls — they die with the type. Chained generic type
   arguments (`ConvertUsing<TConverter>()`, `Include<TDerived, TOther>()`) are statement references
   too: they stay alive while the map lives and die with it.
@@ -126,31 +141,42 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   is idempotent, and `delete` removes marker comments along with the code. Whole-file deletions get
   one marker at the top of the file (or the file itself is deleted). `delete` reads and validates
   every file BEFORE touching the disk — whole-file deletions included — and any file that is
-  missing or whose decoded text length no longer matches what the analysis saw (encoding mismatch,
-  concurrent edit) aborts the WHOLE delete with nothing changed: the verified plan applies in full
-  or not at all. A write that fails midway restores the files already edited (the failed file
-  included — a truncating write must not mangle it), and a whole file that cannot be deleted
-  (locked, read-only checkout) rolls the entire plan back: the files already deleted and every
-  span edit are restored. Every abort or rollback exits non-zero, so scripts never mistake it for
-  success; a csproj that cannot be written degrades to a warning asking for a manual edit. `mark`
-  skips (with a warning) any file whose decoded length no longer matches the analysis. Span edits
+  missing or whose decoded text no longer matches what the analysis saw (length AND content hash,
+  so a same-length concurrent edit is caught too) aborts the WHOLE delete with nothing changed: the
+  verified plan applies in full or not at all. Every write is atomic (temp file in the same
+  directory, then a replacing move), so a crash mid-write can never leave a truncated source file.
+  A write that fails midway restores the files already edited, and a whole file that cannot be
+  deleted (locked, read-only checkout) rolls the entire plan back: the files already deleted and
+  every span edit are restored. Exit codes: 0 full success; 1 for every refusal, abort or rollback
+  (nothing half-applied); 3 when the source edits applied but a csproj/sln step degraded to a
+  "finish manually" warning — scripts never mistake either for success. Case-variant spellings of
+  one file (linked files on a case-insensitive filesystem under case-sensitive path rules, e.g.
+  WSL `/mnt`) are collapsed to the on-disk spelling, so one file is never edited as two. `mark`
+  skips (with a warning) any file whose decoded text no longer matches the analysis. Span edits
   are applied before any whole file is deleted. Edits preserve each file's
   encoding (BOMs, UTF-32 included; non-UTF-8 files are handled byte-preserving via Latin-1) and every untouched
   line's own line ending, never swallow a `#region`/`#if` directive whose counterpart survives,
   and never delete a file whole when it carries global usings, assembly attributes, or inactive
   `#if` regions (code the compiler cannot see). Deleting an enum member takes its separator comma;
   deleting a partial method/property deletes BOTH parts; old-style csproj `<Compile>` entries of
-  deleted files are removed too. `delete` refuses to run while verification reports new compile
-  errors, while review-flagged tests exist (`--delete-review-tests` overrides the latter), while
-  any analyzed project itself has compile errors — references in it are invisible, so the cascade
-  may over-delete (`--allow-compile-errors` overrides) — and while any removal target is still
+  deleted files are removed too (a deletable file in an explicit-listing project whose entry
+  cannot be matched textually gets a loud CS2001 warning instead of a silent broken build).
+  `delete` refuses to run while verification reports new compile
+  errors or was incomplete (a project that could not be rebuilt in memory counts as failed, not as
+  clean), while review-flagged tests exist (`--delete-review-tests` overrides the latter), while
+  any analyzed project itself has compile errors or any solution project failed to LOAD at all —
+  references in them are invisible, so the cascade may over-delete (`--allow-compile-errors`
+  overrides both) — and while any removal target is still
   referenced by surviving code, which would break the callers or silently rebind them to another
   overload (`--no-verify` overrides).
 - `--config cfg.json` supports `{ "keep": ["Ns.Something*", ...], "strictMembers": false }` —
   `keep` patterns are extra entry points that are never orphaned, by any pass (use for
   reflection-only code).
-- By default, public properties and enum members of in-use types are kept (serializers and model
-  binding reach them via reflection); `--strict-members` disables that.
+- By default, public properties, public FIELDS and enum members of in-use types are kept
+  (serializers, marshalling and model binding reach them via reflection); `--strict-members`
+  disables that. Fields of `[StructLayout]`/`[DataContract]`/`[Serializable]` types are kept in
+  EVERY mode, whatever their accessibility — their order and presence IS the marshalled or
+  serialized shape.
 
 ## Known limitations
 
@@ -178,6 +204,13 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   builds that escalate CS1574 to an error may need a doc-comment pass afterwards.
 - A factory lambda inside a DI registration (`AddScoped<IFoo>(sp => new Foo())`) keeps `Foo` in use
   even when the registration dies.
+- **The solution is the whole world**: consumers outside it — a NuGet package published from one of
+  the projects, another repository referencing the DLLs — are invisible by design. When deleted
+  orphans include public API, one aggregate warning says so; add `keep` patterns for any published
+  surface before trusting the report.
+- Packages declared centrally (`Directory.Packages.props`, `Directory.Build.props`) are not listed
+  in the csprojs the tool edits, so they are never removed automatically (over-keep, never
+  over-delete).
 - A field in a multi-variable declaration (`int a, b;`): when every sibling is orphaned too the
   whole line is deleted; when a sibling is still in use the orphaned field is KEPT in place and a
   "kept in place" warning is emitted (it becomes a pre-existing orphan for future runs). An

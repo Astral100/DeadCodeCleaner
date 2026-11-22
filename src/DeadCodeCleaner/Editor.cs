@@ -12,9 +12,11 @@ public static class Editor
     public static void Mark(DeletionReport report, Action<string> log)
     {
         int files = 0, markers = 0;
-        var deletableFiles = new HashSet<string>(report.DeletableFiles, Constants.PathComparer);
+        var lengths = CanonicalKeys(report.FileTextLengths);
+        var hashes = CanonicalKeys(report.FileTextHashes);
+        var deletableFiles = new HashSet<string>(report.DeletableFiles.Select(CanonicalPath), Constants.PathComparer);
 
-        foreach (var file in report.DeletableFiles)
+        foreach (var file in deletableFiles.OrderBy(x => x, Constants.PathComparer))
         {
             if (!File.Exists(file))
             {
@@ -22,9 +24,9 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(file, out var encoding);
-            if (report.FileTextLengths.TryGetValue(file, out var expectedLen) && expectedLen != text.Length)
+            if (Stale(lengths, hashes, file, text, out var why))
             {
-                log($"  WARNING: {file} decodes to {text.Length} chars but the analysis saw {expectedLen} (changed since the analysis, or encoding mismatch) — skipped");
+                log($"  WARNING: {file} {why} — skipped");
                 continue;
             }
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
@@ -36,8 +38,9 @@ public static class Editor
 
         // line -> marker suffix ("" for plain; review notes carry the reason)
         var perFile = new Dictionary<string, SortedDictionary<int, string>>(Constants.PathComparer);
-        void Plan(string file, int line, string suffix)
+        void Plan(string fileRaw, int line, string suffix)
         {
+            var file = CanonicalPath(fileRaw);
             if (deletableFiles.Contains(file)) { return; }
             if (!perFile.TryGetValue(file, out var set)) { perFile[file] = set = new SortedDictionary<int, string>(); }
             if (!set.TryGetValue(line, out var existing) || existing.Length < suffix.Length) { set[line] = suffix; }
@@ -59,9 +62,9 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(file, out var encoding);
-            if (report.FileTextLengths.TryGetValue(file, out var expectedLen) && expectedLen != text.Length)
+            if (Stale(lengths, hashes, file, text, out var why))
             {
-                log($"  WARNING: {file} decodes to {text.Length} chars but the analysis saw {expectedLen} (changed since the analysis, or encoding mismatch) — skipped");
+                log($"  WARNING: {file} {why} — skipped");
                 continue;
             }
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
@@ -128,19 +131,24 @@ public static class Editor
 
     // ---------------------------------------------------------------- delete
 
-    /// <summary>Applies the plan. False when nothing was applied (a validation abort) or a failure
-    /// forced a rollback: the caller must exit non-zero so scripts never mistake it for success.</summary>
-    public static bool Delete(DeletionReport report, Action<string> log)
+    /// <summary>Applies the plan. Returns 0 on full success, 1 when nothing was applied (a
+    /// validation abort) or a failure forced a rollback, and 3 when the source edits applied but a
+    /// csproj/sln step was left for manual action — so scripts never mistake either for success.</summary>
+    public static int Delete(DeletionReport report, Action<string> log)
     {
         int deletedFiles = 0, regions = 0;
-        var deletableFiles = new HashSet<string>(report.DeletableFiles, Constants.PathComparer);
+        bool manualSteps = false;
+        var lengths = CanonicalKeys(report.FileTextLengths);
+        var hashes = CanonicalKeys(report.FileTextHashes);
+        var deletableFiles = new HashSet<string>(report.DeletableFiles.Select(CanonicalPath), Constants.PathComparer);
 
         // Char-span deletions per file, plus the lines whose marker (inserted by a previous mark
         // run) sits above a span and may fall outside it (mid-line anchors, chain segments).
         var perFile = new Dictionary<string, List<(int Start, int End)>>(Constants.PathComparer);
         var markerLines = new Dictionary<string, List<int>>(Constants.PathComparer);
-        void Range(string file, int start, int end, int markerLine)
+        void Range(string fileRaw, int start, int end, int markerLine)
         {
+            var file = CanonicalPath(fileRaw);
             if (deletableFiles.Contains(file)) { return; }
             if (!perFile.TryGetValue(file, out var list)) { perFile[file] = list = new List<(int, int)>(); }
             if (end > start) { list.Add((start, end)); }
@@ -163,19 +171,19 @@ public static class Editor
             if (!File.Exists(file))
             {
                 log($"error: {file} no longer exists on disk — the analysis is stale; NOTHING was deleted, re-run delete");
-                return false;
+                return 1;
             }
             var text = ReadFileText(file, out var encoding);
-            if (report.FileTextLengths.TryGetValue(file, out var expected) && expected != text.Length)
+            if (Stale(lengths, hashes, file, text, out var why))
             {
-                log($"error: {file} decodes to {text.Length} chars but the analysis saw {expected} (encoding mismatch, or the file changed since the analysis) — NOTHING was deleted");
-                return false;
+                log($"error: {file} {why} — NOTHING was deleted");
+                return 1;
             }
             var ranges = perFile[file];
             if (ranges.Count > 0 && ranges.Max(r => r.End) > text.Length)
             {
                 log($"error: {file} is shorter than the computed spans (encoding mismatch?) — NOTHING was deleted");
-                return false;
+                return 1;
             }
             var starts = LineStarts(text);
             foreach (var line in markerLines[file]) { AddMarkerLineAbove(line, text, starts, ranges); }
@@ -185,14 +193,20 @@ public static class Editor
         // Whole files are validated too: a file that changed since the analysis may hold code the
         // plan never accounted for. Their text is kept, so a failed deletion can restore them.
         var wholeFiles = new List<(string File, string OldText, Encoding Encoding)>();
-        foreach (var file in report.DeletableFiles)
+        foreach (var file in deletableFiles.OrderBy(x => x, Constants.PathComparer))
         {
-            if (!File.Exists(file)) { continue; }
-            var text = ReadFileText(file, out var wenc);
-            if (report.FileTextLengths.TryGetValue(file, out var expected) && text.Length != expected)
+            if (!File.Exists(file))
             {
-                log($"error: {file} decodes to {text.Length} chars but the analysis saw {expected} — it changed since the analysis; NOTHING was deleted");
-                return false;
+                // The verifier approved the plan as a whole: a vanished file means the world moved
+                // under the analysis, and the remaining edits may no longer be safe together.
+                log($"error: {file} no longer exists on disk — the analysis is stale; NOTHING was deleted, re-run delete");
+                return 1;
+            }
+            var text = ReadFileText(file, out var wenc);
+            if (Stale(lengths, hashes, file, text, out var why))
+            {
+                log($"error: {file} {why} — NOTHING was deleted");
+                return 1;
             }
             wholeFiles.Add((file, text, wenc));
         }
@@ -230,7 +244,7 @@ public static class Editor
                 log($"error: could not write {file}: {e.Message} — restoring it and the {written.Count} file(s) already edited");
                 int restored = RestoreFiles(toRestore);
                 log($"  restored {restored}/{toRestore.Count}; nothing else was changed");
-                return false;
+                return 1;
             }
             written.Add((file, oldText, encoding));
             regions += n;
@@ -252,7 +266,7 @@ public static class Editor
                 log($"error: could not delete {file}: {e.Message} — restoring the {deletedWhole.Count} file(s) already deleted and the {written.Count} edit(s)");
                 int restored = RestoreFiles(toRestore);
                 log($"  restored {restored}/{toRestore.Count}; the plan was rolled back");
-                return false;
+                return 1;
             }
             deletedWhole.Add((file, oldText, encoding));
             deletedFiles++;
@@ -263,26 +277,40 @@ public static class Editor
         {
             var n = RemoveXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference), log);
             if (n > 0) { regions += n; log($"  removed PackageReference {rr.Reference} from {rr.Project}"); }
-            else { log($"  WARNING: PackageReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually"); }
+            else
+            {
+                log($"  WARNING: PackageReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually");
+                manualSteps = true;
+            }
         }
         foreach (var rr in report.ProjectRefRemovals)
         {
             var n = RemoveXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"), log);
             if (n > 0) { regions += n; log($"  removed ProjectReference {rr.Reference} from {rr.Project}"); }
-            else { log($"  WARNING: ProjectReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually"); }
+            else
+            {
+                log($"  WARNING: ProjectReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually");
+                manualSteps = true;
+            }
         }
         foreach (var rr in report.CompileEntryRemovals)
         {
             var n = RemoveXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference), log);
             if (n > 0) { regions += n; log($"  removed Compile entry {rr.Reference} from {rr.Project}"); }
-            else { log($"  WARNING: Compile entry {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually"); }
+            else
+            {
+                log($"  WARNING: Compile entry {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually");
+                manualSteps = true;
+            }
         }
 
+        int deletedProjects = 0;
         foreach (var pd in report.DeletableProjects)
         {
             if (!RemoveProjectFromSolution(report.Solution, pd.CsprojPath, pd.Project, log))
             {
                 log($"  WARNING: {pd.Project} left on disk — remove it from the solution manually, then delete {pd.CsprojPath}");
+                manualSteps = true;
                 continue;
             }
             if (File.Exists(pd.CsprojPath))
@@ -295,15 +323,22 @@ public static class Editor
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
                     log($"  WARNING: {pd.Project} was removed from the solution but {pd.CsprojPath} could not be deleted: {e.Message} — delete it manually");
+                    manualSteps = true;
                     continue;
                 }
             }
-            TryRemoveProjectDirectory(pd.CsprojPath, log);
+            deletedProjects++;
+            if (!TryRemoveProjectDirectory(pd.CsprojPath, log)) { manualSteps = true; }
         }
 
-        log($"Deleted: {deletedFiles} file(s), {regions} code region(s)/reference(s), {report.DeletableProjects.Count} project(s).");
+        log($"Deleted: {deletedFiles} file(s), {regions} code region(s)/reference(s), {deletedProjects}/{report.DeletableProjects.Count} project(s).");
         log("Build the solution to verify. (Usings that would no longer compile were removed; merely-unused ones are left for IDE cleanup.)");
-        return true;
+        if (manualSteps)
+        {
+            log("Some csproj/sln steps could not be completed (see the WARNINGs above) — finish them manually; exit code 3.");
+            return 3;
+        }
+        return 0;
     }
 
     static bool RemoveProjectFromSolution(string solution, string csprojPath, string projectName, Action<string> log)
@@ -340,32 +375,39 @@ public static class Editor
         }
     }
 
-    static void TryRemoveProjectDirectory(string csprojPath, Action<string> log)
+    static bool TryRemoveProjectDirectory(string csprojPath, Action<string> log)
     {
         var dir = Path.GetDirectoryName(csprojPath);
-        if (dir == null || !Directory.Exists(dir)) { return; }
+        if (dir == null || !Directory.Exists(dir)) { return true; }
         try
         {
             // Check exclusivity BEFORE deleting anything: a directory shared with another project
-            // (or holding non-code files) is left alone, build output included.
+            // (or holding non-code files) is left alone, build output included. Directories that
+            // hold no files at all (folders emptied by the whole-file deletions) do not count.
             var leftovers = Directory.EnumerateFileSystemEntries(dir)
-                .Where(e => !(Directory.Exists(e) && Path.GetFileName(e) is "bin" or "obj")).ToList();
+                .Where(e => !(Directory.Exists(e) && (Path.GetFileName(e) is "bin" or "obj" || IsRecursivelyEmpty(e)))).ToList();
             if (leftovers.Count > 0)
             {
                 log($"  NOTE: {dir} kept — it still contains non-code files");
-                return;
+                return true;
             }
-            foreach (var junk in new[] { "bin", "obj" })
+            foreach (var e in Directory.EnumerateFileSystemEntries(dir).ToList())
             {
-                var p = Path.Combine(dir, junk);
-                if (Directory.Exists(p)) { Directory.Delete(p, recursive: true); }
+                if (Directory.Exists(e)) { Directory.Delete(e, recursive: true); }
             }
             Directory.Delete(dir);
+            return true;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             log($"  WARNING: could not remove {dir}: {e.Message}");
+            return false;
         }
+    }
+
+    static bool IsRecursivelyEmpty(string dir)
+    {
+        return !Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories).Any();
     }
 
     // ----------------------------------------------------------- xml helpers
@@ -671,9 +713,99 @@ public static class Editor
         }
     }
 
+    /// <summary>Writes atomically: the text goes to a temp file in the same directory first, then
+    /// replaces the target in one move — a crash mid-write can never leave a truncated source file.</summary>
     static void WriteFileText(string path, string text, Encoding encoding)
     {
-        File.WriteAllText(path, text, encoding);
+        var tmp = path + ".dcc-" + Environment.ProcessId + ".tmp";
+        try
+        {
+            File.WriteAllText(tmp, text, encoding);
+            File.Move(tmp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tmp))
+            {
+                try { File.Delete(tmp); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* leftover temp file only */ }
+            }
+        }
+    }
+
+    /// <summary>SHA-256 (hex) of a text, computed identically from the analyzed tree and from the
+    /// decoded on-disk file, so same-length concurrent edits are caught before any write.</summary>
+    internal static string TextHash(string text)
+    {
+        var bytes = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(text));
+        return Convert.ToHexString(bytes);
+    }
+
+    /// <summary>True when the on-disk text no longer matches what the analysis saw.</summary>
+    static bool Stale(Dictionary<string, int> lengths, Dictionary<string, string> hashes, string file, string text, out string why)
+    {
+        if (lengths.TryGetValue(file, out var expected) && expected != text.Length)
+        {
+            why = $"decodes to {text.Length} chars but the analysis saw {expected} (changed since the analysis, or encoding mismatch)";
+            return true;
+        }
+        if (hashes.TryGetValue(file, out var h) && h != TextHash(text))
+        {
+            why = "its content changed since the analysis (same length, different text)";
+            return true;
+        }
+        why = null;
+        return false;
+    }
+
+    static readonly Dictionary<string, string> _canonicalCache = new(StringComparer.Ordinal);
+
+    /// <summary>Collapses case-variant spellings of one path to the single on-disk spelling. On a
+    /// case-insensitive filesystem mounted under case-sensitive path rules (WSL /mnt), linked files
+    /// can appear under two casings: editing them as two files makes the second write clobber the
+    /// first. Two genuinely distinct entries (a truly case-sensitive filesystem) stay distinct.</summary>
+    static string CanonicalPath(string path)
+    {
+        if (OperatingSystem.IsWindows()) { return path; } // PathComparer is already case-insensitive
+        if (_canonicalCache.TryGetValue(path, out var cached)) { return cached; }
+        var result = path;
+        var dir = Path.GetDirectoryName(path);
+        var name = Path.GetFileName(path);
+        if (!string.IsNullOrEmpty(dir) && name.Length > 0)
+        {
+            var cdir = CanonicalPath(dir);
+            result = Path.Combine(cdir, name);
+            try
+            {
+                if (Directory.Exists(cdir))
+                {
+                    string exact = null, insensitive = null;
+                    int insensitiveCount = 0;
+                    foreach (var entry in Directory.EnumerateFileSystemEntries(cdir))
+                    {
+                        var en = Path.GetFileName(entry);
+                        if (en == name) { exact = entry; }
+                        if (StringComparer.OrdinalIgnoreCase.Equals(en, name))
+                        {
+                            insensitive = entry;
+                            insensitiveCount++;
+                        }
+                    }
+                    if (exact != null) { result = exact; }
+                    else if (insensitiveCount == 1) { result = insensitive; }
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* unreadable directory: keep the given spelling */ }
+        }
+        _canonicalCache[path] = result;
+        return result;
+    }
+
+    static Dictionary<string, T> CanonicalKeys<T>(Dictionary<string, T> source)
+    {
+        var result = new Dictionary<string, T>(Constants.PathComparer);
+        foreach (var (k, v) in source) { result[CanonicalPath(k)] = v; }
+        return result;
     }
 
     static string Truncate(string s, int max)

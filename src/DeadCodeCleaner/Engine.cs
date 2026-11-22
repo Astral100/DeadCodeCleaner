@@ -10,6 +10,7 @@ public sealed class Engine
     readonly CliOptions _opts;
     readonly AnalyzerConfig _config;
     readonly Action<string> _log;
+    readonly Dictionary<SyntaxTree, string> _treeHashes = new();
 
     public Engine(CliOptions opts, AnalyzerConfig config, Action<string> log)
     {
@@ -39,7 +40,30 @@ public sealed class Engine
             graph.Warnings.Add($"workspace: ... and {loadWarnings.Count - Constants.WorkspaceWarningLimit} more load diagnostics");
         }
 
+        // A workspace diagnostic alone does not mean a project is missing (analyzer-version
+        // complaints fire for projects that load fine). What gates delete is a project that is IN
+        // the solution file but absent from the loaded set: everything it references is invisible.
+        int dropped = 0;
+        var loadedPaths = new HashSet<string>(
+            solution.Projects.Where(p => p.FilePath != null).Select(p => Path.GetFullPath(p.FilePath)),
+            Constants.PathComparer);
+        try
+        {
+            var slnDir = Path.GetDirectoryName(_opts.SolutionPath) ?? "";
+            foreach (Match m in Regex.Matches(File.ReadAllText(_opts.SolutionPath), "\"([^\"]+\\.(?:cs|vb|fs)proj)\""))
+            {
+                var p = Path.GetFullPath(Path.Combine(slnDir, m.Groups[1].Value.Replace('\\', Path.DirectorySeparatorChar)));
+                if (!loadedPaths.Contains(p))
+                {
+                    graph.Warnings.Add($"{Path.GetFileNameWithoutExtension(p)}: in the solution but NOT loaded — the project and every reference from it are INVISIBLE to the analysis");
+                    dropped++;
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* unreadable sln: the load itself would have failed */ }
+
         var (report, lostAssemblies) = ComputeReport(graph, solution);
+        report.ProjectsFailedToLoad = dropped + graph.ProjectsNotAnalyzed.Count;
         if (_opts.Mode != "find" && !_opts.NoVerify && _opts.RemoveTargets.Count > 0)
         {
             await Verify(solution, graph, report, lostAssemblies);
@@ -53,6 +77,7 @@ public sealed class Engine
     async Task Verify(Solution solution, Graph graph, DeletionReport report, Dictionary<string, HashSet<string>> lostAssemblies)
     {
         _log("Verifying the deletion plan (in-memory rebuild) ...");
+        int incomplete = 0;
         var spansByFile = new Dictionary<string, List<(int Start, int End)>>(Constants.PathComparer);
         void AddSpan(string file, int start, int length)
         {
@@ -91,6 +116,7 @@ public sealed class Engine
                 if (inRange.Count < merged.Count)
                 {
                     report.Warnings.Add($"VERIFY: {doc.FilePath}: {merged.Count - inRange.Count} deletion span(s) lie beyond the end of the file — verification is incomplete for it");
+                    incomplete++;
                 }
                 if (inRange.Count == 0) { continue; }
                 var edits = inRange.Select(r => new Microsoft.CodeAnalysis.Text.TextChange(new Microsoft.CodeAnalysis.Text.TextSpan(r.Start, r.End - r.Start), "")).ToList();
@@ -156,7 +182,12 @@ public sealed class Engine
             if (newProj == null || oldProj == null) { continue; }
             var oldComp = await oldProj.GetCompilationAsync();
             var newComp = await newProj.GetCompilationAsync();
-            if (oldComp == null || newComp == null) { continue; }
+            if (oldComp == null || newComp == null)
+            {
+                report.Warnings.Add($"VERIFY: {newProj.Name}: the project could not be rebuilt in memory — verification is incomplete for it");
+                incomplete++;
+                continue;
+            }
             string Key(Diagnostic d)
             {
                 return d.Id + "|" + (d.Location.SourceTree?.FilePath ?? "") + "|" + d.GetMessage();
@@ -193,11 +224,17 @@ public sealed class Engine
         {
             report.Warnings.Add($"VERIFY: the plan introduces {newErrors} new compile error(s) — the deletion is UNSAFE as planned; fix manually (or --no-verify to override in delete mode)");
         }
-        else
+        if (incomplete > 0)
+        {
+            // Incomplete verification must not read as "clean": whatever could not be rebuilt or
+            // applied counts against the plan exactly like a found error.
+            report.Warnings.Add($"VERIFY: verification was incomplete in {incomplete} place(s) — treated as failed; delete refuses (--no-verify overrides)");
+        }
+        if (newErrors == 0 && incomplete == 0)
         {
             _log("  verification clean: the plan introduces no new compile errors");
         }
-        report.VerificationErrors = newErrors;
+        report.VerificationErrors = newErrors + incomplete;
     }
 
     (DeletionReport Report, Dictionary<string, HashSet<string>> LostAssemblies) ComputeReport(Graph graph, Solution solution)
@@ -414,6 +451,7 @@ public sealed class Engine
 
         // Symbol entries. Skip members whose containing type is itself deleted (the type entry covers them).
         // The id tie-break keeps same-FQN overloads in a deterministic report order.
+        int publicApiDeleted = 0;
         foreach (var id in allDead.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal).ThenBy(x => x, StringComparer.Ordinal))
         {
             if (HasDeadContainer(graph, id, allDead)) { continue; }
@@ -439,13 +477,17 @@ public sealed class Engine
                     note = "also references surviving code: " + string.Join(", ", surviving);
                 }
             }
-            var parts = DeclarationParts(graph, symbol, id, allDead, keptInPlace, report.Warnings, report.FileTextLengths);
+            var parts = DeclarationParts(graph, symbol, id, allDead, keptInPlace, report.Warnings, report.FileTextLengths, report.FileTextHashes);
             if (parts.Count == 0) { continue; }
             // The containing type survives here (dead containers were skipped above): a constructor
             // deleted while its type stays in use may still be called by DI or reflection.
             if (symbol is IMethodSymbol { MethodKind: MethodKind.Constructor, IsStatic: false })
             {
                 report.Warnings.Add($"constructor deleted while its type stays in use: {SymbolNames.Fqn(symbol)} — DI or reflection may still construct the type through it at runtime; check before deleting");
+            }
+            if (symbol.DeclaredAccessibility == Accessibility.Public && category is Constants.CategoryOrphaned or Constants.CategoryBrokenOrphan)
+            {
+                publicApiDeleted++;
             }
             report.Symbols.Add(new SymbolDeletion
             {
@@ -456,6 +498,12 @@ public sealed class Engine
                 Review = review,
                 ReviewNote = note,
             });
+        }
+        if (publicApiDeleted > 0)
+        {
+            // The analysis treats the solution as the whole world: consumers outside it (NuGet
+            // packages, other repositories) are invisible by design and deserve one loud caveat.
+            report.Warnings.Add($"{publicApiDeleted} deleted symbol(s) are public API — if any project in this solution is consumed OUTSIDE it (published package, another repo), those consumers are invisible here; add keep patterns for the published surface");
         }
 
         // Deleted symbols whose names still appear inside inactive #if regions: the compiler (and
@@ -523,11 +571,13 @@ public sealed class Engine
             }
             foreach (var id in allDead.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
             {
-                if (!graph.Decl.TryGetValue(id, out var tsym) || tsym is not INamedTypeSymbol) { continue; }
+                if (!graph.Decl.TryGetValue(id, out var tsym) || tsym is not INamedTypeSymbol tnts) { continue; }
                 var fqn = SymbolNames.Fqn(tsym);
+                // Config wiring spells nested types the CLR way ("Outer+Inner"), not the C# way.
+                var metadataFqn = tnts.ContainingType == null ? fqn : SymbolNames.MetadataFqn(tnts);
                 foreach (var (file, text) in configTexts)
                 {
-                    if (!text.Contains(fqn, StringComparison.Ordinal)) { continue; }
+                    if (!text.Contains(fqn, StringComparison.Ordinal) && !text.Contains(metadataFqn, StringComparison.Ordinal)) { continue; }
                     cfgMentions++;
                     if (cfgMentions <= Constants.ShownConfigMentions)
                     {
@@ -566,6 +616,21 @@ public sealed class Engine
         {
             if (!report.Warnings.Contains(msg)) { report.Warnings.Add(msg); }
         }
+        // Member-level chain segments of SURVIVING statements whose refs died (an explicitly removed
+        // mapped member): only the ".ForMember(...)" goes — the rest of the mapping stands.
+        var segmentRemovals = new List<(StatementNode Stmt, StatementSegment Seg)>();
+        foreach (var stmt in graph.Statements)
+        {
+            if (deadStmts.Contains(stmt)) { continue; }
+            if (allDead.Contains(stmt.ContainingMember) || HasDeadContainer(graph, stmt.ContainingMember, allDead)) { continue; }
+            foreach (var seg in stmt.ChainSegments)
+            {
+                if (!seg.Refs.Any(allDead.Contains)) { continue; }
+                segmentRemovals.Add((stmt, seg));
+                var gone = seg.Refs.Where(allDead.Contains).Select(n => FqnOf(graph, n)).Distinct().ToList();
+                WarnOnce($"map configuration removed: {stmt.FilePath}:{seg.Line} .{seg.MethodName}(...) references deleted {string.Join(", ", gone)} — the segment is removed, the rest of the mapping is kept");
+            }
+        }
         foreach (var stmt in deadStmts.OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.AnchorStart).ThenBy(s => s.SegmentStart))
         {
             if (allDead.Contains(stmt.ContainingMember) || HasDeadContainer(graph, stmt.ContainingMember, allDead)) { continue; }
@@ -594,6 +659,7 @@ public sealed class Engine
                 continue;
             }
             report.FileTextLengths[stmt.FilePath] = stmt.FileTextLength;
+            report.FileTextHashes[stmt.FilePath] = stmt.FileTextHash;
             report.Statements.Add(new StatementDeletion
             {
                 Kind = stmt.Kind,
@@ -604,6 +670,22 @@ public sealed class Engine
                 SpanStart = spanStart,
                 SpanLength = spanLength,
                 WholeStatement = whole,
+            });
+        }
+        foreach (var (stmt, seg) in segmentRemovals)
+        {
+            report.FileTextLengths[stmt.FilePath] = stmt.FileTextLength;
+            report.FileTextHashes[stmt.FilePath] = stmt.FileTextHash;
+            report.Statements.Add(new StatementDeletion
+            {
+                Kind = stmt.Kind + " (segment)",
+                File = stmt.FilePath,
+                StartLine = seg.Line,
+                EndLine = seg.EndLine,
+                Snippet = seg.Snippet,
+                SpanStart = seg.Start,
+                SpanLength = seg.Length,
+                WholeStatement = false,
             });
         }
         report.Statements.Sort((a, b) => string.CompareOrdinal(a.File, b.File) is var c && c != 0 ? c : a.StartLine.CompareTo(b.StartLine));
@@ -651,7 +733,7 @@ public sealed class Engine
             sym.InDeletableFile = sym.Parts.All(p => deletableFileSet.Contains(p.File));
         }
 
-        var lostAssemblies = ComputeProjectCleanup(graph, report, allDead, keptInPlace, deletableFileSet);
+        var lostAssemblies = ComputeProjectCleanup(graph, report, allDead, keptInPlace, deletableFileSet, deadStmts);
 
         report.Stats = new ReportStats
         {
@@ -685,6 +767,12 @@ public sealed class Engine
         return graph.Decl.TryGetValue(id, out var s) ? SymbolNames.Fqn(s) : id;
     }
 
+    string TreeHashOf(SyntaxTree tree)
+    {
+        if (!_treeHashes.TryGetValue(tree, out var h)) { _treeHashes[tree] = h = Editor.TextHash(tree.GetText().ToString()); }
+        return h;
+    }
+
     bool HasDeadContainer(Graph graph, string id, HashSet<string> dead)
     {
         var cur = id;
@@ -696,7 +784,7 @@ public sealed class Engine
         return false;
     }
 
-    List<SourcePart> DeclarationParts(Graph graph, ISymbol s, string id, HashSet<string> allDead, HashSet<string> keptInPlace, List<string> warnings, Dictionary<string, int> fileLengths)
+    List<SourcePart> DeclarationParts(Graph graph, ISymbol s, string id, HashSet<string> allDead, HashSet<string> keptInPlace, List<string> warnings, Dictionary<string, int> fileLengths, Dictionary<string, string> fileHashes)
     {
         var parts = new List<SourcePart>();
         // A partial method/property has a second declaration under a separate symbol: deleting only
@@ -772,6 +860,14 @@ public sealed class Engine
                 if (!warnings.Contains(gmsg)) { warnings.Add(gmsg); }
                 continue;
             }
+            // Generated code that DOES land on disk (gRPC stubs, XAML .g.cs) lives under obj/ and
+            // regenerates on build: editing it is pointless and masks the real (regenerating) state.
+            if (tree.FilePath.Replace('\\', '/').Contains("/obj/", StringComparison.OrdinalIgnoreCase))
+            {
+                var omsg = $"skipped: {SymbolNames.Fqn(s)} is declared in {tree.FilePath}, generated under obj/ — it is left to regenerate";
+                if (!warnings.Contains(omsg)) { warnings.Add(omsg); }
+                continue;
+            }
             // FullSpan includes leading trivia; exclude leading #directives (#region, #if) whose
             // counterpart lies outside the deleted span, or deletion breaks compilation.
             var span = node.FullSpan;
@@ -811,6 +907,7 @@ public sealed class Engine
             }
             var lines = tree.GetLineSpan(node.Span);
             fileLengths[tree.FilePath] = tree.Length;
+            fileHashes[tree.FilePath] = TreeHashOf(tree);
             parts.Add(new SourcePart
             {
                 File = tree.FilePath,
@@ -865,7 +962,7 @@ public sealed class Engine
     /// repair loop restores candidates until every surviving need stays reachable in the final
     /// reference graph. Returns, per project, the assembly names no longer provided after cleanup
     /// (for the verifier to simulate).</summary>
-    Dictionary<string, HashSet<string>> ComputeProjectCleanup(Graph graph, DeletionReport report, HashSet<string> allDead, HashSet<string> keptInPlace, HashSet<string> deletableFiles)
+    Dictionary<string, HashSet<string>> ComputeProjectCleanup(Graph graph, DeletionReport report, HashSet<string> allDead, HashSet<string> keptInPlace, HashSet<string> deletableFiles, HashSet<StatementNode> deadStmts)
     {
         var nodesByProject = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var (node, projects) in graph.ProjectsOf)
@@ -959,6 +1056,25 @@ public sealed class Engine
                         }
                         else { dp.UnionWith(tps); }
                     }
+                }
+            }
+            // SURVIVING registrations/mappings reference their types only through suppressed spans
+            // (rules, not edges), so their InvolvedNodes must count as needs too — or a still-needed
+            // ProjectReference (and the matching using) is planned for removal.
+            foreach (var stmt in graph.Statements)
+            {
+                if (deadStmts.Contains(stmt)) { continue; }
+                if (!graph.ProjectsOf.TryGetValue(stmt.ContainingMember, out var sps) || !sps.Contains(pname)) { continue; }
+                // Surviving member-level segments keep their text too, so their refs are needs;
+                // a segment being removed (a ref died) is not.
+                var stmtRefs = stmt.InvolvedNodes
+                    .Concat(stmt.ChainSegments.Where(seg => !seg.Refs.Any(allDead.Contains)).SelectMany(seg => seg.Refs));
+                foreach (var t in stmtRefs)
+                {
+                    if (t == null || !graph.ProjectsOf.TryGetValue(t, out var tps) || tps.Contains(pname)) { continue; }
+                    var group = tps.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+                    if (needKeys.Add(string.Join("|", group))) { needs.Add(group); }
+                    sp.UnionWith(group);
                 }
             }
         }
@@ -1154,11 +1270,19 @@ public sealed class Engine
             foreach (var (pname, pi) in graph.Projects.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
             {
                 if (deletableProjects.Contains(pname) || pi.CompileItems.Count == 0) { continue; }
-                var rel = Path.GetRelativePath(Path.GetDirectoryName(pi.FilePath) ?? "", file).Replace('\\', '/');
+                var pdir = Path.GetDirectoryName(pi.FilePath) ?? "";
+                var rel = Path.GetRelativePath(pdir, file).Replace('\\', '/');
                 var match = pi.CompileItems.FirstOrDefault(ci => StringComparer.OrdinalIgnoreCase.Equals(ci.Replace('\\', '/'), rel));
                 if (match != null)
                 {
                     report.CompileEntryRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = match });
+                }
+                else if (file.StartsWith(pdir + Path.DirectorySeparatorChar, Constants.PathComparison))
+                {
+                    // An explicit-listing project owns the file but none of its <Compile> entries
+                    // matched textually (MSBuild property in the Include, odd relative form): the
+                    // file is deleted, so a dangling entry breaks the build with CS2001.
+                    report.Warnings.Add($"{pname}: deleted file {file} has no textually matching <Compile> entry — if this project lists files explicitly, remove the entry manually or the build fails (CS2001)");
                 }
             }
         }
@@ -1223,6 +1347,7 @@ public sealed class Engine
             if (allGone || nameDies)
             {
                 report.FileTextLengths[u0.File] = u0.FileTextLength;
+                report.FileTextHashes[u0.File] = u0.FileTextHash;
                 report.UsingRemovals.Add(new UsingRemoval { File = u0.File, Line = u0.Line, Namespace = u0.Namespace, SpanStart = u0.SpanStart, SpanLength = u0.SpanLength });
             }
         }

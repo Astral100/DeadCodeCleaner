@@ -50,6 +50,11 @@ public class WidgetService : IWidgetService
         // GadgetService (no identifier) must then keep it alive on its own.
         new GadgetDto().Deconstruct(out var deconA, out var deconB);
         _ = deconA + deconB;
+        // Internal shared-declaration fields: these references die with this class, so
+        // WidgetCounter orphans (kept in place beside the surviving GadgetCounter) and the
+        // WidgetOnly pair orphans whole.
+        SharedService.WidgetCounter++;
+        SharedService.WidgetOnlyA += SharedService.WidgetOnlyB;
         return SharedService.Prefix() + "widget";
     }
 }

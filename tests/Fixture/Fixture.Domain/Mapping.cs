@@ -30,8 +30,9 @@ public class MappingProfile : Profile
         // statement, so they must NOT keep the widget types alive through the rooted profile.
         CreateMap<WidgetEntity, WidgetDto>().ForMember(d => d.Name);
         // The chained call's generic type argument is the ONLY reference to GadgetConverter: it
-        // must live while this map lives and die with it.
-        CreateMap<GadgetEntity, GadgetDto>().ConvertVia<GadgetConverter>();
+        // must live while this map lives and die with it. The ForMember is member-level
+        // configuration: removing AuditNote removes the segment, never the whole mapping.
+        CreateMap<GadgetEntity, GadgetDto>().ConvertVia<GadgetConverter>().ForMember(d => d.AuditNote);
     }
 }
 

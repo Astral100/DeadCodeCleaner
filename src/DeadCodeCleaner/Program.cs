@@ -7,7 +7,15 @@ public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
-        if (!MSBuildLocator.IsRegistered) { MSBuildLocator.RegisterDefaults(); }
+        try
+        {
+            if (!MSBuildLocator.IsRegistered) { MSBuildLocator.RegisterDefaults(); }
+        }
+        catch (InvalidOperationException e)
+        {
+            Console.Error.WriteLine("error: no MSBuild / .NET SDK installation was found: " + e.Message);
+            return 2;
+        }
         var exitCode = await Run(args);
         return exitCode;
     }
@@ -78,6 +86,11 @@ public static class Program
                     Editor.Mark(report, log);
                     break;
                 case "delete":
+                    if (report.ProjectsFailedToLoad > 0 && !opts.AllowCompileErrors)
+                    {
+                        Console.Error.WriteLine($"error: {report.ProjectsFailedToLoad} project(s)/load failure(s) left parts of the solution INVISIBLE to the analysis (see the workspace warnings) — references in them cannot be seen and the cascade may over-delete; fix the load problems first, or pass --allow-compile-errors; nothing was deleted");
+                        return 1;
+                    }
                     if (report.ProjectsWithCompileErrors > 0 && !opts.AllowCompileErrors)
                     {
                         Console.Error.WriteLine($"error: {report.ProjectsWithCompileErrors} project(s) had compile errors during analysis — references in them are invisible and the cascade may over-delete; fix the build first, or pass --allow-compile-errors; nothing was deleted");
@@ -99,7 +112,8 @@ public static class Program
                         Console.Error.WriteLine($"error: verification found {report.VerificationErrors} new compile error(s) in the deletion plan — nothing was deleted (see the VERIFY warnings; --no-verify overrides)");
                         return 1;
                     }
-                    if (!Editor.Delete(report, log)) { return 1; }
+                    var deleteExit = Editor.Delete(report, log);
+                    if (deleteExit != 0) { return deleteExit; }
                     break;
             }
             return 0;
@@ -179,6 +193,9 @@ public static class Program
 
             The FQN format is Namespace.Type.Member without parameters, e.g.
               Roar.Infrastructure.WebBase.Controllers.AdminController.GetRoleActionList
+
+            Exit codes: 0 success; 1 refused/rolled back (nothing half-applied); 2 bad usage/environment;
+              3 delete applied, but some csproj/sln steps need manual completion (see WARNINGs).
             """);
     }
 }

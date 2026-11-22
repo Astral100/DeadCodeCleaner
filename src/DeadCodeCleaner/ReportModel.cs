@@ -4,6 +4,9 @@ namespace DeadCodeCleaner;
 
 public sealed class DeletionReport
 {
+    /// <summary>Marks the file as this tool's own output, so the config scan of a later run never
+    /// mistakes a report saved inside a project directory for runtime configuration.</summary>
+    public string Generator { get; init; } = Constants.ReportGeneratorName;
     public required string Solution { get; init; }
     public required string[] RemoveTargets { get; init; }
     public DateTime GeneratedUtc { get; init; } = DateTime.UtcNow;
@@ -24,11 +27,18 @@ public sealed class DeletionReport
     public int StillReferencedTargets { get; set; }
     /// <summary>Projects whose analysis compilation had errors — references in them are invisible.</summary>
     public int ProjectsWithCompileErrors { get; set; }
+    /// <summary>Workspace load failures plus solution projects the analysis could not see at all
+    /// (non-C#, failed evaluation): references from them are invisible, so delete refuses.</summary>
+    public int ProjectsFailedToLoad { get; set; }
     /// <summary>File -> length of the text the spans were computed against: the editor refuses to
     /// touch a file whose on-disk text decodes to a different length (encoding mismatch, or the
     /// file changed since the analysis).</summary>
     [JsonIgnore]
     public Dictionary<string, int> FileTextLengths { get; } = new(Constants.PathComparer);
+    /// <summary>File -> SHA-256 of the analyzed text: catches same-length concurrent edits the
+    /// length check cannot see.</summary>
+    [JsonIgnore]
+    public Dictionary<string, string> FileTextHashes { get; } = new(Constants.PathComparer);
     public ReportStats Stats { get; set; } = new();
 }
 

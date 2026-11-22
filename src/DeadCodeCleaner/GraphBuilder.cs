@@ -17,6 +17,7 @@ public sealed class GraphBuilder
     readonly Action<string> _log;
     readonly List<(INamedTypeSymbol Type, bool IsTest)> _types = new();
     readonly HashSet<InvocationExpressionSyntax> _processedInvocations = new();
+    readonly Dictionary<SyntaxTree, string> _treeHashes = new();
     readonly HashSet<string> _solutionAssemblies = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<SyntaxNode, AnchorInfo> _anchors = new();
 
@@ -41,7 +42,12 @@ public sealed class GraphBuilder
         var seenProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var project in solution.Projects)
         {
-            if (project.Language != LanguageNames.CSharp) { continue; }
+            if (project.Language != LanguageNames.CSharp)
+            {
+                _graph.Warnings.Add($"{project.Name}: not a C# project — its code and its references into C# code are INVISIBLE to the analysis");
+                _graph.ProjectsNotAnalyzed.Add(project.Name);
+                continue;
+            }
             if (!seenProjects.Add(project.FilePath ?? project.Name))
             {
                 // Multi-targeting duplicate: conditional (#if) code of the other frameworks is invisible.
@@ -50,7 +56,12 @@ public sealed class GraphBuilder
                 continue;
             }
             var comp = await project.GetCompilationAsync();
-            if (comp == null) { continue; }
+            if (comp == null)
+            {
+                _graph.Warnings.Add($"{project.Name}: no compilation could be built — the project is INVISIBLE to the analysis");
+                _graph.ProjectsNotAnalyzed.Add(project.Name);
+                continue;
+            }
             bool isTest = IsTestProject(project);
             compilations.Add((comp, isTest, project.Name));
             _solutionAssemblies.Add(comp.Assembly.Name);
@@ -118,10 +129,11 @@ public sealed class GraphBuilder
         foreach (var pinfo2 in _graph.Projects.Values)
         {
             var resolved = new List<(string Name, string Include)>();
-            foreach (var (name, include) in pinfo2.ProjectReferences)
+            foreach (var include in pinfo2.ProjectReferences.Values.ToList())
             {
+                var fileName = Path.GetFileNameWithoutExtension(include);
                 var full = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(pinfo2.FilePath) ?? "", include.Replace('\\', '/')));
-                var rname = byPath.TryGetValue(full, out var n1) ? n1 : byFileName.TryGetValue(name, out var n2) ? n2 : name;
+                var rname = byPath.TryGetValue(full, out var n1) ? n1 : byFileName.TryGetValue(fileName, out var n2) ? n2 : fileName;
                 resolved.Add((rname, include));
             }
             pinfo2.ProjectReferences.Clear();
@@ -189,7 +201,13 @@ public sealed class GraphBuilder
                     foreach (var f in EnumerateFilesPruned(dir))
                     {
                         if (Constants.NonCompiledContentExtensions.Contains(Path.GetExtension(f)) && seenFiles.Add(f)) { found++; }
-                        if (IsConfigLikeFile(f)) { texts.Add((f, ReadConfigText(f))); }
+                        if (!IsConfigLikeFile(f)) { continue; }
+                        var txt = ReadConfigText(f);
+                        // This tool's own reports (saved under any --json name) mention every deleted
+                        // type and removed package by design: scanning them as config would turn the
+                        // previous run's output into false "mentioned in config" blocks.
+                        if (txt.Contains(Constants.ReportGeneratorJsonFragment, StringComparison.Ordinal)) { continue; }
+                        texts.Add((f, txt));
                     }
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -304,6 +322,7 @@ public sealed class GraphBuilder
                 SpanStart = spanStart,
                 SpanLength = u.FullSpan.End - spanStart,
                 FileTextLength = sourceText.Length,
+                FileTextHash = TreeHash(tree),
             });
         }
     }
@@ -329,7 +348,9 @@ public sealed class GraphBuilder
                 }
                 else if (el.Name.LocalName == "ProjectReference")
                 {
-                    info.ProjectReferences[Path.GetFileNameWithoutExtension(include)] = include;
+                    // Keyed by the Include path until resolution: two references whose FILES share a
+                    // name (A/Core.csproj, B/Core.csproj) must not collapse into one entry.
+                    info.ProjectReferences[include] = include;
                     if (conditional) { info.ConditionalProjectRefIncludes.Add(include.Replace('\\', '/')); }
                 }
                 else if (el.Name.LocalName == "Compile" && !info.CompileItems.Contains(include))
@@ -524,6 +545,10 @@ public sealed class GraphBuilder
         var typeId = Graph.Id(type);
         var members = type.GetMembers();
         var one = new object[1] { typeId };
+        // [StructLayout]/[DataContract]/[Serializable]: the FIELD set is the marshalled or
+        // serialized shape, whatever each field's accessibility.
+        bool layoutSensitive = type.IsSerializable
+            || type.GetAttributes().Any(a => a.AttributeClass?.Name is { } an && Constants.LayoutSensitiveAttributeNames.Contains(an));
 
         foreach (var m in members)
         {
@@ -546,11 +571,17 @@ public sealed class GraphBuilder
                 // language reaches them without identifiers, whatever their accessibility.
                 _graph.AddRule(one, new object[] { mId }, "kept with type");
             }
+            else if (m is IFieldSymbol && layoutSensitive)
+            {
+                _graph.AddRule(one, new object[] { mId }, "layout-sensitive field kept with type");
+            }
             else if (!_config.StrictMembers)
             {
-                // Serializers / model binding / data binding reach these via reflection.
+                // Serializers / model binding / data binding reach these via reflection; public
+                // FIELDS carry serializer shape exactly as public properties do.
                 bool keep = (m is IPropertySymbol p && p.DeclaredAccessibility == Accessibility.Public)
-                    || (m is IFieldSymbol && type.TypeKind == TypeKind.Enum);
+                    || (m is IFieldSymbol && type.TypeKind == TypeKind.Enum)
+                    || (m is IFieldSymbol pubF && pubF.DeclaredAccessibility == Accessibility.Public);
                 if (keep) { _graph.AddRule(one, new object[] { mId }, "public surface kept with type"); }
             }
 
@@ -708,6 +739,34 @@ public sealed class GraphBuilder
         {
             rootWholeType = true;
             reason = Constants.ReasonAutofacModule;
+        }
+        // Framework-discovered code: no static reference exists to any of these, so without a root
+        // they are "pre-existing orphans" and die the moment they touch newly-dead code.
+        else if (BaseChainHasName(type, "Migration", "DbMigration"))
+        {
+            rootWholeType = true;
+            reason = "EF migration";
+        }
+        else if (BaseChainHasName(type, "ViewComponent", "TagHelper", "PageModel", "ComponentBase", "Hub"))
+        {
+            rootWholeType = true;
+            reason = "framework component";
+        }
+        else if (BaseChainHasExternalName(type, "Page", "System.Web") || BaseChainHasExternalName(type, "UserControl", "System.Web")
+            || BaseChainHasExternalName(type, "MasterPage", "System.Web") || BaseChainHasExternalName(type, "HttpApplication", "System.Web"))
+        {
+            rootWholeType = true;
+            reason = "WebForms code-behind";
+        }
+        else if (type.AllInterfaces.Any(i => i.Name is "IEntityTypeConfiguration" or "IMiddleware" or "IHttpModule" or "IHttpHandler" or "IJob" or "ITagHelper"))
+        {
+            rootWholeType = true;
+            reason = "framework-discovered implementation";
+        }
+        else if (type.InstanceConstructors.Any(c => c.Parameters.Any(p => p.Type.Name == "RequestDelegate")))
+        {
+            rootWholeType = true;
+            reason = "convention middleware";
         }
 
         if (rootWholeType)
@@ -965,8 +1024,11 @@ public sealed class GraphBuilder
                     // constructor, with no identifier naming it.
                     AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(pbt));
                     break;
-                case ForEachStatementSyntax fe:
+                case CommonForEachStatementSyntax fe:
                 {
+                    // CommonForEachStatementSyntax covers BOTH forms: "foreach (var x in y)" and the
+                    // deconstructing "foreach (var (a, b) in y)" — the latter is a different node
+                    // type, and matching only the plain form loses extension GetEnumerator edges.
                     var info = model.GetForEachStatementInfo(fe);
                     AddEdgeTo(sourceId, info.GetEnumeratorMethod);
                     AddEdgeTo(sourceId, info.MoveNextMethod);
@@ -1083,9 +1145,28 @@ public sealed class GraphBuilder
     void RecordExternalCall(string sourceId, ISymbol target)
     {
         if (target == null) { return; }
-        var asm = target.OriginalDefinition.ContainingAssembly?.Name;
+        var def = target.OriginalDefinition;
+        var asm = def.ContainingAssembly?.Name;
         if (asm == null || _solutionAssemblies.Contains(asm)) { return; }
+        if (Constants.EmptyContainerBenignAssemblies.Contains(asm) && !IsPureBclTarget(def))
+        {
+            // mscorlib / System.Runtime also hold File, Environment and Process: a call into them
+            // is only benign when its TYPE is on the pure-surface lists. Everything else is recorded
+            // under a name outside the benign set, so it blocks the empty-container pass.
+            _graph.AddExternalCallRef(sourceId, asm + "!" + (def.ContainingType?.Name ?? def.Name));
+            return;
+        }
         _graph.AddExternalCallRef(sourceId, asm);
+    }
+
+    bool IsPureBclTarget(ISymbol def)
+    {
+        var top = def.ContainingType;
+        if (top == null) { return false; }
+        while (top.ContainingType != null) { top = top.ContainingType; }
+        var ns = top.ContainingNamespace?.IsGlobalNamespace == false ? top.ContainingNamespace.ToDisplayString() : "";
+        if (Constants.EmptyContainerPureNamespaces.Contains(ns)) { return true; }
+        return Constants.EmptyContainerPureTypes.Contains(ns + "." + top.Name);
     }
 
     void RecordExternal(string sourceId, ISymbol target)
@@ -1209,6 +1290,12 @@ public sealed class GraphBuilder
         var innerStatement = inv.FirstAncestorOrSelf<StatementSyntax>();
         SyntaxNode anchor = innerStatement ?? (SyntaxNode)inv;
         string manualReason = null;
+        // No statement ancestor: the registration IS the body of an expression-bodied member or an
+        // initializer. Deleting the whole span would leave "=> ;" — plan a manual removal instead.
+        if (innerStatement == null)
+        {
+            manualReason = "the registration is the body of an expression-bodied member or initializer";
+        }
         // A registration inside a lambda (factory delegates, MapperConfiguration callbacks) cannot be
         // deleted by span arithmetic without breaking the surrounding expression.
         for (var a = inv.Parent; a != null && a != innerStatement; a = a.Parent)
@@ -1289,6 +1376,7 @@ public sealed class GraphBuilder
             SegmentStart = segmentStart,
             SegmentLength = segmentLength,
             FileTextLength = anchor.SyntaxTree.Length,
+            FileTextHash = TreeHash(anchor.SyntaxTree),
             ManualReason = manualReason,
         };
         foreach (var nid in involved)
@@ -1306,6 +1394,12 @@ public sealed class GraphBuilder
     {
         skip ??= new List<TextSpan>();
         skip.Add(span);
+    }
+
+    string TreeHash(SyntaxTree tree)
+    {
+        if (!_treeHashes.TryGetValue(tree, out var h)) { _treeHashes[tree] = h = Editor.TextHash(tree.GetText().ToString()); }
+        return h;
     }
 
     void HandleCreateMap(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax> typeArgs, string sourceId, SemanticModel model, ref List<TextSpan> skip)
@@ -1330,28 +1424,62 @@ public sealed class GraphBuilder
         // (a rooted profile would keep the mapped members alive forever); they belong to the
         // statement, which keeps them while it lives and releases them when it dies.
         var claimed = new List<InvocationExpressionSyntax> { inv };
-        var chainRefs = new List<string>();
+        var chainRefs = new List<string>();        // every chained ref: kept alive while the statement lives
+        var structuralRefs = new List<string>();   // refs of structural calls (ConvertUsing, Include): kill the whole statement
+        var segments = new List<StatementSegment>();
         var chainTop = (SyntaxNode)inv;
         while (chainTop.Parent is MemberAccessExpressionSyntax cma && cma.Parent is InvocationExpressionSyntax cInv)
         {
             claimed.Add(cInv);
             _processedInvocations.Add(cInv);
             AddSkip(ref skip, TextSpan.FromBounds(cma.Name.SpanStart, cInv.Span.End));
+            var segRefs = new List<string>();
             foreach (var idn in cInv.ArgumentList.DescendantNodes())
             {
                 if (idn is not (IdentifierNameSyntax or GenericNameSyntax)) { continue; }
-                if (Normalize(model.GetSymbolInfo(idn).Symbol) is { } nid && !chainRefs.Contains(nid)) { chainRefs.Add(nid); }
+                if (Normalize(model.GetSymbolInfo(idn).Symbol) is { } nid && !segRefs.Contains(nid)) { segRefs.Add(nid); }
             }
             // Generic type arguments on the chained call's NAME (ConvertUsing<TConverter>,
             // Include<TDerived,TOther>) sit inside the suppressed span and appear in no argument
             // list: claim them as statement references or they are lost entirely.
             if (cma.Name is GenericNameSyntax chainedGeneric)
             {
-                foreach (var ta in chainedGeneric.TypeArgumentList.Arguments) { CollectTypeRefNodes(ta, model, chainRefs); }
+                foreach (var ta in chainedGeneric.TypeArgumentList.Arguments) { CollectTypeRefNodes(ta, model, segRefs); }
+            }
+            foreach (var r in segRefs)
+            {
+                if (!chainRefs.Contains(r)) { chainRefs.Add(r); }
+            }
+            var mname = cma.Name.Identifier.Text;
+            if (Constants.MemberLevelMapChainNames.Contains(mname))
+            {
+                // Member-level configuration: when its member dies, only THIS segment goes and the
+                // rest of the mapping stands. The span starts at the '.', so the chain stays valid.
+                var segLines = cInv.GetLocation().GetLineSpan();
+                var segSnippet = Regex.Replace("." + cma.Name + cInv.ArgumentList, @"\s+", " ").Trim();
+                if (segSnippet.Length > Constants.SnippetMaxLength) { segSnippet = segSnippet[..(Constants.SnippetMaxLength - 3)] + "..."; }
+                segments.Add(new StatementSegment
+                {
+                    Start = cma.OperatorToken.SpanStart,
+                    Length = cInv.Span.End - cma.OperatorToken.SpanStart,
+                    Line = cma.Name.GetLocation().GetLineSpan().StartLinePosition.Line + 1,
+                    EndLine = segLines.EndLinePosition.Line + 1,
+                    MethodName = mname,
+                    Snippet = segSnippet,
+                    Refs = segRefs,
+                });
+            }
+            else
+            {
+                foreach (var r in segRefs)
+                {
+                    if (!structuralRefs.Contains(r)) { structuralRefs.Add(r); }
+                }
             }
             chainTop = cInv;
         }
-        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed, involved.Concat(chainRefs).Concat(argNodes), segmentEnd: (InvocationExpressionSyntax)chainTop);
+        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed, involved.Concat(structuralRefs).Concat(argNodes), segmentEnd: (InvocationExpressionSyntax)chainTop);
+        stmt.ChainSegments.AddRange(segments);
         var guards = new List<object> { sourceId };
         guards.AddRange(involved);
         _graph.AddRule(guards, new object[] { stmt }, "CreateMap in use iff both types in use");
@@ -1387,12 +1515,14 @@ public sealed class GraphBuilder
     void HandleMsDi(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax>? typeArgs, string sourceId, SemanticModel model, ref List<TextSpan> skip)
     {
         string service = null, impl = null;
+        bool externalService = false;
         var spansToSkip = new List<TextSpan>();
         var argNodes = new List<string>();
         if (typeArgs is { Count: 2 })
         {
             service = ResolveTypeNode(typeArgs.Value[0], model);
             impl = ResolveTypeNode(typeArgs.Value[1], model);
+            externalService = service == null;
             spansToSkip.Add(typeArgs.Value[0].Span);
             spansToSkip.Add(typeArgs.Value[1].Span);
             CollectTypeRefNodes(typeArgs.Value[0], model, argNodes);
@@ -1411,6 +1541,7 @@ public sealed class GraphBuilder
             if (typeofs.Count == 0) { return; }
             service = ResolveTypeNode(typeofs[0].Type, model);
             impl = typeofs.Count > 1 ? ResolveTypeNode(typeofs[1].Type, model) : service;
+            externalService = service == null && typeofs.Count > 1;
             // The WHOLE typeof expression: its ITypeOfOperation spans it entirely, and a narrower
             // skip would let the operation walk re-pin the type with a permanent edge.
             foreach (var t in typeofs)
@@ -1435,8 +1566,13 @@ public sealed class GraphBuilder
         }
         var guards = new List<object> { sourceId };
         if (service != null) { guards.Add(service); }
-        else if (impl != null) { guards.Add(impl); } // external service type: tie to the implementation
-        _graph.AddRule(guards, new object[] { stmt }, "DI registration in use iff service in use");
+        // An EXTERNAL service type (AddSingleton<IAuthorizationHandler, MinAgeHandler>): the
+        // framework resolves it at runtime, so no in-solution reference can exist. The statement
+        // lives with its containing member alone — guarding it on the implementation would be
+        // circular (the implementation lives only through this statement) and would delete a
+        // runtime-live component as a "pre-existing orphan".
+        else if (impl != null && !externalService) { guards.Add(impl); } // unresolvable without a service arg: tie to the implementation
+        _graph.AddRule(guards, new object[] { stmt }, externalService ? "external service registration" : "DI registration in use iff service in use");
 
         if (impl != null)
         {
@@ -1507,7 +1643,25 @@ public sealed class GraphBuilder
                     foreach (var i in it.AllInterfaces)
                     {
                         if (NodeId(i) is { } iId) { services.Add(iId); }
+                        // An EXTERNAL interface (IHostedService, IAuthorizationHandler): consumers
+                        // resolve through it outside the solution's sight.
+                        else { hasExternalService = true; }
                     }
+                }
+            }
+            else if (mname is "Keyed" or "Named" && ma.Name is GenericNameSyntax kg)
+            {
+                // Keyed<IFoo>("key") / Named<IFoo>("name") register a service exactly as As<IFoo> does.
+                foreach (var ta in kg.TypeArgumentList.Arguments)
+                {
+                    if (ResolveTypeNode(ta, model) is { } s)
+                    {
+                        services.Add(s);
+                        textualRefs.Add(s);
+                        AddSkip(ref skip, ta.Span);
+                        CollectTypeRefNodes(ta, model, argNodes);
+                    }
+                    else { hasExternalService = true; }
                 }
             }
             else if (!Constants.AutofacChainContinuers.Contains(mname)) { break; }
@@ -1535,6 +1689,13 @@ public sealed class GraphBuilder
         {
             _graph.AddRule(new object[] { stmt }, extraArgs, "type arguments of the registration");
         }
+        // An external service wins over everything: its consumers resolve outside the solution's
+        // sight, so the registration stays while the containing member does — even when in-solution
+        // services registered alongside it die.
+        if (hasExternalService)
+        {
+            _graph.AddRule(new object[] { sourceId }, new object[] { stmt }, "external service registration");
+        }
         if (services.Count > 0)
         {
             foreach (var s in services)
@@ -1546,11 +1707,7 @@ public sealed class GraphBuilder
                 _graph.AddRule(new object[] { sourceId, impl }, new object[] { stmt }, "self registration");
             }
         }
-        else if (hasExternalService)
-        {
-            _graph.AddRule(new object[] { sourceId }, new object[] { stmt }, "external service registration");
-        }
-        else if (impl != null)
+        else if (!hasExternalService && impl != null)
         {
             _graph.AddRule(new object[] { sourceId, impl }, new object[] { stmt }, "self registration");
         }

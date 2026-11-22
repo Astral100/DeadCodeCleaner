@@ -23,15 +23,33 @@ public sealed class StatementNode
     public required int SegmentLength { get; init; }
     /// <summary>Length of the file's analyzed text, so the editor can detect decoding mismatches.</summary>
     public required int FileTextLength { get; init; }
+    /// <summary>SHA-256 of the file's analyzed text, so the editor can detect same-length edits.</summary>
+    public required string FileTextHash { get; init; }
     /// <summary>Why automatic deletion is unsafe (if/else branch, inside a lambda), or null when it is safe.</summary>
     public string ManualReason { get; init; }
     /// <summary>Node ids the statement's text references (service/implementation/mapped types, chain
     /// lambdas): the statement cannot compile without them, so it dies when any of them dies.</summary>
     public List<string> InvolvedNodes { get; } = new();
+    /// <summary>Member-level chain segments (".ForMember(d => d.X, ...)"): each dies ALONE when its
+    /// refs die while the statement survives, leaving the rest of the mapping standing.</summary>
+    public List<StatementSegment> ChainSegments { get; } = new();
     /// <summary>True when deleting the whole anchor is safe: the anchor is an expression statement whose
     /// entire call chain consists of tracked registrations and their chain continuations. Set in a
     /// post-pass once every statement on the anchor is known.</summary>
     public bool WholeAnchorAllowed { get; set; }
+}
+
+/// <summary>One member-level chained call of a tracked statement (see StatementNode.ChainSegments).
+/// The span starts at the '.' before the name, so removing it leaves a valid shorter chain.</summary>
+public sealed class StatementSegment
+{
+    public required int Start { get; init; }
+    public required int Length { get; init; }
+    public required int Line { get; init; }        // 1-based
+    public required int EndLine { get; init; }     // 1-based
+    public required string MethodName { get; init; }
+    public required string Snippet { get; init; }
+    public required List<string> Refs { get; init; }
 }
 
 /// <summary>Conjunctive implication: when ALL antecedents are in use, all consequents become in use.
@@ -90,6 +108,9 @@ public sealed class Graph
     public HashSet<string> ConfigKeptIds { get; } = new(StringComparer.Ordinal);
     /// <summary>Projects whose analysis compilation had errors: their references are incomplete.</summary>
     public List<string> ProjectsWithCompileErrors { get; } = new();
+    /// <summary>Projects in the solution the analysis could not see at all (non-C#, or no
+    /// compilation): every reference from them is invisible, so delete must refuse.</summary>
+    public List<string> ProjectsNotAnalyzed { get; } = new();
     /// <summary>Node id -> names of the projects that compile it (more than one for linked files).</summary>
     public Dictionary<string, HashSet<string>> ProjectsOf { get; } = new(StringComparer.Ordinal);
     /// <summary>Project name -> csproj facts.</summary>
@@ -207,6 +228,8 @@ public sealed class UsingRef
     public required int SpanLength { get; init; }
     /// <summary>Length of the file's analyzed text, so the editor can detect decoding mismatches.</summary>
     public required int FileTextLength { get; init; }
+    /// <summary>SHA-256 of the file's analyzed text, so the editor can detect same-length edits.</summary>
+    public required string FileTextHash { get; init; }
 }
 
 /// <summary>Per-project facts needed for package/reference cleanup.</summary>

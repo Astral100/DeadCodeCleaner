@@ -69,16 +69,66 @@ public static class Constants
         "RegisterAssemblyTypes", "RegisterAssemblyModules", "Scan",
     };
 
-    /// <summary>Assemblies whose use does not block deleting an "empty" profile/module whole:
-    /// pure-data framework code with no observable side effects worth preserving.</summary>
+    /// <summary>Assemblies whose use does not AUTOMATICALLY block deleting an "empty" profile/module
+    /// whole. These are only candidates: mscorlib and System.Runtime also hold File, Environment and
+    /// Process, so a call into them blocks the deletion anyway unless its TYPE is on the pure-surface
+    /// lists below.</summary>
     public static readonly HashSet<string> EmptyContainerBenignAssemblies = new(StringComparer.OrdinalIgnoreCase)
     {
         "mscorlib", "netstandard", "System.Private.CoreLib", "System.Runtime", "System", "System.Core",
         "System.Linq", "System.Linq.Expressions", "System.Collections", "System.ObjectModel",
     };
 
+    /// <summary>Namespaces in the benign assemblies whose every member is free of external side
+    /// effects: calls here never block the empty-container pass.</summary>
+    public static readonly HashSet<string> EmptyContainerPureNamespaces = new(StringComparer.Ordinal)
+    {
+        "System.Linq", "System.Linq.Expressions", "System.Collections", "System.Collections.Generic",
+        "System.Collections.ObjectModel", "System.Collections.Concurrent", "System.Collections.Specialized",
+        "System.Text", "System.Text.RegularExpressions", "System.Globalization",
+    };
+
+    /// <summary>Individual side-effect-free types (full names) in benign-assembly namespaces that
+    /// also hold dangerous ones (System has both String and Environment; System.IO has Path and File).</summary>
+    public static readonly HashSet<string> EmptyContainerPureTypes = new(StringComparer.Ordinal)
+    {
+        "System.String", "System.Object", "System.Math", "System.MathF", "System.Convert", "System.Guid",
+        "System.DateTime", "System.DateTimeOffset", "System.TimeSpan", "System.TimeZoneInfo", "System.Uri",
+        "System.Version", "System.Random", "System.Char", "System.Boolean", "System.Byte", "System.SByte",
+        "System.Int16", "System.Int32", "System.Int64", "System.UInt16", "System.UInt32", "System.UInt64",
+        "System.Single", "System.Double", "System.Decimal", "System.Enum", "System.Array", "System.Tuple",
+        "System.ValueTuple", "System.Nullable", "System.Lazy", "System.Func", "System.Action",
+        "System.Predicate", "System.Comparison", "System.EventHandler", "System.StringComparer",
+        "System.Exception", "System.ArgumentException", "System.ArgumentNullException",
+        "System.ArgumentOutOfRangeException", "System.InvalidOperationException", "System.NotSupportedException",
+        "System.NotImplementedException", "System.FormatException", "System.InvalidCastException",
+        "System.IO.Path",
+    };
+
+    /// <summary>Chained CreateMap calls configuring ONE member (".ForMember(d => d.X, ...)"): when the
+    /// member dies, only the segment is removed and the rest of the mapping stands. Structural chain
+    /// calls (ConvertUsing, Include, ReverseMap) still kill the whole mapping instead.</summary>
+    public static readonly HashSet<string> MemberLevelMapChainNames = new(StringComparer.Ordinal)
+    {
+        "ForMember", "ForPath", "ForSourceMember",
+    };
+
+    /// <summary>Attributes marking a type whose FIELD set is its marshalled/serialized shape: every
+    /// field is kept while the type is in use, whatever its accessibility.</summary>
+    public static readonly HashSet<string> LayoutSensitiveAttributeNames = new(StringComparer.Ordinal)
+    {
+        "StructLayoutAttribute", "DataContractAttribute",
+    };
+
+    /// <summary>Top-level property marking this tool's own JSON reports, so a report saved inside a
+    /// project directory is never scanned as configuration on the next run.</summary>
+    public const string ReportGeneratorName = "DeadCodeCleaner";
+    public const string ReportGeneratorJsonFragment = "\"generator\": \"DeadCodeCleaner\"";
+
     public const string TestProjectNamePattern = @"(^|[._])Tests?([._]|$)";
-    public const string TestPackagePattern = @"Include=""(xunit|nunit|NUnit|MSTest|Microsoft\.NET\.Test\.Sdk)";
+    /// <summary>Whole package ids only (closing quote required): "xunit.abstractions" alone marks a
+    /// LIBRARY that extends a test framework, not a test project, and must not match.</summary>
+    public const string TestPackagePattern = @"Include\s*=\s*[""'](xunit(\.core|\.runner\.[\w.]+|\.extensibility\.[\w.]+)?|nunit|nunit3testadapter|nunitlite|mstest(\.testframework|\.testadapter)?|microsoft\.net\.test\.sdk)[""']";
 
     public static readonly JsonSerializerOptions CaseInsensitiveJson = new() { PropertyNameCaseInsensitive = true };
 

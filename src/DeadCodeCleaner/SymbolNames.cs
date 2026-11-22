@@ -21,6 +21,21 @@ public static class SymbolNames
         return ns + string.Join(".", parts);
     }
 
+    /// <summary>The CLR spelling of a type name, with '+' between nesting levels
+    /// ("Ns.Outer+Inner"): configuration files reference nested types this way.</summary>
+    public static string MetadataFqn(INamedTypeSymbol type)
+    {
+        var parts = new Stack<string>();
+        var top = type;
+        for (var cur = type; cur != null; cur = cur.ContainingType)
+        {
+            parts.Push(cur.Name);
+            top = cur;
+        }
+        var ns = top.ContainingNamespace?.IsGlobalNamespace == false ? top.ContainingNamespace.ToDisplayString() + "." : "";
+        return ns + string.Join("+", parts);
+    }
+
     /// <summary>Display name including method parameters, for disambiguation output.</summary>
     public static string Detailed(ISymbol symbol)
     {

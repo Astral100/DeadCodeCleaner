@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 REPORT=$(mktemp)
 SCRATCH=""
 SCRATCH2=""
-trap 'rm -rf "$SCRATCH" "$SCRATCH2"; rm -f "$REPORT"' EXIT
+SCRATCH3=""
+trap 'rm -rf "$SCRATCH" "$SCRATCH2" "$SCRATCH3"; rm -f "$REPORT"' EXIT
 FAIL=0
 
 check() { # check <description> <jq filter that must output true>
@@ -46,6 +47,8 @@ check "kept-field warning emitted" \
     '[.warnings[]] | map(select(contains("WidgetCounter"))) | length == 1'
 check "other shared field NOT orphaned" \
     '[.symbols[].fqn] | index("Fixture.Domain.SharedService.GadgetCounter") == null'
+check "public field kept with its in-use type" \
+    '[.symbols[].fqn] | index("Fixture.Domain.SharedService.WidgetPublicTally") == null'
 check "fully-dead shared declaration deleted (whole line)" \
     '[.symbols[] | select(.fqn=="Fixture.Domain.SharedService.WidgetOnlyA") | .parts | length] | index(1) != null'
 check "broken test class deleted" \
@@ -229,6 +232,33 @@ if grep -q "AddFixtureLogging" "$SCRATCH2/Fixture/Fixture.Web/Program.cs"; then
     pass "chained untracked call survives"; else failx "chained untracked call survives"; fi
 if dotnet build "$SCRATCH2/Fixture/Fixture.sln" > /dev/null 2>&1; then
     pass "solution builds after delete"; else failx "solution builds after delete"; fi
+
+echo "== Case 8: removing a mapped member removes only its ForMember segment"
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution tests/Fixture/Fixture.sln \
+    --remove Fixture.Domain.GadgetDto.AuditNote --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+
+check "property removed" \
+    '[.symbols[] | select(.category=="removed") | .fqn] | index("Fixture.Domain.GadgetDto.AuditNote") != null'
+check "ForMember segment removal planned" \
+    '[.statements[] | select(.kind | endswith("(segment)")) | .snippet] | map(select(contains("AuditNote"))) | length == 1'
+check "whole mapping NOT removed" \
+    '[.statements[] | select(.kind == "AutoMapper.CreateMap")] | length == 0'
+check "segment warning emitted" \
+    '[.warnings[]] | map(select(startswith("map configuration removed"))) | length == 1'
+check "verification clean" '.verificationErrors == 0'
+
+SCRATCH3=$(mktemp -d)
+cp -r tests/Fixture "$SCRATCH3/Fixture"
+dotnet restore "$SCRATCH3/Fixture/Fixture.sln" > /dev/null 2>&1
+dotnet run --project src/DeadCodeCleaner -- delete --solution "$SCRATCH3/Fixture/Fixture.sln" \
+    --remove Fixture.Domain.GadgetDto.AuditNote --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED (verification rejected the plan?)"; exit 1; }
+if ! grep -q "ForMember(d => d.AuditNote)" "$SCRATCH3/Fixture/Fixture.Domain/Mapping.cs"; then
+    pass "segment deleted from the mapping"; else failx "segment deleted from the mapping"; fi
+if grep -q "ConvertVia<GadgetConverter>" "$SCRATCH3/Fixture/Fixture.Domain/Mapping.cs"; then
+    pass "rest of the mapping chain survives"; else failx "rest of the mapping chain survives"; fi
+if dotnet build "$SCRATCH3/Fixture/Fixture.sln" > /dev/null 2>&1; then
+    pass "solution builds after segment delete"; else failx "solution builds after segment delete"; fi
 
 if [ "$FAIL" = 1 ]; then echo "RESULT: FAILURES PRESENT"; exit 1; fi
 echo "RESULT: all checks passed"
