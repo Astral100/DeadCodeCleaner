@@ -14,7 +14,7 @@ public static class Sweeper
         {
             foreach (var a in rule.Antecedents)
             {
-                if (!ruleIndex.TryGetValue(a, out var list)) ruleIndex[a] = list = new List<Rule>();
+                if (!ruleIndex.TryGetValue(a, out var list)) { ruleIndex[a] = list = new List<Rule>(); }
                 list.Add(rule);
             }
         }
@@ -22,11 +22,11 @@ public static class Sweeper
 
         void Enqueue(object n)
         {
-            if (n is string s && removed.Contains(s)) return;
-            if (live.Add(n)) queue.Enqueue(n);
+            if (n is string s && removed.Contains(s)) { return; }
+            if (live.Add(n)) { queue.Enqueue(n); }
         }
 
-        foreach (var r in roots) Enqueue(r);
+        foreach (var r in roots) { Enqueue(r); }
 
         while (queue.Count > 0)
         {
@@ -34,9 +34,10 @@ public static class Sweeper
             if (n is string id)
             {
                 if (graph.Edges.TryGetValue(id, out var targets))
-                    foreach (var t in targets) Enqueue(t);
-                if (graph.ContainerOf.TryGetValue(id, out var container))
-                    Enqueue(container);
+                {
+                    foreach (var t in targets) { Enqueue(t); }
+                }
+                if (graph.ContainerOf.TryGetValue(id, out var container)) { Enqueue(container); }
             }
             if (ruleIndex.TryGetValue(n, out var rules))
             {
@@ -45,7 +46,9 @@ public static class Sweeper
                     satisfied.TryGetValue(rule, out var count);
                     satisfied[rule] = ++count;
                     if (count == rule.Antecedents.Length)
-                        foreach (var c in rule.Consequents) Enqueue(c);
+                    {
+                        foreach (var c in rule.Consequents) { Enqueue(c); }
+                    }
                 }
             }
         }

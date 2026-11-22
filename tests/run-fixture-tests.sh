@@ -63,9 +63,11 @@ check "CreateMap statement reported" \
 check "gadget CreateMap NOT reported" \
     '[.statements[].snippet] | map(select(contains("GadgetEntity"))) | length == 0'
 check "DI registration reported" \
-    '[.statements[] | select(.kind=="DI.Register") | .snippet] | map(select(contains("IWidgetService"))) | length == 1'
-check "chained registration is segment-only (untracked call survives)" \
-    '[.statements[] | select(.snippet|contains("IWidgetService")) | .wholeStatement] == [false]'
+    '[.statements[] | select(.kind=="DI.Register") | .snippet] | map(select(contains("IWidgetService"))) | length == 2'
+check "chained registration is segment-only, typeof registration whole" \
+    '[.statements[] | select(.snippet|contains("IWidgetService")) | .wholeStatement] == [false, true]'
+check "typeof registration reported dead (not pinned by the bound tree)" \
+    '[.statements[].snippet] | map(select(contains("typeof(IWidgetService)"))) | length == 1'
 check "Widgets.cs deletable in full" \
     '[.deletableFiles[]] | map(select(endswith("Widgets.cs"))) | length == 1'
 check "Controllers.cs NOT deletable" \
@@ -84,8 +86,18 @@ check "WidgetExtra orphaned (inactive-region trap armed)" \
     "$orph | index(\"Fixture.Domain.WidgetExtra\") != null"
 check "file with inactive #if region NOT deletable" \
     '[.deletableFiles[]] | map(select(endswith("Conditional.cs"))) | length == 0'
-check "inactive-region warning emitted" \
-    '[.warnings[]] | map(select(contains("inactive #if"))) | length == 1'
+check "inactive-region file-kept warning emitted" \
+    '[.warnings[]] | map(select(contains("file kept (contains inactive"))) | length == 1'
+check "deleted symbol mentioned in inactive #if code warns" \
+    '[.warnings[]] | map(select(contains("mentioned in inactive #if"))) | length >= 1'
+check "record with orphaned primary ctor survives whole" \
+    '[.symbols[].fqn] | map(select(startswith("Fixture.Domain.WidgetTag"))) | length == 0'
+check "base ctor called via primary base call survives" \
+    '[.symbols[].fqn] | map(select(startswith("Fixture.Domain.TagHolder"))) | length == 0'
+check "attribute used on enum member survives" \
+    '[.symbols[].fqn] | index("Fixture.Domain.EnumNoteAttribute") == null'
+check "internal Deconstruct survives (pattern member kept with type)" \
+    '[.symbols[].fqn] | index("Fixture.Domain.GadgetDto.Deconstruct") == null'
 check "broken test method deleted from mixed class" \
     '[.symbols[] | select(.category=="broken-test") | .fqn] | index("Fixture.Tests.MixedTests.GetWidget_when_controller_is_removed_then_this_test_breaks") != null'
 check "healthy sibling test and its class survive" \
@@ -151,8 +163,13 @@ dotnet run --project src/DeadCodeCleaner -- mark --solution "$SCRATCH/Fixture/Fi
 S2=$(snapshot)
 if [ "$S1" = "$S2" ]; then
     pass "mark is idempotent (second run changes nothing)"; else failx "mark is idempotent (second run changes nothing)"; fi
+if dotnet run --project src/DeadCodeCleaner -- delete --solution "$SCRATCH/Fixture/Fixture.sln" \
+    --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1; then
+    failx "delete refuses while review-flagged tests exist"; else pass "delete refuses while review-flagged tests exist"; fi
+if [ -f "$SCRATCH/Fixture/Fixture.Domain/Widgets.cs" ]; then
+    pass "refusal left all files in place"; else failx "refusal left all files in place"; fi
 dotnet run --project src/DeadCodeCleaner -- delete --solution "$SCRATCH/Fixture/Fixture.sln" \
-    --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED"; exit 1; }
+    --remove Fixture.Web.WidgetsController --delete-review-tests --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED"; exit 1; }
 if ! grep -rq --include='*.cs' --include='*.csproj' "todo: to be deleted" "$SCRATCH/Fixture"; then
     pass "no markers left after delete"; else failx "no markers left after delete"; fi
 if [ ! -f "$SCRATCH/Fixture/Fixture.Domain/Widgets.cs" ]; then
@@ -181,17 +198,17 @@ dotnet run --project src/DeadCodeCleaner -- analyze \
     --solution tests/Fixture/Fixture.sln \
     --remove Fixture.Domain.WidgetService --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
 
-check "registration reported dead although its service survives" \
-    '[.statements[] | select(.snippet|contains("IWidgetService"))] | length == 1'
-check "deleted-but-in-use registration warning emitted" \
-    '[.warnings[]] | map(select(startswith("registration deleted although still in use"))) | length == 1'
+check "registrations reported dead although their service survives" \
+    '[.statements[] | select(.snippet|contains("IWidgetService"))] | length == 2'
+check "deleted-but-in-use registration warnings emitted" \
+    '[.warnings[]] | map(select(startswith("registration deleted although still in use"))) | length == 2'
 
 SCRATCH2=$(mktemp -d)
 cp -r tests/Fixture "$SCRATCH2/Fixture"
 dotnet restore "$SCRATCH2/Fixture/Fixture.sln" > /dev/null 2>&1
 dotnet run --project src/DeadCodeCleaner -- delete --solution "$SCRATCH2/Fixture/Fixture.sln" \
     --remove Fixture.Domain.WidgetService --remove Fixture.Domain.WidgetKind.Fancy \
-    --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED (verification rejected the plan?)"; exit 1; }
+    --delete-review-tests --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED (verification rejected the plan?)"; exit 1; }
 if ! grep -q "    Fancy" "$SCRATCH2/Fixture/Fixture.Domain/Shapes.cs"; then
     pass "enum member deleted"; else failx "enum member deleted"; fi
 if grep -q "Legacy," "$SCRATCH2/Fixture/Fixture.Domain/Shapes.cs"; then

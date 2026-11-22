@@ -21,6 +21,7 @@ public static class Constants
     public const int ReviewNoteMaxLength = 120;
     public const int SlnRemoveTimeoutMs = 60_000;
     public const int VerifyShownErrors = 20;
+    public const int ShownInactiveMentions = 10;
 
     public const string CategoryRemoved = "removed";
     public const string CategoryOrphaned = "orphaned";
@@ -31,6 +32,10 @@ public static class Constants
     public const string ReasonAutoMapperProfile = "AutoMapper profile";
     public const string ReasonAutofacModule = "Autofac module";
     public const string CreateMapMethodName = "CreateMap";
+
+    /// <summary>File paths are case-insensitive on Windows (linked files can be written with another
+    /// casing) but case-sensitive on Linux, where Foo.cs and foo.cs are different files.</summary>
+    public static readonly StringComparer PathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     public static readonly HashSet<string> AutofacRegisterMethodNames = new(StringComparer.Ordinal)
     {
@@ -81,7 +86,8 @@ public static class Constants
     };
 
     /// <summary>Members kept while their type is in use: pattern-based language features and framework
-    /// callbacks reference these without a resolvable identifier in syntax.</summary>
+    /// callbacks reference these without a resolvable identifier in syntax. The language patterns
+    /// require accessibility, not "public", so accessibility is not checked here.</summary>
     public static readonly HashSet<string> KeepAliveMemberNames = new(StringComparer.Ordinal)
     {
         "GetEnumerator", "MoveNext", "Current", "GetAwaiter", "GetResult", "IsCompleted",

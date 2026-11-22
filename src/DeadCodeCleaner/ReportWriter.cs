@@ -17,7 +17,7 @@ public static class ReportWriter
         Console.WriteLine($"In use   : {s.InUseBaseline} baseline -> {s.InUseAfterRemoval} after removal ({s.AlreadyOrphanedBefore} were already orphaned before and are left untouched)");
 
         Section("Files deletable in full", report.DeletableFiles.Count);
-        foreach (var f in report.DeletableFiles.Take(limit)) Console.WriteLine($"  {f}");
+        foreach (var f in report.DeletableFiles.Take(limit)) { Console.WriteLine($"  {f}"); }
         More(report.DeletableFiles.Count, limit);
 
         PrintCategory(report, Constants.CategoryRemoved, "Requested removals", limit);
@@ -28,41 +28,45 @@ public static class ReportWriter
 
         Section("Statements to remove (DI registrations, mappings)", report.Statements.Count);
         foreach (var st in report.Statements.Take(limit))
+        {
             Console.WriteLine($"  {st.File}:{st.StartLine}  [{st.Kind}]  {st.Snippet}");
+        }
         More(report.Statements.Count, limit);
 
         if (report.DeletableProjects.Count > 0)
         {
             Section("Projects deletable in full (removed from solution)", report.DeletableProjects.Count);
-            foreach (var p in report.DeletableProjects) Console.WriteLine($"  {p.Project}  ({p.CsprojPath})");
+            foreach (var p in report.DeletableProjects) { Console.WriteLine($"  {p.Project}  ({p.CsprojPath})"); }
         }
         if (report.PackageRefRemovals.Count > 0)
         {
             Section("NuGet package references to remove", report.PackageRefRemovals.Count);
-            foreach (var r in report.PackageRefRemovals) Console.WriteLine($"  {r.Project}: {r.Reference}");
+            foreach (var r in report.PackageRefRemovals) { Console.WriteLine($"  {r.Project}: {r.Reference}"); }
         }
         if (report.ProjectRefRemovals.Count > 0)
         {
             Section("Project references to remove", report.ProjectRefRemovals.Count);
-            foreach (var r in report.ProjectRefRemovals) Console.WriteLine($"  {r.Project}: -> {r.Reference}");
+            foreach (var r in report.ProjectRefRemovals) { Console.WriteLine($"  {r.Project}: -> {r.Reference}"); }
         }
         if (report.CompileEntryRemovals.Count > 0)
         {
             Section("Old-style <Compile> entries to remove (their files are deleted)", report.CompileEntryRemovals.Count);
-            foreach (var r in report.CompileEntryRemovals) Console.WriteLine($"  {r.Project}: {r.Reference}");
+            foreach (var r in report.CompileEntryRemovals) { Console.WriteLine($"  {r.Project}: {r.Reference}"); }
         }
         if (report.UsingRemovals.Count > 0)
         {
             Section("Using directives to remove (their assemblies are going away)", report.UsingRemovals.Count);
             foreach (var u in report.UsingRemovals.Take(limit))
+            {
                 Console.WriteLine($"  {u.File}:{u.Line}  using {u.Namespace};");
+            }
             More(report.UsingRemovals.Count, limit);
         }
 
         if (report.Warnings.Count > 0)
         {
             Section("Warnings", report.Warnings.Count);
-            foreach (var w in report.Warnings.Take(limit)) Console.WriteLine($"  {w}");
+            foreach (var w in report.Warnings.Take(limit)) { Console.WriteLine($"  {w}"); }
         }
         Console.WriteLine("=======================================================");
     }
@@ -70,7 +74,7 @@ public static class ReportWriter
     static void PrintCategory(DeletionReport report, string category, string title, int limit)
     {
         var items = report.Symbols.Where(x => x.Category == category).ToList();
-        if (items.Count == 0 && category != Constants.CategoryOrphaned) return;
+        if (items.Count == 0 && category != Constants.CategoryOrphaned) { return; }
         Section(title, items.Count);
         foreach (var item in items.Take(limit))
         {
@@ -91,7 +95,7 @@ public static class ReportWriter
 
     static void More(int total, int limit)
     {
-        if (total > limit) Console.WriteLine($"  ... and {total - limit} more (use --verbose or the JSON report)");
+        if (total > limit) { Console.WriteLine($"  ... and {total - limit} more (use --verbose or the JSON report)"); }
     }
 
     public static void WriteJson(DeletionReport report, string path)

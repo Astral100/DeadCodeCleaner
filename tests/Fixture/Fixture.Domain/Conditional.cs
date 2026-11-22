@@ -15,7 +15,7 @@ public class HiddenLegacy
 {
     public string Hidden()
     {
-        return "hidden";
+        return new WidgetExtra().Tag();
     }
 }
 #endif

@@ -46,6 +46,10 @@ public class WidgetService : IWidgetService
         var bag = new GadgetBag();
         bag.Add(new GadgetEntity());
         _ = bag;
+        // Same trap for Deconstruct: this explicit call dies, and the deconstruction syntax in
+        // GadgetService (no identifier) must then keep it alive on its own.
+        new GadgetDto().Deconstruct(out var deconA, out var deconB);
+        _ = deconA + deconB;
         return SharedService.Prefix() + "widget";
     }
 }

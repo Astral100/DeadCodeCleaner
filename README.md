@@ -13,9 +13,13 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
    the same node. References are collected from BOTH the syntax tree and the compiler's bound tree
    (IOperation), so constructs with no identifier in source still count: LINQ query syntax,
    collection-initializer `Add`, `x?[0]`, object/element initializers, user-defined operators and
-   conversions, `var`-inferred types. Compile-only dependencies are edges too: an `override` keeps
+   conversions, `var`-inferred types, deconstruction, enum-member attributes, and a primary
+   constructor's `: Base(x)` call. Compile-only dependencies are edges too: an `override` keeps
    its base member alive, an explicit interface implementation keeps the interface member alive.
-   Assembly-level attributes root everything they reference.
+   Assembly-level attributes root everything they reference. Pattern members the language reaches
+   without identifiers (`Deconstruct`, `Dispose`, `GetEnumerator`, ...) are kept with their type
+   whatever their accessibility. A primary constructor is never tracked as a deletable symbol of
+   its own — its declaring syntax IS the type declaration, so uses of it count as uses of the type.
 2. Entry points ("roots") are detected: `Main`, controllers (name or base class), hosted services,
    `Startup`/`Program`, AutoMapper profiles, Autofac modules, plus anything matched by the config's
    `keep` patterns.
@@ -23,10 +27,12 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
    targets treated as deleted. The difference is the complete cascade. Code unreachable in the
    baseline is pre-existing dead code and is never reported.
 4. **The compiler referees the result**: the whole deletion plan is applied to the sources in
-   memory, the affected projects are recompiled, and every compile error that was not there before
-   is reported as a `VERIFY` warning. `delete` refuses to touch the disk while any exist
-   (`--no-verify` overrides). Over-deletion therefore cannot slip through silently even where the
-   analysis has a blind spot.
+   memory — code spans deleted, files and projects removed, project references dropped, and the
+   assemblies of removed packages stripped from the compilations — the affected projects are
+   recompiled, and every compile error that was not there before is reported as a `VERIFY`
+   warning (errors are counted per message, so a new error identical to a pre-existing one still
+   registers). `delete` refuses to touch the disk while any exist (`--no-verify` overrides).
+   Over-deletion therefore cannot slip through silently even where the analysis has a blind spot.
 
 ### Indirect dependencies
 
@@ -41,8 +47,9 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   `ReverseMap` and Autofac's lifetime calls count as part of theirs); otherwise only the dead call's
   chain segment is removed (`services.AddScoped<IA,A>().AddLogging()` keeps `AddLogging`, and
   `return services.AddScoped<IA,A>();` keeps the `return`). A registration that is the body of a
-  braceless `if`/loop takes the whole construct with it; one inside an if/else branch or a lambda is
-  reported as a warning for manual removal instead. References inside a map's `ForMember` lambdas
+  braceless `if`/loop takes the whole construct with it — unless the construct's condition or
+  header has side effects (a call, assignment, or increment), which, like an if/else branch or a
+  lambda, is reported as a warning for manual removal instead. References inside a map's `ForMember` lambdas
   belong to the statement, not the profile, so they cannot keep the mapped types alive forever. A
   statement whose text references deleted code dies with it in every case: removing an
   implementation type takes its registration along even while the service interface stays in use
@@ -50,8 +57,11 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
 - **Empty containers**: an AutoMapper profile or Autofac module whose every mapping/registration
   died (and that nothing surviving references) is deleted whole.
 - **Build plumbing cascades too**: a NuGet `PackageReference` or `ProjectReference` whose last
-  surviving user was deleted is removed from the csproj; `using` directives that no assembly can
-  satisfy any more are removed; a project whose every declaration is deleted is removed from the
+  surviving user was deleted is removed from the csproj (entries under a `Condition` are left in
+  place with a warning — only one build configuration is analyzed); `using` directives that no
+  assembly can satisfy any more are removed (matched under their RESOLVED names, so `using Sub;`
+  inside `namespace A` means `A.Sub`; a file banner above the first using is never deleted with
+  it); a project whose every declaration is deleted is removed from the
   solution and its csproj deleted (directory too, when nothing but code remained). Transitive
   reachability is respected for both kinds and ACROSS projects — SDK-style references are
   transitive, so a reference in project B is kept when a dependent project A reaches code or
@@ -70,6 +80,12 @@ deleted test that *also* touches surviving production code is flagged `[REVIEW]`
 never takes its healthy siblings along: the class is deleted only when every test in it died. Code
 in a project the heuristics classify as test (e.g. "TestCommon") that production actually uses is
 treated as production.
+
+`delete` REFUSES to run while any `[REVIEW]` test exists, because whether such a test should be
+salvaged is a judgment call: run `analyze` or `mark` first, let a human or an LLM rewrite the
+flagged tests to drop the deleted references and keep the assertions that still matter (the tool
+re-analyzes on every run, so adjusted tests simply survive), then run `delete` again. Pass
+`--delete-review-tests` to delete them as-is instead.
 
 ### Pre-existing orphans that reference deleted code
 
@@ -104,7 +120,7 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   `#if` regions (code the compiler cannot see). Deleting an enum member takes its separator comma;
   deleting a partial method/property deletes BOTH parts; old-style csproj `<Compile>` entries of
   deleted files are removed too. `delete` refuses to run while verification reports new compile
-  errors.
+  errors, and while review-flagged tests exist (`--delete-review-tests` overrides the latter).
 - `--config cfg.json` supports `{ "keep": ["Ns.Something*", ...], "strictMembers": false }` —
   `keep` patterns are extra entry points that are never orphaned (use for reflection-only code).
 - By default, public properties and enum members of in-use types are kept (serializers and model
@@ -115,21 +131,28 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 - References the compiler cannot see are invisible: reflection by string, routes referenced from
   JavaScript, `web.config`/XML wiring, `RedirectToAction("X", "Y")` strings, Razor views. A warning
   is emitted when such files exist in the solution. Use the config `keep` list for such roots, and
-  treat the report as a very strong draft, not gospel.
+  treat the report as a very strong draft, not gospel. Code inside inactive `#if` regions is
+  equally invisible (to the analysis AND the verifier, which compiles with the same symbols): when
+  a deleted symbol's name still appears in such a region, a warning names it.
 - A factory lambda inside a DI registration (`AddScoped<IFoo>(sp => new Foo())`) keeps `Foo` in use
   even when the registration dies.
 - A field in a multi-variable declaration (`int a, b;`): when every sibling is orphaned too the
   whole line is deleted; when a sibling is still in use the orphaned field is KEPT in place and a
-  "kept in place" warning is emitted (it becomes a pre-existing orphan for future runs).
+  "kept in place" warning is emitted (it becomes a pre-existing orphan for future runs). An
+  orphaned positional record property (declared by a parameter) is kept in place the same way.
+- A csproj element sharing a line with anything else (a sibling element, the ItemGroup tags) is
+  never edited — a warning asks for manual removal, since the edits are line-granular.
 - `packages.config` projects get no package cleanup (a warning says so). Multi-targeting projects
   are analyzed for their first target framework only (warned). On Windows, run against net47
   solutions with Visual Studio MSBuild installed; `MSBuildLocator` finds it automatically.
 
 ## Tests
 
-`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (70 checks covering
-MediatR, AutoMapper (incl. `ForMember` chains), DI, test poisoning, broken-test isolation,
-pre-existing orphans, member/overload-level removal, project-reference cleanup, chain-segment
-deletion, override and partial-method survival, enum-member removal, collection-initializer and
-assembly-attribute edges, inactive `#if` protection, the still-referenced warning, the in-memory
-verification, mark idempotency, and two delete round-trips that must rebuild).
+`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (78 checks covering
+MediatR, AutoMapper (incl. `ForMember` chains), DI (generic and `typeof` forms), test poisoning,
+broken-test isolation, pre-existing orphans, member/overload-level removal, project-reference
+cleanup, chain-segment deletion, override and partial-method survival, enum-member removal,
+collection-initializer, deconstruction, enum-member-attribute and assembly-attribute edges,
+primary-constructor and primary-base-call safety, inactive `#if` protection and its mention
+warning, the still-referenced warning, the in-memory verification, the review-test delete refusal,
+mark idempotency, and two delete round-trips that must rebuild).

@@ -7,7 +7,7 @@ public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
-        if (!MSBuildLocator.IsRegistered) MSBuildLocator.RegisterDefaults();
+        if (!MSBuildLocator.IsRegistered) { MSBuildLocator.RegisterDefaults(); }
         var exitCode = await Run(args);
         return exitCode;
     }
@@ -61,7 +61,9 @@ public static class Program
                     .Take(Constants.FindMatchLimit)
                     .ToList();
                 foreach (var (fqn, symbol) in matches)
+                {
                     Console.WriteLine($"{SymbolNames.Kind(symbol),-11} {fqn}");
+                }
                 Console.WriteLine($"({matches.Count} match(es))");
                 return 0;
             }
@@ -76,6 +78,12 @@ public static class Program
                     Editor.Mark(report, log);
                     break;
                 case "delete":
+                    var reviewTests = report.Symbols.Count(s => s.Review);
+                    if (reviewTests > 0 && !opts.DeleteReviewTests)
+                    {
+                        Console.Error.WriteLine($"error: {reviewTests} test(s) to be deleted also reference surviving code (see the [REVIEW] entries) — adjust or remove them first, or pass --delete-review-tests to delete them as-is; nothing was deleted");
+                        return 1;
+                    }
                     if (report.VerificationErrors > 0)
                     {
                         Console.Error.WriteLine($"error: verification found {report.VerificationErrors} new compile error(s) in the deletion plan — nothing was deleted (see the VERIFY warnings; --no-verify overrides)");
@@ -102,14 +110,16 @@ public static class Program
         {
             opts.Mode = args[0].ToLowerInvariant();
             if (opts.Mode is not ("analyze" or "mark" or "delete" or "find"))
+            {
                 throw new ArgumentException($"unknown mode '{args[0]}' (expected analyze | mark | delete | find)");
+            }
             i = 1;
         }
         for (; i < args.Length; i++)
         {
             string Next()
             {
-                if (++i < args.Length) return args[i];
+                if (++i < args.Length) { return args[i]; }
                 throw new ArgumentException($"missing value after {args[i - 1]}");
             }
             switch (args[i])
@@ -121,15 +131,20 @@ public static class Program
                 case "--config": opts.ConfigPath = Path.GetFullPath(Next()); break;
                 case "--strict-members": opts.StrictMembers = true; break;
                 case "--no-verify": opts.NoVerify = true; break;
+                case "--delete-review-tests": opts.DeleteReviewTests = true; break;
                 case "--verbose" or "-v": opts.Verbose = true; break;
                 default: throw new ArgumentException($"unknown option '{args[i]}'");
             }
         }
-        if (opts.SolutionPath == null) throw new ArgumentException("--solution is required");
+        if (opts.SolutionPath == null) { throw new ArgumentException("--solution is required"); }
         if (opts.Mode == "find" && opts.FindSubstring == null)
+        {
             throw new ArgumentException("find mode requires --find <substring>");
+        }
         if (opts.Mode is "mark" or "delete" && opts.RemoveTargets.Count == 0)
+        {
             throw new ArgumentException($"{opts.Mode} mode requires at least one --remove target");
+        }
         return opts;
     }
 
@@ -143,11 +158,12 @@ public static class Program
               DeadCodeCleaner find    --solution <path.sln> --find <substring>   (look up symbol names)
 
             Options:
-              --json <path>      where to write the JSON report (default ./deadcode-report.json)
-              --config <path>    JSON config: { "keep": ["Ns.Type*", ...], "strictMembers": false }
-              --strict-members   do not auto-keep public properties / enum members of in-use types
-              --no-verify        skip the in-memory rebuild that checks the plan compiles
-              --verbose          print full lists instead of the first 100
+              --json <path>           where to write the JSON report (default ./deadcode-report.json)
+              --config <path>         JSON config: { "keep": ["Ns.Type*", ...], "strictMembers": false }
+              --strict-members        do not auto-keep public properties / enum members of in-use types
+              --no-verify             skip the in-memory rebuild that checks the plan compiles
+              --delete-review-tests   delete review-flagged tests too (default: delete refuses while any exist)
+              --verbose               print full lists instead of the first 100
 
             The FQN format is Namespace.Type.Member without parameters, e.g.
               Roar.Infrastructure.WebBase.Controllers.AdminController.GetRoleActionList

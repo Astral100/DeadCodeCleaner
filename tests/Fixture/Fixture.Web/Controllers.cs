@@ -28,11 +28,15 @@ public class WidgetsController
     }
 
     // Uses Render through the BASE type, the partial method, the conditional file's class, and the
-    // marker attribute: all must be handled correctly when this controller is removed.
+    // marker attribute: all must be handled correctly when this controller is removed. Also the
+    // ONLY code constructing WidgetTag and TagHolder, and the only [EnumNote] use outside the enum.
     [FixtureMarker]
+    [EnumNote]
     public string GetWidgetBadge(ShapeBase shape)
     {
-        return shape.Render() + new WidgetFormatter().FormatWidget() + new WidgetExtra().Tag();
+        var holder = new TagHolder("badge");
+        _ = holder;
+        return shape.Render() + new WidgetFormatter().FormatWidget() + new WidgetExtra().Tag() + new WidgetTag("w").Show();
     }
 
     // Overload with its own private dependency: removable individually by signature.
@@ -62,7 +66,14 @@ public class GadgetsController
     public string GetGadget()
     {
         return SharedService.Prefix() + _svc.Describe() + new GadgetDto().Label + SharedService.GadgetCounter
-            + new Circle().Render() + new WidgetFormatter().Plain() + WidgetKind.Basic;
+            + new Circle().Render() + new WidgetFormatter().Plain() + WidgetKind.Basic + new NamedTagHolder("n").Name();
+    }
+
+    // Keeps WidgetTag in use AS A TYPE without ever constructing it: removing the other controller
+    // orphans only the constructor, and that must not delete the record.
+    public string DescribeTag(WidgetTag tag)
+    {
+        return tag.Show();
     }
 }
 

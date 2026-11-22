@@ -2,6 +2,7 @@
 
 - No `Async` suffix on async method names. `GetInstalledModels`, not `GetInstalledModelsAsync`.
 - Every method has a braced body. Never use expression-bodied methods (`=>`).
+- Every control-flow construct (`if`, `else`, `for`, `foreach`, `while`, `do`, `using`, `lock`) has a braced body. No one-line unbraced statements like `if (x) continue;`.
 - Keep statements on one line, unless the line is genuinely long (roughly over 150-170 characters); past that point, split it structurally. Method signatures stay on one line. A log call stays on one line up to a message of roughly 300-400 characters; past that, split it into multiple log calls.
 - Compare strings with `==` and `!=`. Never `string.Equals`, and no `ToLower`/`ToUpper` unless genuinely necessary.
 - Don't use `string.Compare`/`string.CompareOrdinal` unless a case genuinely requires it.

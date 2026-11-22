@@ -10,6 +10,8 @@ public static class Program
         // Chained with an UNTRACKED call: deleting the registration must keep AddFixtureLogging().
         services.AddScoped<IWidgetService, WidgetService>().AddFixtureLogging();
         services.AddScoped<IGadgetService, GadgetService>();
+        // typeof form: the types must not be pinned by the bound-tree walk, or this can never be cleaned up.
+        services.AddScoped(typeof(IWidgetService), typeof(WidgetService));
     }
 }
 
@@ -17,6 +19,11 @@ public static class Program
 public class ServiceCollection
 {
     public ServiceCollection AddScoped<TService, TImplementation>() where TImplementation : TService
+    {
+        return this;
+    }
+
+    public ServiceCollection AddScoped(Type service, Type implementation)
     {
         return this;
     }

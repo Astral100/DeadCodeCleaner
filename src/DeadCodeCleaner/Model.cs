@@ -88,10 +88,13 @@ public sealed class Graph
     public List<UsingRef> UsingRefs { get; } = new();
     /// <summary>Files carrying non-symbol top-level content (global usings, assembly attributes,
     /// extern aliases) that must never be deleted whole.</summary>
-    public HashSet<string> FilesWithTopLevelContent { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> FilesWithTopLevelContent { get; } = new(Constants.PathComparer);
     /// <summary>Files containing inactive #if regions: the compiler cannot see that code, so these
     /// files must never be deleted whole.</summary>
-    public HashSet<string> FilesWithInactiveCode { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> FilesWithInactiveCode { get; } = new(Constants.PathComparer);
+    /// <summary>File -> the text of its inactive #if regions, for warning when a deleted symbol's
+    /// name still appears in code the compiler cannot see.</summary>
+    public Dictionary<string, string> DisabledTexts { get; } = new(Constants.PathComparer);
     /// <summary>Project name -> external assemblies referenced from places that always survive
     /// (assembly-level attributes): their packages must never be removed.</summary>
     public Dictionary<string, HashSet<string>> ProjectExternalRefs { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -100,21 +103,27 @@ public sealed class Graph
     public void AddProjectExternalRef(string projectName, string assemblyName)
     {
         if (!ProjectExternalRefs.TryGetValue(projectName, out var set))
+        {
             ProjectExternalRefs[projectName] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
         set.Add(assemblyName);
     }
 
     public void AddExternalRef(string nodeId, string assemblyName)
     {
         if (!ExternalRefs.TryGetValue(nodeId, out var set))
+        {
             ExternalRefs[nodeId] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
         set.Add(assemblyName);
     }
 
     public void AddNodeProject(string nodeId, string projectName)
     {
         if (!ProjectsOf.TryGetValue(nodeId, out var set))
+        {
             ProjectsOf[nodeId] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
         set.Add(projectName);
     }
 
@@ -126,23 +135,25 @@ public sealed class Graph
 
     public void AddEdge(string from, string to)
     {
-        if (from == to) return;
+        if (from == to) { return; }
         if (!Edges.TryGetValue(from, out var set))
+        {
             Edges[from] = set = new HashSet<string>(StringComparer.Ordinal);
-        if (set.Add(to)) EdgeCount++;
+        }
+        if (set.Add(to)) { EdgeCount++; }
     }
 
     public void AddRoot(string id, string reason, bool isTest)
     {
         var target = isTest ? TestRoots : Roots;
-        if (target.Add(id) && !RootReasons.ContainsKey(id)) RootReasons[id] = reason;
+        if (target.Add(id) && !RootReasons.ContainsKey(id)) { RootReasons[id] = reason; }
     }
 
     public void AddRule(IEnumerable<object> antecedents, IEnumerable<object> consequents, string note = null)
     {
         var ants = antecedents.Distinct(NodeComparer.Instance).ToArray();
         var cons = consequents.ToArray();
-        if (ants.Length == 0 || cons.Length == 0) return;
+        if (ants.Length == 0 || cons.Length == 0) { return; }
         Rules.Add(new Rule { Antecedents = ants, Consequents = cons, Note = note });
     }
 }
@@ -153,9 +164,14 @@ public sealed class UsingRef
     public required string Project { get; init; }
     public required string File { get; init; }
     public required int Line { get; init; }        // 1-based
+    /// <summary>The name as written in source (for display).</summary>
     public required string Namespace { get; init; }
+    /// <summary>The resolved full namespace or type name: "using Sub;" inside namespace A resolves
+    /// to "A.Sub", and liveness must be looked up under that name, not the written one.</summary>
+    public required string ResolvedName { get; init; }
     public required HashSet<string> Providers { get; init; }
-    /// <summary>Char span of the directive incl. leading trivia, with leading #directives excluded.</summary>
+    /// <summary>Char span of the directive: its own line(s) plus leading trivia up to the line start,
+    /// with leading #directives and file banners excluded.</summary>
     public required int SpanStart { get; init; }
     public required int SpanLength { get; init; }
 }
@@ -169,6 +185,11 @@ public sealed class ProjectInfo
     public List<string> PackageReferences { get; } = new();
     /// <summary>Referenced project name -> Include path as written in the csproj.</summary>
     public Dictionary<string, string> ProjectReferences { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Packages declared under a Condition (build-configuration dependent): only the first
+    /// configuration was analyzed, so these are never removed automatically.</summary>
+    public HashSet<string> ConditionalPackages { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Include paths (slash-normalized) of ProjectReferences declared under a Condition.</summary>
+    public HashSet<string> ConditionalProjectRefIncludes { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Explicit &lt;Compile Include&gt; items as written (old-style csproj): entries of
     /// deleted files must be removed with the files.</summary>
     public List<string> CompileItems { get; } = new();
@@ -219,4 +240,7 @@ public sealed class CliOptions
     public bool Verbose;
     public bool StrictMembers;
     public bool NoVerify;
+    /// <summary>Delete review-flagged tests (tests that also reference surviving code) without
+    /// refusing. Default: delete mode stops while any exist, so they can be adjusted first.</summary>
+    public bool DeleteReviewTests;
 }
