@@ -58,6 +58,12 @@ public class GadgetsController
 {
     private readonly IGadgetService _svc;
 
+    public string DescribeDynamically(object source)
+    {
+        dynamic d = source;
+        return (string)d.Describe();
+    }
+
     public GadgetsController(IGadgetService svc)
     {
         _svc = svc;

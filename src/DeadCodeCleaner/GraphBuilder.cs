@@ -136,6 +136,11 @@ public sealed class GraphBuilder
                 && TryGetChain(es.Expression, out var chain) && chain.All(ai.Claimed.Contains);
             foreach (var s in ai.Statements) { s.WholeAnchorAllowed = allowed && s.ManualReason == null; }
         }
+
+        if (_graph.AssemblyScanSite != null)
+        {
+            _graph.Warnings.Add($"solution registers services by assembly scanning ({_graph.AssemblyScanSite}) — scanned implementations are INVISIBLE to this analysis; add keep patterns for them before trusting the report");
+        }
         return _graph;
     }
 
@@ -169,28 +174,77 @@ public sealed class GraphBuilder
     void WarnAboutNonCompiledContent()
     {
         int found = 0;
-        var scanned = new HashSet<string>(Constants.PathComparer);
+        var seenFiles = new HashSet<string>(Constants.PathComparer);
+        var textsByDir = new Dictionary<string, List<(string File, string Text)>>(Constants.PathComparer);
         foreach (var pinfo in _graph.Projects.Values)
         {
             var dir = Path.GetDirectoryName(pinfo.FilePath);
-            if (dir == null || !scanned.Add(dir)) { continue; }
-            try
+            if (dir == null) { continue; }
+            if (!textsByDir.TryGetValue(dir, out var texts))
             {
-                foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                textsByDir[dir] = texts = new List<(string, string)>();
+                try
                 {
-                    var sep = Path.DirectorySeparatorChar;
-                    if (f.Contains($"{sep}bin{sep}") || f.Contains($"{sep}obj{sep}")) { continue; }
-                    if (Constants.NonCompiledContentExtensions.Contains(Path.GetExtension(f))) { found++; }
+                    foreach (var f in EnumerateFilesPruned(dir))
+                    {
+                        if (Constants.NonCompiledContentExtensions.Contains(Path.GetExtension(f)) && seenFiles.Add(f)) { found++; }
+                        if (IsConfigLikeFile(f)) { texts.Add((f, ReadConfigText(f))); }
+                    }
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    // Unreadable directory: content scan is best-effort.
                 }
             }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                // Unreadable directory: content scan is best-effort.
-            }
+            _graph.ConfigTextsByProject[pinfo.Name] = texts;
         }
         if (found > 0)
         {
-            _graph.Warnings.Add($"solution contains {found} non-compiled content file(s) (views / WebForms / config wiring) — references from them are INVISIBLE to this analysis; review the report before deleting");
+            _graph.Warnings.Add($"solution contains {found} non-compiled content file(s) (views / WebForms / XAML / service wiring) — references from them are INVISIBLE to this analysis; review the report before deleting");
+        }
+    }
+
+    /// <summary>Every file under <paramref name="dir"/>, skipping build-output and tooling
+    /// directories (bin, obj, node_modules, ...).</summary>
+    IEnumerable<string> EnumerateFilesPruned(string dir)
+    {
+        var stack = new Stack<string>();
+        stack.Push(dir);
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            foreach (var sub in Directory.EnumerateDirectories(cur))
+            {
+                if (!Constants.SkippedScanDirectories.Contains(Path.GetFileName(sub))) { stack.Push(sub); }
+            }
+            foreach (var f in Directory.EnumerateFiles(cur)) { yield return f; }
+        }
+    }
+
+    /// <summary>Config-like files that can wire up types and packages by name: .config, and .json
+    /// except NuGet/tooling artifacts and this tool's own report.</summary>
+    bool IsConfigLikeFile(string path)
+    {
+        var ext = Path.GetExtension(path);
+        if (string.Equals(ext, ".config", StringComparison.OrdinalIgnoreCase)) { return true; }
+        if (!string.Equals(ext, ".json", StringComparison.OrdinalIgnoreCase)) { return false; }
+        var name = Path.GetFileName(path);
+        if (string.Equals(name, Constants.DefaultReportFileName, StringComparison.OrdinalIgnoreCase)) { return false; }
+        if (name.EndsWith(".assets.json", StringComparison.OrdinalIgnoreCase)) { return false; }
+        return true;
+    }
+
+    string ReadConfigText(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            if (fi.Length > Constants.MaxScannedConfigFileBytes) { return ""; }
+            return File.ReadAllText(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return "";
         }
     }
 
@@ -244,6 +298,7 @@ public sealed class GraphBuilder
                 Providers = providers,
                 SpanStart = spanStart,
                 SpanLength = u.FullSpan.End - spanStart,
+                FileTextLength = sourceText.Length,
             });
         }
     }
@@ -367,6 +422,18 @@ public sealed class GraphBuilder
             // the declaration facts, but every project records membership (for reference cleanup).
             bool firstSeen = _graph.Nodes.Add(typeId);
             _graph.AddNodeProject(typeId, projectName);
+            if (!firstSeen)
+            {
+                // A second declaration of an already-known full name in a DIFFERENT file: the graph
+                // only tracks the first symbol's files, so this file's whole-file accounting is
+                // incomplete and it must never be deleted whole.
+                var knownPaths = new HashSet<string>(_graph.Decl[typeId].DeclaringSyntaxReferences.Select(r => r.SyntaxTree.FilePath), Constants.PathComparer);
+                foreach (var dr in type.DeclaringSyntaxReferences)
+                {
+                    var fp = dr.SyntaxTree.FilePath;
+                    if (!string.IsNullOrEmpty(fp) && !knownPaths.Contains(fp)) { _graph.FilesWithDuplicateDecls.Add(fp); }
+                }
+            }
             if (firstSeen)
             {
                 _graph.Decl[typeId] = type;
@@ -468,16 +535,18 @@ public sealed class GraphBuilder
                     || Constants.KeepAliveMemberNames.Contains(mm.Name);
                 if (keep) { _graph.AddRule(one, new object[] { mId }, "kept with type"); }
             }
+            else if (m is IPropertySymbol np && Constants.KeepAliveMemberNames.Contains(np.Name))
+            {
+                // Pattern properties (Current, IsCompleted) stay with the type in EVERY mode: the
+                // language reaches them without identifiers, whatever their accessibility.
+                _graph.AddRule(one, new object[] { mId }, "kept with type");
+            }
             else if (!_config.StrictMembers)
             {
                 // Serializers / model binding / data binding reach these via reflection.
                 bool keep = (m is IPropertySymbol p && p.DeclaredAccessibility == Accessibility.Public)
                     || (m is IFieldSymbol && type.TypeKind == TypeKind.Enum);
                 if (keep) { _graph.AddRule(one, new object[] { mId }, "public surface kept with type"); }
-            }
-            else if (m is IPropertySymbol kp && Constants.KeepAliveMemberNames.Contains(kp.Name))
-            {
-                _graph.AddRule(one, new object[] { mId }, "kept with type");
             }
 
             // Override dispatch: the override is used whenever the overridden member is used on a
@@ -898,6 +967,7 @@ public sealed class GraphBuilder
                 {
                     var info = model.GetAwaitExpressionInfo(aw);
                     AddEdgeTo(sourceId, info.GetAwaiterMethod);
+                    AddEdgeTo(sourceId, info.IsCompletedProperty);
                     AddEdgeTo(sourceId, info.GetResultMethod);
                     break;
                 }
@@ -967,6 +1037,9 @@ public sealed class GraphBuilder
             case IConversionOperation cv: Emit(cv.OperatorMethod); break;
             case ITypeOfOperation to: Emit(to.TypeOperand); break;
             case IIsTypeOperation it: Emit(it.TypeOperand); break;
+            case IDynamicMemberReferenceOperation dmr when dmr.MemberName.Length > 0:
+                _graph.DynamicMemberNames.Add(dmr.MemberName);
+                break;
         }
         if (op.Type is INamedTypeSymbol named) { Emit(named); }
         foreach (var child in op.ChildOperations) { HarvestOperation(child, sourceId, skipSpans); }
@@ -1029,6 +1102,11 @@ public sealed class GraphBuilder
             var name = GetMethodName(inv);
             if (name == null) { continue; }
             var id = name.Identifier.Text;
+            if (_graph.AssemblyScanSite == null && Constants.AssemblyScanMethodNames.Contains(id))
+            {
+                var scanLoc = inv.GetLocation().GetLineSpan();
+                _graph.AssemblyScanSite = $"{inv.SyntaxTree.FilePath}:{scanLoc.StartLinePosition.Line + 1}";
+            }
             var typeArgs = (name as GenericNameSyntax)?.TypeArgumentList.Arguments;
 
             if (id == Constants.CreateMapMethodName && typeArgs is { Count: 2 })
@@ -1064,6 +1142,18 @@ public sealed class GraphBuilder
         return sym is ITypeSymbol t ? NodeId(t) : null;
     }
 
+    /// <summary>Every node referenced anywhere inside a type-argument syntax, nested type arguments
+    /// included ("IRepo&lt;Customer&gt;" yields both IRepo`1 and Customer). The whole span is
+    /// suppressed in the walks, so these must become statement references or they are lost.</summary>
+    void CollectTypeRefNodes(SyntaxNode typeSyntax, SemanticModel model, List<string> into)
+    {
+        foreach (var n in typeSyntax.DescendantNodesAndSelf())
+        {
+            if (n is not (IdentifierNameSyntax or GenericNameSyntax)) { continue; }
+            if (Normalize(model.GetSymbolInfo(n).Symbol) is { } nid && !into.Contains(nid)) { into.Add(nid); }
+        }
+    }
+
     /// <summary>True when the construct's header (condition, iterator, resource) contains anything
     /// with a side effect outside the registration itself: deleting the whole construct would then
     /// silently drop behavior, so the statement must be flagged for manual removal instead.</summary>
@@ -1083,7 +1173,7 @@ public sealed class GraphBuilder
         return false;
     }
 
-    StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember, IEnumerable<InvocationExpressionSyntax> claimed, IEnumerable<string> involved, bool allowSegment = true)
+    StatementNode NewStatement(string kind, InvocationExpressionSyntax inv, string containingMember, IEnumerable<InvocationExpressionSyntax> claimed, IEnumerable<string> involved, bool allowSegment = true, InvocationExpressionSyntax segmentEnd = null)
     {
         var innerStatement = inv.FirstAncestorOrSelf<StatementSyntax>();
         SyntaxNode anchor = innerStatement ?? (SyntaxNode)inv;
@@ -1147,8 +1237,10 @@ public sealed class GraphBuilder
         int segmentStart = -1, segmentLength = 0;
         if (allowSegment && inv.Expression is MemberAccessExpressionSyntax chain)
         {
+            // The segment runs to the end of the CLAIMED chain (ForMember, ReverseMap, ...), not
+            // just this call: a shorter cut would leave the continuation dangling off the receiver.
             segmentStart = chain.Expression.Span.End;
-            segmentLength = inv.Span.End - segmentStart;
+            segmentLength = (segmentEnd ?? inv).Span.End - segmentStart;
         }
         var lines = anchor.GetLocation().GetLineSpan();
         var snippet = Regex.Replace(anchor.ToString(), @"\s+", " ").Trim();
@@ -1165,6 +1257,7 @@ public sealed class GraphBuilder
             AnchorLength = anchor.FullSpan.End - anchorStart,
             SegmentStart = segmentStart,
             SegmentLength = segmentLength,
+            FileTextLength = anchor.SyntaxTree.Length,
             ManualReason = manualReason,
         };
         foreach (var nid in involved)
@@ -1187,9 +1280,11 @@ public sealed class GraphBuilder
     void HandleCreateMap(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax> typeArgs, string sourceId, SemanticModel model, ref List<TextSpan> skip)
     {
         var involved = new List<string>();
+        var argNodes = new List<string>();
         foreach (var ta in typeArgs)
         {
             if (ResolveTypeNode(ta, model) is { } t) { involved.Add(t); }
+            CollectTypeRefNodes(ta, model, argNodes);
         }
         if (involved.Count == 0) { return; }
         _processedInvocations.Add(inv);
@@ -1215,10 +1310,17 @@ public sealed class GraphBuilder
             }
             chainTop = cInv;
         }
-        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed, involved.Concat(chainRefs));
+        var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed, involved.Concat(chainRefs).Concat(argNodes), segmentEnd: (InvocationExpressionSyntax)chainTop);
         var guards = new List<object> { sourceId };
         guards.AddRange(involved);
         _graph.AddRule(guards, new object[] { stmt }, "CreateMap in use iff both types in use");
+        // Nested type arguments ("CreateMap<Dto<Customer>, ...>") sit inside suppressed spans: the
+        // statement must keep them alive while it lives, or they orphan under surviving text.
+        var extraArgs = argNodes.Where(a => !involved.Contains(a)).Cast<object>().ToList();
+        if (extraArgs.Count > 0)
+        {
+            _graph.AddRule(new object[] { stmt }, extraArgs, "type arguments of the mapping");
+        }
         if (chainRefs.Count > 0)
         {
             _graph.AddRule(new object[] { stmt }, chainRefs.Cast<object>().ToList(), "map configuration references");
@@ -1245,17 +1347,21 @@ public sealed class GraphBuilder
     {
         string service = null, impl = null;
         var spansToSkip = new List<TextSpan>();
+        var argNodes = new List<string>();
         if (typeArgs is { Count: 2 })
         {
             service = ResolveTypeNode(typeArgs.Value[0], model);
             impl = ResolveTypeNode(typeArgs.Value[1], model);
             spansToSkip.Add(typeArgs.Value[0].Span);
             spansToSkip.Add(typeArgs.Value[1].Span);
+            CollectTypeRefNodes(typeArgs.Value[0], model, argNodes);
+            CollectTypeRefNodes(typeArgs.Value[1], model, argNodes);
         }
         else if (typeArgs is { Count: 1 })
         {
             service = impl = ResolveTypeNode(typeArgs.Value[0], model);
             spansToSkip.Add(typeArgs.Value[0].Span);
+            CollectTypeRefNodes(typeArgs.Value[0], model, argNodes);
         }
         else if (typeArgs == null)
         {
@@ -1266,14 +1372,24 @@ public sealed class GraphBuilder
             impl = typeofs.Count > 1 ? ResolveTypeNode(typeofs[1].Type, model) : service;
             // The WHOLE typeof expression: its ITypeOfOperation spans it entirely, and a narrower
             // skip would let the operation walk re-pin the type with a permanent edge.
-            foreach (var t in typeofs) { spansToSkip.Add(t.Span); }
+            foreach (var t in typeofs)
+            {
+                spansToSkip.Add(t.Span);
+                CollectTypeRefNodes(t.Type, model, argNodes);
+            }
         }
         if (service == null && impl == null) { return; }
 
         _processedInvocations.Add(inv);
         foreach (var s in spansToSkip) { AddSkip(ref skip, s); }
 
-        var stmt = NewStatement("DI.Register", inv, sourceId, new[] { inv }, new[] { service, impl });
+        var stmt = NewStatement("DI.Register", inv, sourceId, new[] { inv }, new[] { service, impl }.Concat(argNodes));
+        // Nested type arguments inside the suppressed spans must stay alive while the statement does.
+        var extraArgs = argNodes.Where(a => a != service && a != impl).Cast<object>().ToList();
+        if (extraArgs.Count > 0)
+        {
+            _graph.AddRule(new object[] { stmt }, extraArgs, "type arguments of the registration");
+        }
         var guards = new List<object> { sourceId };
         if (service != null) { guards.Add(service); }
         else if (impl != null) { guards.Add(impl); } // external service type: tie to the implementation
@@ -1293,10 +1409,12 @@ public sealed class GraphBuilder
     void HandleAutofac(InvocationExpressionSyntax inv, SeparatedSyntaxList<TypeSyntax>? typeArgs, string sourceId, SemanticModel model, ref List<TextSpan> skip)
     {
         string impl = null;
+        var argNodes = new List<string>();
         if (typeArgs is { Count: 1 })
         {
             impl = ResolveTypeNode(typeArgs.Value[0], model);
             AddSkip(ref skip, typeArgs.Value[0].Span);
+            CollectTypeRefNodes(typeArgs.Value[0], model, argNodes);
         }
         else
         {
@@ -1307,6 +1425,7 @@ public sealed class GraphBuilder
                 impl = ResolveTypeNode(typeofs[0].Type, model);
                 // The WHOLE typeof expression (see HandleMsDi).
                 AddSkip(ref skip, typeofs[0].Span);
+                CollectTypeRefNodes(typeofs[0].Type, model, argNodes);
             }
         }
         _processedInvocations.Add(inv);
@@ -1330,6 +1449,7 @@ public sealed class GraphBuilder
                         services.Add(s);
                         textualRefs.Add(s);
                         AddSkip(ref skip, ta.Span);
+                        CollectTypeRefNodes(ta, model, argNodes);
                     }
                     else { hasExternalService = true; }
                 }
@@ -1356,7 +1476,13 @@ public sealed class GraphBuilder
 
         // No segment: a chain segment of the outermost call would delete only the lifetime call,
         // not the registration, so a partially surviving anchor falls back to a manual warning.
-        var stmt = NewStatement("DI.Register", outermost, sourceId, claimed, textualRefs.Append(impl), allowSegment: false);
+        var stmt = NewStatement("DI.Register", outermost, sourceId, claimed, textualRefs.Append(impl).Concat(argNodes), allowSegment: false);
+        // Nested type arguments inside the suppressed spans must stay alive while the statement does.
+        var extraArgs = argNodes.Where(a => a != impl && !services.Contains(a)).Cast<object>().ToList();
+        if (extraArgs.Count > 0)
+        {
+            _graph.AddRule(new object[] { stmt }, extraArgs, "type arguments of the registration");
+        }
         if (services.Count > 0)
         {
             foreach (var s in services)

@@ -86,7 +86,7 @@ public sealed class Engine
                 }
                 if (!spansByFile.TryGetValue(doc.FilePath, out var spans)) { continue; }
                 var text = await doc.GetTextAsync();
-                var merged = MergeSpans(spans);
+                var merged = Editor.MergeRanges(spans);
                 var inRange = merged.Where(r => r.End <= text.Length).ToList();
                 if (inRange.Count < merged.Count)
                 {
@@ -200,25 +200,6 @@ public sealed class Engine
         report.VerificationErrors = newErrors;
     }
 
-    List<(int Start, int End)> MergeSpans(List<(int Start, int End)> ranges)
-    {
-        var sorted = ranges.OrderBy(r => r.Start).ToList();
-        var result = new List<(int, int)>();
-        foreach (var r in sorted)
-        {
-            if (result.Count > 0 && r.Start <= result[^1].Item2)
-            {
-                var last = result[^1];
-                result[^1] = (last.Item1, Math.Max(last.Item2, r.End));
-            }
-            else
-            {
-                result.Add(r);
-            }
-        }
-        return result;
-    }
-
     (DeletionReport Report, Dictionary<string, HashSet<string>> LostAssemblies) ComputeReport(Graph graph, Solution solution)
     {
         var report = new DeletionReport
@@ -227,6 +208,11 @@ public sealed class Engine
             RemoveTargets = _opts.RemoveTargets.ToArray(),
         };
         report.Warnings.AddRange(graph.Warnings);
+
+        if (graph.Roots.Count == 0)
+        {
+            report.Warnings.Add("no production entry points detected — nothing counts as in use, so every removal cascades through ALL of its transitive referrers; declare roots via --config keep/roots and re-check before trusting this report");
+        }
 
         var removedSeeds = ResolveRemovals(graph);
         var removed = ExpandRemovals(graph, removedSeeds);
@@ -414,7 +400,8 @@ public sealed class Engine
         var keptInPlace = new HashSet<string>(StringComparer.Ordinal);
 
         // Symbol entries. Skip members whose containing type is itself deleted (the type entry covers them).
-        foreach (var id in allDead.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+        // The id tie-break keeps same-FQN overloads in a deterministic report order.
+        foreach (var id in allDead.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal).ThenBy(x => x, StringComparer.Ordinal))
         {
             if (HasDeadContainer(graph, id, allDead)) { continue; }
             if (!graph.Decl.TryGetValue(id, out var symbol)) { continue; }
@@ -439,8 +426,14 @@ public sealed class Engine
                     note = "also references surviving code: " + string.Join(", ", surviving);
                 }
             }
-            var parts = DeclarationParts(graph, symbol, id, allDead, keptInPlace, report.Warnings);
+            var parts = DeclarationParts(graph, symbol, id, allDead, keptInPlace, report.Warnings, report.FileTextLengths);
             if (parts.Count == 0) { continue; }
+            // The containing type survives here (dead containers were skipped above): a constructor
+            // deleted while its type stays in use may still be called by DI or reflection.
+            if (symbol is IMethodSymbol { MethodKind: MethodKind.Constructor, IsStatic: false })
+            {
+                report.Warnings.Add($"constructor deleted while its type stays in use: {SymbolNames.Fqn(symbol)} — DI or reflection may still construct the type through it at runtime; check before deleting");
+            }
             report.Symbols.Add(new SymbolDeletion
             {
                 Fqn = SymbolNames.Fqn(symbol),
@@ -476,6 +469,63 @@ public sealed class Engine
             if (mentions > Constants.ShownInactiveMentions)
             {
                 report.Warnings.Add($"... and {mentions - Constants.ShownInactiveMentions} more deleted symbols are mentioned in inactive #if code");
+            }
+        }
+
+        // Deleted members whose names are accessed through 'dynamic' somewhere in the solution:
+        // dynamic binding happens at runtime, invisible to the analysis AND the verifier.
+        if (graph.DynamicMemberNames.Count > 0)
+        {
+            int dynMentions = 0;
+            foreach (var id in allDead.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+            {
+                if (!graph.Decl.TryGetValue(id, out var dsym) || dsym is INamedTypeSymbol) { continue; }
+                if (dsym is IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.StaticConstructor }) { continue; }
+                if (!graph.DynamicMemberNames.Contains(dsym.Name)) { continue; }
+                dynMentions++;
+                if (dynMentions <= Constants.ShownDynamicMentions)
+                {
+                    report.Warnings.Add($"deleted {FqnOf(graph, id)} shares its name with a member accessed dynamically — dynamic member binding happens at runtime and may break; check the dynamic call sites");
+                }
+            }
+            if (dynMentions > Constants.ShownDynamicMentions)
+            {
+                report.Warnings.Add($"... and {dynMentions - Constants.ShownDynamicMentions} more deleted members share names with dynamic accesses");
+            }
+        }
+
+        // Deleted types whose full names appear in .config / .json files: config wiring (HTTP
+        // modules, providers, serialized settings) references types by name, invisibly.
+        if (graph.ConfigTextsByProject.Count > 0)
+        {
+            int cfgMentions = 0;
+            var scannedConfigs = new HashSet<string>(Constants.PathComparer);
+            var configTexts = new List<(string File, string Text)>();
+            foreach (var texts in graph.ConfigTextsByProject.Values)
+            {
+                foreach (var t in texts)
+                {
+                    if (t.Text.Length > 0 && scannedConfigs.Add(t.File)) { configTexts.Add(t); }
+                }
+            }
+            foreach (var id in allDead.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+            {
+                if (!graph.Decl.TryGetValue(id, out var tsym) || tsym is not INamedTypeSymbol) { continue; }
+                var fqn = SymbolNames.Fqn(tsym);
+                foreach (var (file, text) in configTexts)
+                {
+                    if (!text.Contains(fqn, StringComparison.Ordinal)) { continue; }
+                    cfgMentions++;
+                    if (cfgMentions <= Constants.ShownConfigMentions)
+                    {
+                        report.Warnings.Add($"deleted {fqn} is mentioned in {file} — config-wired types load at runtime and are invisible to the analysis; check before deleting");
+                    }
+                    break;
+                }
+            }
+            if (cfgMentions > Constants.ShownConfigMentions)
+            {
+                report.Warnings.Add($"... and {cfgMentions - Constants.ShownConfigMentions} more deleted types are mentioned in config files");
             }
         }
 
@@ -530,6 +580,7 @@ public sealed class Engine
                 WarnOnce($"manual: {stmt.FilePath}:{stmt.StartLine} — the containing statement must partially survive; delete this call manually: {stmt.Snippet}");
                 continue;
             }
+            report.FileTextLengths[stmt.FilePath] = stmt.FileTextLength;
             report.Statements.Add(new StatementDeletion
             {
                 Kind = stmt.Kind,
@@ -562,6 +613,11 @@ public sealed class Engine
         foreach (var f in filesTouched.OrderBy(x => x, StringComparer.Ordinal))
         {
             if (!nodesByFile.TryGetValue(f, out var declared) || !declared.All(allDead.Contains)) { continue; }
+            if (graph.FilesWithDuplicateDecls.Contains(f))
+            {
+                report.Warnings.Add($"file kept (declares a type another project also declares under the same full name): {f} — its dead declarations are deleted individually");
+                continue;
+            }
             if (graph.FilesWithTopLevelContent.Contains(f))
             {
                 report.Warnings.Add($"file kept (has global usings / assembly attributes): {f} — its dead declarations are deleted individually");
@@ -600,6 +656,17 @@ public sealed class Engine
         return (report, lostAssemblies);
     }
 
+    /// <summary>The first config-like file of the project whose text mentions <paramref name="needle"/>, or null.</summary>
+    string ConfigMentionOf(Graph graph, string projectName, string needle)
+    {
+        if (!graph.ConfigTextsByProject.TryGetValue(projectName, out var texts)) { return null; }
+        foreach (var (file, text) in texts)
+        {
+            if (text.Contains(needle, StringComparison.OrdinalIgnoreCase)) { return file; }
+        }
+        return null;
+    }
+
     string FqnOf(Graph graph, string id)
     {
         return graph.Decl.TryGetValue(id, out var s) ? SymbolNames.Fqn(s) : id;
@@ -616,7 +683,7 @@ public sealed class Engine
         return false;
     }
 
-    List<SourcePart> DeclarationParts(Graph graph, ISymbol s, string id, HashSet<string> allDead, HashSet<string> keptInPlace, List<string> warnings)
+    List<SourcePart> DeclarationParts(Graph graph, ISymbol s, string id, HashSet<string> allDead, HashSet<string> keptInPlace, List<string> warnings, Dictionary<string, int> fileLengths)
     {
         var parts = new List<SourcePart>();
         // A partial method/property has a second declaration under a separate symbol: deleting only
@@ -684,6 +751,14 @@ public sealed class Engine
             }
             var tree = node.SyntaxTree;
             if (string.IsNullOrEmpty(tree.FilePath)) { continue; }
+            // A declaration in a tree with no file on disk (source generators): the generated text
+            // regenerates from the surviving sources, so it is never edited.
+            if (!File.Exists(tree.FilePath))
+            {
+                var gmsg = $"skipped: {SymbolNames.Fqn(s)} has a declaration in {tree.FilePath}, which does not exist on disk (source-generated) — it is left to regenerate";
+                if (!warnings.Contains(gmsg)) { warnings.Add(gmsg); }
+                continue;
+            }
             // FullSpan includes leading trivia; exclude leading #directives (#region, #if) whose
             // counterpart lies outside the deleted span, or deletion breaks compilation.
             var span = node.FullSpan;
@@ -704,8 +779,25 @@ public sealed class Engine
             {
                 var idx = ed.Members.IndexOf(emd);
                 if (idx >= 0 && idx < ed.Members.SeparatorCount) { spanEnd = ed.Members.GetSeparator(idx).FullSpan.End; }
+                // The enum itself survives (dead containers are skipped before this runs): members
+                // after the deleted one without an explicit "= value" silently change their number.
+                bool laterImplicit = false;
+                for (int mi = idx + 1; mi < ed.Members.Count; mi++)
+                {
+                    if (ed.Members[mi].EqualsValue == null)
+                    {
+                        laterImplicit = true;
+                        break;
+                    }
+                }
+                if (idx >= 0 && laterImplicit)
+                {
+                    var emsg = $"enum values shift: deleting {SymbolNames.Fqn(s)} renumbers the later members of its enum that have no explicit value — persisted or serialized numeric values change; give them explicit values first if that matters";
+                    if (!warnings.Contains(emsg)) { warnings.Add(emsg); }
+                }
             }
             var lines = tree.GetLineSpan(node.Span);
+            fileLengths[tree.FilePath] = tree.Length;
             parts.Add(new SourcePart
             {
                 File = tree.FilePath,
@@ -847,6 +939,13 @@ public sealed class Engine
                 if (pi.ConditionalPackages.Contains(pkg))
                 {
                     report.Warnings.Add($"{pname}: PackageReference {pkg} lost its last user but is conditional (build-configuration dependent) — left in place, remove manually if appropriate");
+                    continue;
+                }
+                // A package named in configuration (a Serilog sink in appsettings, a provider in
+                // web.config) can be loaded at runtime with no compile-time use left.
+                if (ConfigMentionOf(graph, pname, pkg) is { } cfgFile)
+                {
+                    report.Warnings.Add($"{pname}: PackageReference {pkg} lost its last compile-time user but its name appears in {cfgFile} — left in place, remove manually if appropriate");
                     continue;
                 }
                 pc.Add(pkg);
@@ -1068,7 +1167,7 @@ public sealed class Engine
 
         // A linked file is compiled into several projects, one UsingRef entry each: the directive
         // goes only when EVERY surviving project that compiles the file has lost all its providers.
-        foreach (var g in graph.UsingRefs.GroupBy(u => u.File + "#" + u.SpanStart, StringComparer.OrdinalIgnoreCase))
+        foreach (var g in graph.UsingRefs.GroupBy(u => u.File + "#" + u.SpanStart, Constants.PathComparer))
         {
             var relevant = g.Where(u => !deletableProjects.Contains(u.Project)).ToList();
             if (relevant.Count == 0) { continue; }
@@ -1080,6 +1179,7 @@ public sealed class Engine
                 && relevant.All(u => u.Providers.Count > 0 && u.Providers.All(solutionAssemblies.Contains));
             if (allGone || nameDies)
             {
+                report.FileTextLengths[u0.File] = u0.FileTextLength;
                 report.UsingRemovals.Add(new UsingRemoval { File = u0.File, Line = u0.Line, Namespace = u0.Namespace, SpanStart = u0.SpanStart, SpanLength = u0.SpanLength });
             }
         }

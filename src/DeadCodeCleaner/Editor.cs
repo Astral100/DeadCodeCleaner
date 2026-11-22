@@ -16,6 +16,11 @@ public static class Editor
 
         foreach (var file in report.DeletableFiles)
         {
+            if (!File.Exists(file))
+            {
+                log($"  WARNING: {file} does not exist on disk (source-generated?) — skipped");
+                continue;
+            }
             var text = ReadFileText(file, out var encoding);
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
             if (FirstLine(text).Trim().StartsWith(Constants.Marker, StringComparison.Ordinal)) { continue; }
@@ -43,6 +48,11 @@ public static class Editor
 
         foreach (var (file, linesToMark) in perFile)
         {
+            if (!File.Exists(file))
+            {
+                log($"  WARNING: {file} does not exist on disk (source-generated?) — skipped");
+                continue;
+            }
             var text = ReadFileText(file, out var encoding);
             var nl = text.Contains("\r\n") ? "\r\n" : "\n";
             var starts = LineStarts(text);
@@ -108,15 +118,6 @@ public static class Editor
         int deletedFiles = 0, regions = 0;
         var deletableFiles = new HashSet<string>(report.DeletableFiles, Constants.PathComparer);
 
-        foreach (var file in report.DeletableFiles)
-        {
-            if (File.Exists(file))
-            {
-                File.Delete(file);
-                deletedFiles++;
-            }
-        }
-
         // Char-span deletions per file, plus the lines whose marker (inserted by a previous mark
         // run) sits above a span and may fall outside it (mid-line anchors, chain segments).
         var perFile = new Dictionary<string, List<(int Start, int End)>>(Constants.PathComparer);
@@ -136,9 +137,22 @@ public static class Editor
         foreach (var st in report.Statements) { Range(st.File, st.SpanStart, st.SpanStart + st.SpanLength, st.StartLine); }
         foreach (var ur in report.UsingRemovals) { Range(ur.File, ur.SpanStart, ur.SpanStart + ur.SpanLength, ur.Line); }
 
+        // Every span file is read and validated BEFORE anything touches the disk: a missing or
+        // mismatched file is skipped up front, and a hard IO error aborts with the tree untouched.
+        var pending = new List<(string File, string NewText, Encoding Encoding, int Regions)>();
         foreach (var file in perFile.Keys.OrderBy(x => x, Constants.PathComparer))
         {
+            if (!File.Exists(file))
+            {
+                log($"  WARNING: {file} does not exist on disk (source-generated?) — skipped");
+                continue;
+            }
             var text = ReadFileText(file, out var encoding);
+            if (report.FileTextLengths.TryGetValue(file, out var expected) && expected != text.Length)
+            {
+                log($"  WARNING: {file} decodes to {text.Length} chars but the analysis saw {expected} (encoding mismatch, or the file changed since the analysis) — skipped, delete manually");
+                continue;
+            }
             var ranges = perFile[file];
             if (ranges.Count > 0 && ranges.Max(r => r.End) > text.Length)
             {
@@ -147,7 +161,23 @@ public static class Editor
             }
             var starts = LineStarts(text);
             foreach (var line in markerLines[file]) { AddMarkerLineAbove(line, text, starts, ranges); }
-            ApplyDeletions(file, text, ranges, encoding, ref regions);
+            var (newText, n) = ComputeDeletions(text, ranges);
+            if (n > 0) { pending.Add((file, newText, encoding, n)); }
+        }
+        foreach (var (file, newText, encoding, n) in pending)
+        {
+            WriteFileText(file, newText, encoding);
+            regions += n;
+        }
+
+        // Whole files go only after every edit is in place, so a failure above deletes nothing.
+        foreach (var file in report.DeletableFiles)
+        {
+            if (File.Exists(file))
+            {
+                File.Delete(file);
+                deletedFiles++;
+            }
         }
 
         // csproj cleanup: packages, project references, whole projects.
@@ -422,11 +452,12 @@ public static class Editor
         if (above.Trim().StartsWith(Constants.Marker, StringComparison.Ordinal)) { ranges.Add((aboveStart, aboveEnd)); }
     }
 
-    static void ApplyDeletions(string file, string text, List<(int Start, int End)> ranges, Encoding encoding, ref int regions)
+    static (string Text, int Regions) ComputeDeletions(string text, List<(int Start, int End)> ranges)
     {
-        if (ranges.Count == 0) { return; }
-        var merged = Merge(ranges);
+        if (ranges.Count == 0) { return (text, 0); }
+        var merged = MergeRanges(ranges);
         var sb = new StringBuilder(text);
+        int regions = 0;
         foreach (var (start, end) in merged.OrderByDescending(r => r.Start))
         {
             var s = Math.Clamp(start, 0, sb.Length);
@@ -434,19 +465,21 @@ public static class Editor
             sb.Remove(s, e - s);
             regions++;
         }
-        WriteFileText(file, sb.ToString(), encoding);
+        return (sb.ToString(), regions);
     }
 
-    static List<(int Start, int End)> Merge(List<(int Start, int End)> ranges)
+    /// <summary>Sorted, overlap-merged copy of the ranges. Shared with the verifier so both apply
+    /// the same deletions.</summary>
+    internal static List<(int Start, int End)> MergeRanges(List<(int Start, int End)> ranges)
     {
         var sorted = ranges.OrderBy(r => r.Start).ToList();
-        var result = new List<(int, int)>();
+        var result = new List<(int Start, int End)>();
         foreach (var r in sorted)
         {
-            if (result.Count > 0 && r.Start <= result[^1].Item2)
+            if (result.Count > 0 && r.Start <= result[^1].End)
             {
                 var last = result[^1];
-                result[^1] = (last.Item1, Math.Max(last.Item2, r.End));
+                result[^1] = (last.Start, Math.Max(last.End, r.End));
             }
             else
             {
@@ -466,6 +499,17 @@ public static class Editor
         {
             encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
             return new UTF8Encoding(false).GetString(bytes, 3, bytes.Length - 3);
+        }
+        // UTF-32 LE shares its first two bytes with UTF-16 LE, so it must be checked first.
+        if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0x00 && bytes[3] == 0x00)
+        {
+            encoding = new UTF32Encoding(bigEndian: false, byteOrderMark: true);
+            return new UTF32Encoding(bigEndian: false, byteOrderMark: false).GetString(bytes, 4, bytes.Length - 4);
+        }
+        if (bytes.Length >= 4 && bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0xFE && bytes[3] == 0xFF)
+        {
+            encoding = new UTF32Encoding(bigEndian: true, byteOrderMark: true);
+            return new UTF32Encoding(bigEndian: true, byteOrderMark: false).GetString(bytes, 4, bytes.Length - 4);
         }
         if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
         {

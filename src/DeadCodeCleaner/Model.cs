@@ -21,6 +21,8 @@ public sealed class StatementNode
     /// the call has no member-access receiver. Used when siblings on the same statement survive.</summary>
     public required int SegmentStart { get; init; }
     public required int SegmentLength { get; init; }
+    /// <summary>Length of the file's analyzed text, so the editor can detect decoding mismatches.</summary>
+    public required int FileTextLength { get; init; }
     /// <summary>Why automatic deletion is unsafe (if/else branch, inside a lambda), or null when it is safe.</summary>
     public string ManualReason { get; init; }
     /// <summary>Node ids the statement's text references (service/implementation/mapped types, chain
@@ -95,6 +97,18 @@ public sealed class Graph
     /// <summary>File -> the text of its inactive #if regions, for warning when a deleted symbol's
     /// name still appears in code the compiler cannot see.</summary>
     public Dictionary<string, string> DisabledTexts { get; } = new(Constants.PathComparer);
+    /// <summary>Member names accessed through 'dynamic': those bindings happen at runtime, so a
+    /// deleted member sharing such a name warrants a warning.</summary>
+    public HashSet<string> DynamicMemberNames { get; } = new(StringComparer.Ordinal);
+    /// <summary>file:line of the first assembly-scanning registration call (RegisterAssemblyTypes,
+    /// Scan, ...), or null when none exists.</summary>
+    public string AssemblyScanSite { get; set; }
+    /// <summary>Files declaring a type whose full name another project declared first: the graph
+    /// tracks only the first declaration, so these files must never be deleted whole.</summary>
+    public HashSet<string> FilesWithDuplicateDecls { get; } = new(Constants.PathComparer);
+    /// <summary>Project name -> (path, text) of its .config / .json files, for warning when a
+    /// deleted type or removed package is still wired up in configuration.</summary>
+    public Dictionary<string, List<(string File, string Text)>> ConfigTextsByProject { get; } = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Project name -> external assemblies referenced from places that always survive
     /// (assembly-level attributes): their packages must never be removed.</summary>
     public Dictionary<string, HashSet<string>> ProjectExternalRefs { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -174,6 +188,8 @@ public sealed class UsingRef
     /// with leading #directives and file banners excluded.</summary>
     public required int SpanStart { get; init; }
     public required int SpanLength { get; init; }
+    /// <summary>Length of the file's analyzed text, so the editor can detect decoding mismatches.</summary>
+    public required int FileTextLength { get; init; }
 }
 
 /// <summary>Per-project facts needed for package/reference cleanup.</summary>

@@ -22,6 +22,9 @@ public static class Constants
     public const int SlnRemoveTimeoutMs = 60_000;
     public const int VerifyShownErrors = 20;
     public const int ShownInactiveMentions = 10;
+    public const int ShownDynamicMentions = 10;
+    public const int ShownConfigMentions = 10;
+    public const int MaxScannedConfigFileBytes = 1_000_000;
 
     public const string CategoryRemoved = "removed";
     public const string CategoryOrphaned = "orphaned";
@@ -46,7 +49,21 @@ public static class Constants
     /// wiring): references from them are invisible, so their presence warrants a warning.</summary>
     public static readonly HashSet<string> NonCompiledContentExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".cshtml", ".razor", ".aspx", ".ascx", ".master", ".asax",
+        ".cshtml", ".razor", ".aspx", ".ascx", ".master", ".asax", ".xaml", ".axaml", ".svc", ".asmx", ".ashx",
+    };
+
+    /// <summary>Directories never descended into when scanning project folders for content files.</summary>
+    public static readonly HashSet<string> SkippedScanDirectories = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin", "obj", "node_modules", ".git", ".vs",
+    };
+
+    /// <summary>Invocation names that register types by scanning assemblies at runtime (Autofac,
+    /// Scrutor): the scanned implementations are invisible to the analysis, so their presence
+    /// warrants a warning.</summary>
+    public static readonly HashSet<string> AssemblyScanMethodNames = new(StringComparer.Ordinal)
+    {
+        "RegisterAssemblyTypes", "RegisterAssemblyModules", "Scan",
     };
 
     /// <summary>Assemblies whose use does not block deleting an "empty" profile/module whole:

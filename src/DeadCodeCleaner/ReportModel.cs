@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace DeadCodeCleaner;
 
 public sealed class DeletionReport
@@ -17,6 +19,11 @@ public sealed class DeletionReport
     public List<string> Warnings { get; } = new();
     /// <summary>New compile errors the in-memory verification found in the deletion plan (0 = safe).</summary>
     public int VerificationErrors { get; set; }
+    /// <summary>File -> length of the text the spans were computed against: the editor refuses to
+    /// touch a file whose on-disk text decodes to a different length (encoding mismatch, or the
+    /// file changed since the analysis).</summary>
+    [JsonIgnore]
+    public Dictionary<string, int> FileTextLengths { get; } = new(Constants.PathComparer);
     public ReportStats Stats { get; set; } = new();
 }
 

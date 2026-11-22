@@ -104,6 +104,8 @@ check "healthy sibling test and its class survive" \
     '[.symbols[].fqn] | map(select(startswith("Fixture.Tests.MixedTests"))) | length == 1'
 check "verification clean (plan introduces no compile errors)" \
     '[.warnings[] | select(startswith("VERIFY"))] | length == 0'
+check "deleted member accessed via dynamic warns" \
+    '[.warnings[]] | map(select(contains("accessed dynamically"))) | length >= 1'
 
 echo "== Case 2: remove GetSecondary (member-level, narrow cascade)"
 dotnet run --project src/DeadCodeCleaner -- analyze \
@@ -211,6 +213,8 @@ dotnet run --project src/DeadCodeCleaner -- delete --solution "$SCRATCH2/Fixture
     --delete-review-tests --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED (verification rejected the plan?)"; exit 1; }
 if ! grep -q "    Fancy" "$SCRATCH2/Fixture/Fixture.Domain/Shapes.cs"; then
     pass "enum member deleted"; else failx "enum member deleted"; fi
+check "enum renumber warning emitted" \
+    '[.warnings[]] | map(select(startswith("enum values shift"))) | length >= 1'
 if grep -q "Legacy," "$SCRATCH2/Fixture/Fixture.Domain/Shapes.cs"; then
     pass "following enum member intact"; else failx "following enum member intact"; fi
 if ! grep -q "AddScoped<IWidgetService" "$SCRATCH2/Fixture/Fixture.Web/Program.cs"; then
