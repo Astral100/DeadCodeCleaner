@@ -4,6 +4,16 @@ namespace DeadCodeCleaner;
 
 /// <summary>A pseudo-node representing a co-dependent statement (DI registration, CreateMap, ...).
 /// In use iff all guard antecedents are in use; reported for deletion when it dies in the removal run.</summary>
+/// <summary>How a project landed in the test world: by hard evidence (a test-framework reference,
+/// IsTestProject, a test ProjectTypeGuids entry) or by its name alone, which deserves a warning.</summary>
+public enum TestClassification
+{
+    Unknown,
+    Production,
+    TestByEvidence,
+    TestByName,
+}
+
 public sealed class StatementNode
 {
     public required string Kind { get; init; }
@@ -126,6 +136,8 @@ public sealed class Graph
     /// <summary>File -> the text of its inactive #if regions, for warning when a deleted symbol's
     /// name still appears in code the compiler cannot see.</summary>
     public Dictionary<string, string> DisabledTexts { get; } = new(Constants.PathComparer);
+    /// <summary>Text of runtime-compiled view/markup files, scanned for deleted-symbol mentions.</summary>
+    public Dictionary<string, string> ViewTexts { get; } = new(Constants.PathComparer);
     /// <summary>Member names accessed through 'dynamic': those bindings happen at runtime, so a
     /// deleted member sharing such a name warrants a warning.</summary>
     public HashSet<string> DynamicMemberNames { get; } = new(StringComparer.Ordinal);
@@ -141,6 +153,33 @@ public sealed class Graph
     /// <summary>Project name -> external assemblies referenced from places that always survive
     /// (assembly-level attributes): their packages must never be removed.</summary>
     public Dictionary<string, HashSet<string>> ProjectExternalRefs { get; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>In-solution nodes a project's ASSEMBLY-LEVEL attributes reference: they live in no
+    /// member body, so reference cleanup must count them as needs explicitly.</summary>
+    public Dictionary<string, HashSet<string>> AssemblyAttrRefs { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public void AddAssemblyAttrRef(string projectName, string nodeId)
+    {
+        if (!AssemblyAttrRefs.TryGetValue(projectName, out var set))
+        {
+            AssemblyAttrRefs[projectName] = set = new HashSet<string>(StringComparer.Ordinal);
+        }
+        set.Add(nodeId);
+    }
+
+    /// <summary>Compile-time dependencies that are NOT liveness references: the target types of
+    /// implicit conversions (a callee's parameter type binding an argument). The caller's text never
+    /// names them, so they must not keep the type alive — but the caller's project still needs the
+    /// type's assembly to compile the call, so reference cleanup counts them.</summary>
+    public Dictionary<string, HashSet<string>> WeakRefs { get; } = new(StringComparer.Ordinal);
+
+    public void AddWeakRef(string sourceId, string nodeId)
+    {
+        if (!WeakRefs.TryGetValue(sourceId, out var set))
+        {
+            WeakRefs[sourceId] = set = new HashSet<string>(StringComparer.Ordinal);
+        }
+        set.Add(nodeId);
+    }
     public int EdgeCount { get; private set; }
 
     public void AddProjectExternalRef(string projectName, string assemblyName)
@@ -283,6 +322,10 @@ public sealed class AnalyzerConfig
     /// <summary>When true, public properties / enum members of in-use types are NOT automatically
     /// kept (riskier: serializers and data binding use them via reflection).</summary>
     public bool StrictMembers { get; set; }
+    /// <summary>When true, registration/mapping methods DECLARED INSIDE the solution (wrappers,
+    /// stand-in frameworks) are tracked as co-dependent statements too. Default: only methods
+    /// resolved to external assemblies (or unresolvable ones) get registration semantics.</summary>
+    public bool InSolutionRegistrations { get; set; }
 }
 
 public sealed class CliOptions
@@ -296,6 +339,7 @@ public sealed class CliOptions
     public bool Verbose;
     public bool StrictMembers;
     public bool NoVerify;
+    public bool AllowStillReferenced;
     /// <summary>Let delete run although some projects had compile errors during analysis (their
     /// references are invisible, so the cascade may over-delete). Default: delete refuses.</summary>
     public bool AllowCompileErrors;

@@ -79,8 +79,11 @@ public sealed class Engine
         _log("Verifying the deletion plan (in-memory rebuild) ...");
         int incomplete = 0;
         var spansByFile = new Dictionary<string, List<(int Start, int End)>>(Constants.PathComparer);
-        void AddSpan(string file, int start, int length)
+        void AddSpan(string fileRaw, int start, int length)
         {
+            // Canonicalized like the Editor's plan: a case-variant linked file must land on ONE key,
+            // or its spans in the second project escape verification.
+            var file = Editor.CanonicalPath(fileRaw);
             if (!spansByFile.TryGetValue(file, out var list)) { spansByFile[file] = list = new List<(int, int)>(); }
             if (length > 0) { list.Add((start, start + length)); }
         }
@@ -109,7 +112,7 @@ public sealed class Engine
                     changed.Add(project.Id);
                     continue;
                 }
-                if (!spansByFile.TryGetValue(doc.FilePath, out var spans)) { continue; }
+                if (!spansByFile.TryGetValue(Editor.CanonicalPath(doc.FilePath), out var spans)) { continue; }
                 var text = await doc.GetTextAsync();
                 var merged = Editor.MergeRanges(spans);
                 var inRange = merged.Where(r => r.End <= text.Length).ToList();
@@ -299,7 +302,7 @@ public sealed class Engine
             if (!membersOf.TryGetValue(container, out var list)) { membersOf[container] = list = new List<string>(); }
             list.Add(member);
         }
-        var poisoned = Poison(graph, poisonSeeds, r2, membersOf);
+        var poisoned = Poison(graph, poisonSeeds, r2, rt1, membersOf);
 
         var brokenTests = new HashSet<string>(
             poisoned.Where(p => graph.TestNodes.Contains(p) && rt1.Contains(p)), StringComparer.Ordinal);
@@ -533,6 +536,34 @@ public sealed class Engine
             }
         }
 
+        // Deleted symbols whose names appear in Razor/WebForms markup: views compile at RUNTIME, so
+        // neither the compiler nor the verifier sees a reference from them, and a page breaks in
+        // production instead of in the build.
+        if (graph.ViewTexts.Count > 0)
+        {
+            int viewMentions = 0;
+            foreach (var symd in report.Symbols)
+            {
+                var dot = symd.Fqn.LastIndexOf('.');
+                var name = dot >= 0 ? symd.Fqn[(dot + 1)..] : symd.Fqn;
+                if (name.Length < 3 || name == "ctor" || name == "cctor") { continue; }
+                foreach (var (file, viewText) in graph.ViewTexts.OrderBy(kv => kv.Key, Constants.PathComparer))
+                {
+                    if (!Regex.IsMatch(viewText, @"\b" + Regex.Escape(name) + @"\b")) { continue; }
+                    viewMentions++;
+                    if (viewMentions <= Constants.ShownViewMentions)
+                    {
+                        report.Warnings.Add($"deleted {symd.Fqn} is mentioned in {file} — views compile at runtime, so this deletion can break a page the verifier cannot see");
+                    }
+                    break;
+                }
+            }
+            if (viewMentions > Constants.ShownViewMentions)
+            {
+                report.Warnings.Add($"... and {viewMentions - Constants.ShownViewMentions} more deleted symbols are mentioned in view/markup files");
+            }
+        }
+
         // Deleted members whose names are accessed through 'dynamic' somewhere in the solution:
         // dynamic binding happens at runtime, invisible to the analysis AND the verifier.
         if (graph.DynamicMemberNames.Count > 0)
@@ -631,6 +662,16 @@ public sealed class Engine
                 WarnOnce($"map configuration removed: {stmt.FilePath}:{seg.Line} .{seg.MethodName}(...) references deleted {string.Join(", ", gone)} — the segment is removed, the rest of the mapping is kept");
             }
         }
+        // Anchor positions of SURVIVING statements, per file: a dead statement's span must never
+        // contain one (a live registration nested inside a dying chain's argument), or deleting the
+        // span silently takes the live statement with it.
+        var survivingAnchors = new Dictionary<string, List<int>>(Constants.PathComparer);
+        foreach (var s in graph.Statements)
+        {
+            if (deadStmts.Contains(s)) { continue; }
+            if (!survivingAnchors.TryGetValue(s.FilePath, out var alist)) { survivingAnchors[s.FilePath] = alist = new List<int>(); }
+            alist.Add(s.AnchorStart);
+        }
         foreach (var stmt in deadStmts.OrderBy(s => s.FilePath, StringComparer.Ordinal).ThenBy(s => s.AnchorStart).ThenBy(s => s.SegmentStart))
         {
             if (allDead.Contains(stmt.ContainingMember) || HasDeadContainer(graph, stmt.ContainingMember, allDead)) { continue; }
@@ -656,6 +697,12 @@ public sealed class Engine
             else
             {
                 WarnOnce($"manual: {stmt.FilePath}:{stmt.StartLine} — the containing statement must partially survive; delete this call manually: {stmt.Snippet}");
+                continue;
+            }
+            if (survivingAnchors.TryGetValue(stmt.FilePath, out var anchors)
+                && anchors.Any(a => a > spanStart && a < spanStart + spanLength))
+            {
+                WarnOnce($"manual: {stmt.FilePath}:{stmt.StartLine} — a surviving tracked statement is nested inside this span; delete it manually: {stmt.Snippet}");
                 continue;
             }
             report.FileTextLengths[stmt.FilePath] = stmt.FileTextLength;
@@ -735,6 +782,19 @@ public sealed class Engine
 
         var lostAssemblies = ComputeProjectCleanup(graph, report, allDead, keptInPlace, deletableFileSet, deadStmts);
 
+        // csproj texts are hashed like source files: delete validates them before editing, so a
+        // reference added between the analysis and the edit aborts instead of being edited blind.
+        foreach (var path in report.PackageRefRemovals.Select(r => r.CsprojPath)
+            .Concat(report.ProjectRefRemovals.Select(r => r.CsprojPath))
+            .Concat(report.CompileEntryRemovals.Select(r => r.CsprojPath))
+            .Distinct(Constants.PathComparer))
+        {
+            if (path == null || !File.Exists(path)) { continue; }
+            var ptext = Editor.ReadFileText(path, out _);
+            report.FileTextLengths[path] = ptext.Length;
+            report.FileTextHashes[path] = Editor.TextHash(ptext);
+        }
+
         report.Stats = new ReportStats
         {
             Projects = solution.Projects.Count(),
@@ -745,8 +805,10 @@ public sealed class Engine
             TestRoots = graph.TestRoots.Count,
             InUseBaseline = graph.Nodes.Count(n => r1.Contains(n)),
             InUseAfterRemoval = graph.Nodes.Count(n => r2.Contains(n)),
+            // "Left untouched" must be literal: pre-existing orphans this run DELETES (removal
+            // targets, broken orphans) are excluded from the count.
             AlreadyOrphanedBefore = graph.Nodes.Count(n =>
-                !graph.TestNodes.Contains(n) && !r1.Contains(n) && !rt1.Contains(n)),
+                !graph.TestNodes.Contains(n) && !r1.Contains(n) && !rt1.Contains(n) && !allDead.Contains(n)),
         };
         return (report, lostAssemblies);
     }
@@ -1057,6 +1119,19 @@ public sealed class Engine
                         else { dp.UnionWith(tps); }
                     }
                 }
+                // Weak refs (implicit-conversion target types): no liveness meaning, but a surviving
+                // caller still needs the surviving type's assembly to compile the converted call.
+                if (stays && graph.WeakRefs.TryGetValue(n, out var weak))
+                {
+                    foreach (var t in weak)
+                    {
+                        if (!Stays(t)) { continue; }
+                        if (!graph.ProjectsOf.TryGetValue(t, out var tps) || tps.Contains(pname)) { continue; }
+                        var group = tps.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+                        if (needKeys.Add(string.Join("|", group))) { needs.Add(group); }
+                        sp.UnionWith(group);
+                    }
+                }
             }
             // SURVIVING registrations/mappings reference their types only through suppressed spans
             // (rules, not edges), so their InvolvedNodes must count as needs too — or a still-needed
@@ -1072,6 +1147,19 @@ public sealed class Engine
                 foreach (var t in stmtRefs)
                 {
                     if (t == null || !graph.ProjectsOf.TryGetValue(t, out var tps) || tps.Contains(pname)) { continue; }
+                    var group = tps.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+                    if (needKeys.Add(string.Join("|", group))) { needs.Add(group); }
+                    sp.UnionWith(group);
+                }
+            }
+            // Assembly-level attributes ("[assembly: Marker]") reference their types from no member
+            // body, so no edge carries the need. Their targets are roots and always survive: the
+            // providing project's reference (and its using) must stay.
+            if (graph.AssemblyAttrRefs.TryGetValue(pname, out var attrRefs))
+            {
+                foreach (var t in attrRefs)
+                {
+                    if (!graph.ProjectsOf.TryGetValue(t, out var tps) || tps.Contains(pname)) { continue; }
                     var group = tps.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
                     if (needKeys.Add(string.Join("|", group))) { needs.Add(group); }
                     sp.UnionWith(group);
@@ -1483,7 +1571,7 @@ public sealed class Engine
     /// <summary>Forward-breakage propagation: code that is not in use after the removal and
     /// references deleted code cannot compile, so it is deleted too. A dead member of a dead type
     /// escalates to the whole type (partial deletion could break interface contracts).</summary>
-    HashSet<string> Poison(Graph graph, HashSet<string> seeds, HashSet<object> r2, Dictionary<string, List<string>> membersOf)
+    HashSet<string> Poison(Graph graph, HashSet<string> seeds, HashSet<object> r2, HashSet<object> rt1, Dictionary<string, List<string>> membersOf)
     {
         // Reverse adjacency restricted to sources that are not in use after removal.
         var reverse = new Dictionary<string, List<string>>(StringComparer.Ordinal);
@@ -1505,10 +1593,13 @@ public sealed class Engine
             if (seeds.Contains(id) || !dead.Add(id)) { return; }
             queue.Enqueue(id);
             // A dead member of a type that is itself out of use takes the whole type down — except
-            // in test classes: one broken test must not delete its healthy siblings. A test class
-            // still dies when EVERY member died (empty-shell pass below).
+            // in test classes (one broken test must not delete its healthy siblings) and types the
+            // TEST world still reaches: a sibling member live only through tests references nothing
+            // deleted, so killing it with the container would over-delete. Such a type still dies
+            // when EVERY member died (empty-shell pass below), or through the test-helper cascade
+            // once the tests that kept it alive are gone.
             if (graph.ContainerOf.TryGetValue(id, out var container)
-                && !r2.Contains(container) && !seeds.Contains(container)
+                && !r2.Contains(container) && !rt1.Contains(container) && !seeds.Contains(container)
                 && !graph.TestNodes.Contains(container))
             {
                 Kill(container);
@@ -1542,10 +1633,13 @@ public sealed class Engine
                 }
             }
             // A class left without any members (all died) is an empty shell: delete it too,
-            // provided it is itself out of use.
+            // provided it is itself out of use. A PRODUCTION type the test world still reaches
+            // keeps its shell (a test may construct it): over-keeping an empty class is safe,
+            // deleting it would take healthy tests along. Test classes still die whole.
             foreach (var (type, members) in membersOf)
             {
                 if (dead.Contains(type) || seeds.Contains(type) || r2.Contains(type)) { continue; }
+                if (rt1.Contains(type) && !graph.TestNodes.Contains(type)) { continue; }
                 if (!graph.Nodes.Contains(type)) { continue; }
                 if (members.Count > 0 && members.All(m => dead.Contains(m) || seeds.Contains(m)))
                 {

@@ -210,6 +210,71 @@ public static class Editor
             }
             wholeFiles.Add((file, text, wenc));
         }
+
+        // csproj edits are computed and validated BEFORE any write, exactly like source edits: a
+        // stale or unreadable csproj aborts while nothing has been touched, and the new texts join
+        // the same rollback set. A Compile entry that cannot be removed while its source file IS
+        // deleted would leave a guaranteed CS2001 broken build, so it refuses up front; package and
+        // project references merely left behind are harmless and only warn (exit code 3).
+        var xmlEdits = new List<(string File, string Element, Func<string, bool> Match, string Label, bool MustMatch)>();
+        foreach (var rr in report.PackageRefRemovals)
+        {
+            xmlEdits.Add((rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference), $"PackageReference {rr.Reference} from {rr.Project}", false));
+        }
+        foreach (var rr in report.ProjectRefRemovals)
+        {
+            xmlEdits.Add((rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"), $"ProjectReference {rr.Reference} from {rr.Project}", false));
+        }
+        foreach (var rr in report.CompileEntryRemovals)
+        {
+            xmlEdits.Add((rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference), $"Compile entry {rr.Reference} from {rr.Project}", true));
+        }
+        var xmlPending = new List<(string File, string NewText, string OldText, Encoding Encoding, int Removed)>();
+        var xmlMessages = new List<string>();
+        foreach (var fileGroup in xmlEdits.GroupBy(x => CanonicalPath(x.File), Constants.PathComparer).OrderBy(g => g.Key, Constants.PathComparer))
+        {
+            var xfile = fileGroup.Key;
+            if (!File.Exists(xfile))
+            {
+                log($"error: {xfile} no longer exists on disk — the analysis is stale; NOTHING was deleted, re-run delete");
+                return 1;
+            }
+            var xtext = ReadFileText(xfile, out var xenc);
+            if (Stale(lengths, hashes, xfile, xtext, out var xwhy))
+            {
+                log($"error: {xfile} {xwhy} — NOTHING was deleted");
+                return 1;
+            }
+            var xlines = SplitLinesKeepEnds(xtext);
+            int removedInFile = 0;
+            foreach (var (_, element, match, label, mustMatch) in fileGroup)
+            {
+                var found = FindXmlElements(xlines, element, match);
+                for (int fi = found.Count - 1; fi >= 0; fi--)
+                {
+                    var (from, to) = found[fi];
+                    if (from > 0 && xlines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) { from--; }
+                    xlines.RemoveRange(from, to - from + 1);
+                }
+                if (found.Count > 0)
+                {
+                    removedInFile += found.Count;
+                    xmlMessages.Add($"  removed {label}");
+                }
+                else if (mustMatch)
+                {
+                    log($"error: {label} could not be matched (shares a line with other content, or the csproj changed) — its source file is planned for deletion, and a dangling entry breaks the build (CS2001); edit {xfile} first; NOTHING was deleted");
+                    return 1;
+                }
+                else
+                {
+                    xmlMessages.Add($"  WARNING: {label} not removed (shares a line with other content, or not found) — edit {xfile} manually");
+                    manualSteps = true;
+                }
+            }
+            if (removedInFile > 0) { xmlPending.Add((xfile, string.Concat(xlines), xtext, xenc, removedInFile)); }
+        }
+
         // Writes restore the already-written files on failure, so a half-applied plan never sticks.
         int RestoreFiles(List<(string File, string OldText, Encoding Encoding)> files)
         {
@@ -272,37 +337,26 @@ public static class Editor
             deletedFiles++;
         }
 
-        // csproj cleanup: packages, project references, whole projects.
-        foreach (var rr in report.PackageRefRemovals)
+        // csproj cleanup: the texts computed and validated up front join the same rollback set.
+        foreach (var (xfile, newText, oldText, xenc, n) in xmlPending)
         {
-            var n = RemoveXmlElements(rr.CsprojPath, "PackageReference", el => IsPackageRefElement(el, rr.Reference), log);
-            if (n > 0) { regions += n; log($"  removed PackageReference {rr.Reference} from {rr.Project}"); }
-            else
+            try
             {
-                log($"  WARNING: PackageReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually");
-                manualSteps = true;
+                WriteFileText(xfile, newText, xenc);
             }
-        }
-        foreach (var rr in report.ProjectRefRemovals)
-        {
-            var n = RemoveXmlElements(rr.CsprojPath, "ProjectReference", el => IsProjectRefElement(el, rr.ReferenceFile, rr.Reference + ".csproj"), log);
-            if (n > 0) { regions += n; log($"  removed ProjectReference {rr.Reference} from {rr.Project}"); }
-            else
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                log($"  WARNING: ProjectReference {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually");
-                manualSteps = true;
+                var toRestore = deletedWhole.Concat(written).ToList();
+                toRestore.Add((xfile, oldText, xenc));
+                log($"error: could not write {xfile}: {e.Message} — restoring the {deletedWhole.Count} deleted file(s) and the {written.Count} edit(s)");
+                int restored = RestoreFiles(toRestore);
+                log($"  restored {restored}/{toRestore.Count}; the plan was rolled back");
+                return 1;
             }
+            written.Add((xfile, oldText, xenc));
+            regions += n;
         }
-        foreach (var rr in report.CompileEntryRemovals)
-        {
-            var n = RemoveXmlElements(rr.CsprojPath, "Compile", el => IsIncludeMatch(el, rr.Reference), log);
-            if (n > 0) { regions += n; log($"  removed Compile entry {rr.Reference} from {rr.Project}"); }
-            else
-            {
-                log($"  WARNING: Compile entry {rr.Reference} not removed from {rr.Project} (shares a line with other content, or not found) — edit {rr.CsprojPath} manually");
-                manualSteps = true;
-            }
-        }
+        foreach (var m in xmlMessages) { log(m); }
 
         int deletedProjects = 0;
         foreach (var pd in report.DeletableProjects)
@@ -580,32 +634,6 @@ public static class Editor
         }
     }
 
-    static int RemoveXmlElements(string file, string elementName, Func<string, bool> match, Action<string> log)
-    {
-        if (!File.Exists(file)) { return 0; }
-        try
-        {
-            var text = ReadFileText(file, out var encoding);
-            var lines = SplitLinesKeepEnds(text);
-            var found = FindXmlElements(lines, elementName, match);
-            int removed = 0;
-            for (int fi = found.Count - 1; fi >= 0; fi--)
-            {
-                var (from, to) = found[fi];
-                if (from > 0 && lines[from - 1].Trim().StartsWith(Constants.XmlMarkerPrefix, StringComparison.Ordinal)) { from--; }
-                lines.RemoveRange(from, to - from + 1);
-                removed++;
-            }
-            if (removed > 0) { WriteFileText(file, string.Concat(lines), encoding); }
-            return removed;
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            log($"  WARNING: could not edit {file}: {e.Message}");
-            return 0;
-        }
-    }
-
     // ---------------------------------------------------------- text helpers
 
     static void AddMarkerLineAbove(int line, string text, int[] starts, List<(int, int)> ranges)
@@ -657,7 +685,7 @@ public static class Editor
     /// <summary>Reads a file preserving its encoding for the write-back: BOMs are honoured, BOM-less
     /// files are decoded as strict UTF-8, and invalid UTF-8 falls back to Latin-1 (byte-preserving)
     /// instead of silently inserting U+FFFD replacement characters.</summary>
-    static string ReadFileText(string path, out Encoding encoding)
+    internal static string ReadFileText(string path, out Encoding encoding)
     {
         var bytes = File.ReadAllBytes(path);
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
@@ -751,7 +779,12 @@ public static class Editor
         }
         if (hashes.TryGetValue(file, out var h) && h != TextHash(text))
         {
-            why = "its content changed since the analysis (same length, different text)";
+            // U+FFFD means the on-disk bytes were not valid for the decoded encoding: the usual
+            // culprit is a legacy single-byte file (CP1252), which Roslyn and this editor decode
+            // differently — a conversion problem, not a concurrent edit.
+            why = text.Contains('�')
+                ? "decodes with replacement characters — the file is not valid UTF-8; convert it to UTF-8 first"
+                : "its content changed since the analysis (same length, different text)";
             return true;
         }
         why = null;
@@ -764,7 +797,7 @@ public static class Editor
     /// case-insensitive filesystem mounted under case-sensitive path rules (WSL /mnt), linked files
     /// can appear under two casings: editing them as two files makes the second write clobber the
     /// first. Two genuinely distinct entries (a truly case-sensitive filesystem) stay distinct.</summary>
-    static string CanonicalPath(string path)
+    internal static string CanonicalPath(string path)
     {
         if (OperatingSystem.IsWindows()) { return path; } // PathComparer is already case-insensitive
         if (_canonicalCache.TryGetValue(path, out var cached)) { return cached; }

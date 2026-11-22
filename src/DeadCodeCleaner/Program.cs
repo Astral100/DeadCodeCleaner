@@ -96,9 +96,11 @@ public static class Program
                         Console.Error.WriteLine($"error: {report.ProjectsWithCompileErrors} project(s) had compile errors during analysis — references in them are invisible and the cascade may over-delete; fix the build first, or pass --allow-compile-errors; nothing was deleted");
                         return 1;
                     }
-                    if (report.StillReferencedTargets > 0 && !opts.NoVerify)
+                    // Deliberately NOT tied to --no-verify: skipping the expensive rebuild for speed
+                    // must never also waive this independent, already-computed refusal.
+                    if (report.StillReferencedTargets > 0 && !opts.AllowStillReferenced)
                     {
-                        Console.Error.WriteLine($"error: {report.StillReferencedTargets} removal target(s) are still referenced by surviving code (see the STILL REFERENCED warnings) — deleting them breaks the callers, or silently rebinds them to another overload; fix the callers first (--no-verify overrides); nothing was deleted");
+                        Console.Error.WriteLine($"error: {report.StillReferencedTargets} removal target(s) are still referenced by surviving code (see the STILL REFERENCED warnings) — deleting them breaks the callers, or silently rebinds them to another overload; fix the callers first (--allow-still-referenced overrides); nothing was deleted");
                         return 1;
                     }
                     var reviewTests = report.Symbols.Count(s => s.Review);
@@ -155,6 +157,7 @@ public static class Program
                 case "--config": opts.ConfigPath = Path.GetFullPath(Next()); break;
                 case "--strict-members": opts.StrictMembers = true; break;
                 case "--no-verify": opts.NoVerify = true; break;
+                case "--allow-still-referenced": opts.AllowStillReferenced = true; break;
                 case "--allow-compile-errors": opts.AllowCompileErrors = true; break;
                 case "--delete-review-tests": opts.DeleteReviewTests = true; break;
                 case "--verbose" or "-v": opts.Verbose = true; break;
@@ -187,6 +190,7 @@ public static class Program
               --config <path>         JSON config: { "keep": ["Ns.Type*", ...], "strictMembers": false }
               --strict-members        do not auto-keep public properties / enum members of in-use types
               --no-verify             skip the in-memory rebuild that checks the plan compiles
+              --allow-still-referenced  let delete run although surviving code still references a removal target
               --allow-compile-errors  let delete run although some projects failed to compile during analysis
               --delete-review-tests   delete review-flagged tests too (default: delete refuses while any exist)
               --verbose               print full lists instead of the first 100

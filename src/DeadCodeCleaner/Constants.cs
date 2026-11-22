@@ -24,6 +24,7 @@ public static class Constants
     public const int ShownInactiveMentions = 10;
     public const int ShownDynamicMentions = 10;
     public const int ShownConfigMentions = 10;
+    public const int ShownViewMentions = 10;
     public const int MaxScannedConfigFileBytes = 1_000_000;
 
     public const string CategoryRemoved = "removed";
@@ -53,6 +54,13 @@ public static class Constants
     public static readonly HashSet<string> NonCompiledContentExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".cshtml", ".razor", ".aspx", ".ascx", ".master", ".asax", ".xaml", ".axaml", ".svc", ".asmx", ".ashx",
+    };
+
+    /// <summary>Runtime-compiled markup whose TEXT is scanned for deleted-symbol mentions: these
+    /// files reference C# symbols by name, compile at runtime, and are invisible to the verifier.</summary>
+    public static readonly HashSet<string> ViewFileExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".cshtml", ".vbhtml", ".razor", ".aspx", ".ascx", ".master", ".asax",
     };
 
     /// <summary>Directories never descended into when scanning project folders for content files.</summary>
@@ -126,9 +134,12 @@ public static class Constants
     public const string ReportGeneratorJsonFragment = "\"generator\": \"DeadCodeCleaner\"";
 
     public const string TestProjectNamePattern = @"(^|[._])Tests?([._]|$)";
-    /// <summary>Whole package ids only (closing quote required): "xunit.abstractions" alone marks a
-    /// LIBRARY that extends a test framework, not a test project, and must not match.</summary>
-    public const string TestPackagePattern = @"Include\s*=\s*[""'](xunit(\.core|\.runner\.[\w.]+|\.extensibility\.[\w.]+)?|nunit|nunit3testadapter|nunitlite|mstest(\.testframework|\.testadapter)?|microsoft\.net\.test\.sdk)[""']";
+    /// <summary>Whole package/assembly ids only (anchored): "xunit.abstractions" alone marks a
+    /// LIBRARY that extends a test framework, not a test project, and must not match. Matched
+    /// against the id part of parsed PackageReference/Reference Include values, never raw text.</summary>
+    public const string TestPackageIdPattern = @"^(xunit(\.v3)?(\.core|\.runner\.[\w.]+|\.extensibility\.[\w.]+)?|nunit|nunit\.framework|nunit3testadapter|nunitlite|mstest(\.testframework|\.testadapter)?|microsoft\.net\.test\.sdk|microsoft\.visualstudio\.qualitytools\.unittestframework)$";
+    /// <summary>Legacy csproj ProjectTypeGuids entry marking an MSTest project.</summary>
+    public const string TestProjectTypeGuid = "3AC096D0-A1C2-E12C-1390-A8335801FDAB";
 
     public static readonly JsonSerializerOptions CaseInsensitiveJson = new() { PropertyNameCaseInsensitive = true };
 

@@ -25,8 +25,10 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
    no static references by design — EF migrations and `IEntityTypeConfiguration<>` classes,
    ViewComponents, TagHelpers, Razor PageModels, Blazor components, SignalR hubs, middleware
    (`IMiddleware` or a `RequestDelegate` constructor), Quartz jobs, and the WebForms/legacy surface
-   (`Page`/`UserControl`/`MasterPage` code-behind, `HttpApplication`, `IHttpModule`, `IHttpHandler`)
-   — plus anything matched by the config's `keep` patterns.
+   (`Page`/`UserControl`/`MasterPage` code-behind, `HttpApplication`, `IHttpModule`, `IHttpHandler`,
+   ASMX `WebService` subclasses, WCF `[ServiceContract]` contracts and their implementations, MEF
+   `[Export]` types, and config-wired `MembershipProvider`/`RoleProvider`/`ProfileProvider`/
+   `ConfigurationSection` subclasses) — plus anything matched by the config's `keep` patterns.
 3. Reachability ("in use") is computed twice: from all roots, and from all roots with the removal
    targets treated as deleted. The difference is the complete cascade. Code unreachable in the
    baseline is pre-existing dead code and is never reported.
@@ -97,8 +99,12 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
 
 ### Tests
 
-Test projects (by name, direct test-framework package references, or `<IsTestProject>`) never keep
-production code in use. When production code is deleted, any test referencing it is deleted too
+Test projects never keep production code in use. Classification demands evidence: a direct
+test-framework reference, `<IsTestProject>`, or a test `ProjectTypeGuids` entry — parsed from the
+csproj as XML, so a commented-out package is not evidence. A test-like NAME alone ("X.Tests",
+"TestCommon") classifies only non-executables, and gets a warning naming the project; an executable
+with an entry point and no test-framework evidence stays production whatever it is called
+("LoadTest", "X.Test.Tools"). When production code is deleted, any test referencing it is deleted too
 ("broken-test"), test helpers used only by those tests cascade ("orphaned-test-helper"), and a
 deleted test that *also* touches surviving production code is flagged `[REVIEW]`. One broken test
 never takes its healthy siblings along: the class is deleted only when every test in it died. Code
@@ -116,7 +122,10 @@ re-analyzes on every run, so adjusted tests simply survive), then run `delete` a
 Code that was already orphaned before the removal stays untouched — unless it references newly
 deleted code, in which case it would no longer compile and is deleted too ("broken-orphan"
 category), cascading transitively. A dead member of a dead type escalates to the whole type, so no
-half-deleted class is left violating an interface contract.
+half-deleted class is left violating an interface contract — but never when the TEST world still
+reaches the type: a sibling member kept alive by a healthy test references nothing deleted, so only
+the broken member goes and the class, its test-live members and their tests all stay. The same
+holds for the empty-shell pass: a production type tests still construct keeps its (empty) shell.
 
 ## Usage
 
@@ -161,6 +170,12 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   deleting a partial method/property deletes BOTH parts; old-style csproj `<Compile>` entries of
   deleted files are removed too (a deletable file in an explicit-listing project whose entry
   cannot be matched textually gets a loud CS2001 warning instead of a silent broken build).
+  csproj edits get the same safety net as source edits: every csproj to be edited is hashed at
+  analysis time and validated, and its new text computed, BEFORE anything touches the disk — a
+  stale csproj aborts with nothing changed, a failed write rolls the whole plan back, and a
+  `<Compile>` entry that cannot be matched while its source file is planned for deletion aborts up
+  front (a dangling entry would break the build). Only `dotnet sln remove` and the removal of a
+  whole project's files stay best-effort (exit code 3 on leftovers).
   `delete` refuses to run while verification reports new compile
   errors or was incomplete (a project that could not be rebuilt in memory counts as failed, not as
   clean), while review-flagged tests exist (`--delete-review-tests` overrides the latter), while
@@ -168,10 +183,15 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   references in them are invisible, so the cascade may over-delete (`--allow-compile-errors`
   overrides both) — and while any removal target is still
   referenced by surviving code, which would break the callers or silently rebind them to another
-  overload (`--no-verify` overrides).
-- `--config cfg.json` supports `{ "keep": ["Ns.Something*", ...], "strictMembers": false }` —
-  `keep` patterns are extra entry points that are never orphaned, by any pass (use for
-  reflection-only code).
+  overload (`--allow-still-referenced` overrides; deliberately NOT waived by `--no-verify`, which
+  only skips the in-memory rebuild).
+- `--config cfg.json` supports `{ "keep": ["Ns.Something*", ...], "strictMembers": false,
+  "inSolutionRegistrations": false }` — `keep` patterns are extra entry points that are never
+  orphaned, by any pass (use for reflection-only code). Registration/mapping calls (`AddScoped`,
+  `CreateMap`, `RegisterType`, ...) get co-dependent-statement semantics only when the resolved
+  method comes from OUTSIDE the solution (or cannot be resolved at all): a domain method that
+  happens to share the name keeps plain reference semantics. `inSolutionRegistrations: true` opts
+  in solution-declared wrappers and stand-in frameworks.
 - By default, public properties, public FIELDS and enum members of in-use types are kept
   (serializers, marshalling and model binding reach them via reflection); `--strict-members`
   disables that. Fields of `[StructLayout]`/`[DataContract]`/`[Serializable]` types are kept in
@@ -183,7 +203,10 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 - References the compiler cannot see are invisible: reflection by string, routes referenced from
   JavaScript, `web.config`/XML wiring, `RedirectToAction("X", "Y")` strings, Razor views, XAML and
   WCF/handler wiring. A warning
-  is emitted when such files exist in the solution. Use the config `keep` list for such roots, and
+  is emitted when such files exist in the solution, and view/markup files (`.cshtml`, `.aspx`,
+  `.ascx`, `.master`, ...) are additionally scanned by TEXT: a deleted symbol whose name appears in
+  one gets a per-symbol warning, because views compile at runtime where the verifier cannot see
+  them. Use the config `keep` list for such roots, and
   treat the report as a very strong draft, not gospel. Code inside inactive `#if` regions is
   equally invisible (to the analysis AND the verifier, which compiles with the same symbols): when
   a deleted symbol's name still appears in such a region, a warning names it.
@@ -224,7 +247,7 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 
 ## Tests
 
-`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (83 checks covering
+`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (110 checks covering
 MediatR, AutoMapper (incl. `ForMember` chains), DI (generic and `typeof` forms), test poisoning,
 broken-test isolation, pre-existing orphans, member/overload-level removal, project-reference
 cleanup, chain-segment deletion, override and partial-method survival, enum-member removal,
@@ -233,4 +256,6 @@ primary-constructor and primary-base-call safety, inactive `#if` protection and 
 warning, the still-referenced warning, the dynamic-access warning, the enum-renumber warning,
 chained generic type arguments living and dying with their map, attribute-constructor survival,
 the in-memory verification, the review-test delete refusal,
-mark idempotency, and two delete round-trips that must rebuild).
+mark idempotency, two delete round-trips that must rebuild, the container-escalation gate for
+test-live classes, evidence-based test-project classification, assembly-attribute reference needs,
+and the `AsImplementedInterfaces` cascade with `IDisposable` excluded).

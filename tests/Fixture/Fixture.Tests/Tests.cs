@@ -88,6 +88,23 @@ public class MixedTests
     }
 }
 
+// Keeps CollateralHelper.Useful test-alive: removing ObsoleteGizmo must not delete this test.
+public class CollateralHelperTests
+{
+    [Fact]
+    public void Useful_when_called_then_value_is_returned()
+    {
+        // Arrange
+        var expectedValue = 42;
+
+        // Act
+        var actualValue = CollateralHelper.Useful();
+
+        // Assert
+        _ = expectedValue == actualValue;
+    }
+}
+
 // Used only by WidgetsControllerTests: must cascade when that test dies.
 public static class TestData
 {

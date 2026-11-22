@@ -62,7 +62,12 @@ public sealed class GraphBuilder
                 _graph.ProjectsNotAnalyzed.Add(project.Name);
                 continue;
             }
-            bool isTest = IsTestProject(project);
+            var classification = ClassifyProject(project);
+            if (classification == TestClassification.TestByName)
+            {
+                _graph.Warnings.Add($"{project.Name}: classified as a TEST project by its NAME alone (no test-framework reference found) — if it is deployed production code, rename it or keep its symbols, because its code does not count as production roots");
+            }
+            bool isTest = classification != TestClassification.Production;
             compilations.Add((comp, isTest, project.Name));
             _solutionAssemblies.Add(comp.Assembly.Name);
             CollectProjectInfo(project);
@@ -201,6 +206,9 @@ public sealed class GraphBuilder
                     foreach (var f in EnumerateFilesPruned(dir))
                     {
                         if (Constants.NonCompiledContentExtensions.Contains(Path.GetExtension(f)) && seenFiles.Add(f)) { found++; }
+                        // View/markup text is kept for the deleted-symbol mention scan: views
+                        // compile at runtime and are invisible to the compiler AND the verifier.
+                        if (Constants.ViewFileExtensions.Contains(Path.GetExtension(f)) && !_graph.ViewTexts.ContainsKey(f)) { _graph.ViewTexts[f] = ReadConfigText(f); }
                         if (!IsConfigLikeFile(f)) { continue; }
                         var txt = ReadConfigText(f);
                         // This tool's own reports (saved under any --json name) mention every deleted
@@ -413,28 +421,41 @@ public sealed class GraphBuilder
         _graph.Projects[project.Name] = info;
     }
 
-    bool IsTestProject(Project project)
+    TestClassification ClassifyProject(Project project)
     {
-        var name = project.Name;
-        if (name.EndsWith("Test", StringComparison.Ordinal) || name.EndsWith("Tests", StringComparison.Ordinal)
-            || Regex.IsMatch(name, Constants.TestProjectNamePattern) || name.Contains("TestCommon", StringComparison.Ordinal))
-        {
-            return true;
-        }
-        // Only DIRECT test-framework dependencies count: transitive flow through a shared
-        // project reference must not turn a production project into a test project.
+        // Only DIRECT test-framework dependencies count: transitive flow through a shared project
+        // reference must not turn a production project into a test project. The csproj is parsed as
+        // XML, never matched as raw text: a commented-out package is not evidence.
+        bool evidence = false;
         try
         {
             if (project.FilePath != null && File.Exists(project.FilePath))
             {
-                var text = File.ReadAllText(project.FilePath);
-                if (Regex.IsMatch(text, Constants.TestPackagePattern, RegexOptions.IgnoreCase)) { return true; }
-                if (text.Contains("<IsTestProject>true", StringComparison.OrdinalIgnoreCase)) { return true; }
+                foreach (var el in XDocument.Load(project.FilePath).Descendants())
+                {
+                    var ln = el.Name.LocalName;
+                    if (ln is "PackageReference" or "Reference")
+                    {
+                        var include = (string)el.Attribute("Include") ?? (string)el.Attribute("Update") ?? "";
+                        var id = include.Split(',')[0].Trim();
+                        if (Regex.IsMatch(id, Constants.TestPackageIdPattern, RegexOptions.IgnoreCase)) { evidence = true; break; }
+                    }
+                    else if (ln == "IsTestProject" && Regex.IsMatch(el.Value, @"^\s*true\s*$", RegexOptions.IgnoreCase)) { evidence = true; break; }
+                    else if (ln == "ProjectTypeGuids" && el.Value.Contains(Constants.TestProjectTypeGuid, StringComparison.OrdinalIgnoreCase)) { evidence = true; break; }
+                }
             }
         }
-        catch (IOException) { /* unreadable project file: treat as production */ }
-        catch (UnauthorizedAccessException) { /* unreadable project file: treat as production */ }
-        return false;
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Xml.XmlException) { /* unreadable or malformed project file: no evidence */ }
+        if (evidence) { return TestClassification.TestByEvidence; }
+        var name = project.Name;
+        bool nameMatch = name.EndsWith("Test", StringComparison.Ordinal) || name.EndsWith("Tests", StringComparison.Ordinal)
+            || Regex.IsMatch(name, Constants.TestProjectNamePattern) || name.Contains("TestCommon", StringComparison.Ordinal);
+        if (!nameMatch) { return TestClassification.Production; }
+        // An EXECUTABLE with no test-framework evidence is a deployable tool whatever its name says
+        // ("LoadTest", "X.Test.Tools"): classifying it as a test project would strip its production
+        // roots and make everything it exclusively uses deletable.
+        bool exe = project.CompilationOptions?.OutputKind is OutputKind.ConsoleApplication or OutputKind.WindowsApplication or OutputKind.WindowsRuntimeApplication;
+        return exe ? TestClassification.Production : TestClassification.TestByName;
     }
 
     // ---------------------------------------------------------------- Phase 1
@@ -768,6 +789,32 @@ public sealed class GraphBuilder
             rootWholeType = true;
             reason = "convention middleware";
         }
+        else if (HasAttributeNamed(type, "ServiceContractAttribute") || type.AllInterfaces.Any(i => HasAttributeNamed(i, "ServiceContractAttribute")))
+        {
+            rootWholeType = true;
+            reason = "WCF service contract";
+        }
+        else if (BaseChainHasExternalName(type, "WebService", "System.Web"))
+        {
+            rootWholeType = true;
+            reason = "ASMX web service";
+        }
+        else if (HasAttributeNamed(type, "ExportAttribute") || HasAttributeNamed(type, "InheritedExportAttribute"))
+        {
+            rootWholeType = true;
+            reason = "MEF export";
+        }
+        else if (BaseChainHasExternalName(type, "MembershipProvider", "System.Web") || BaseChainHasExternalName(type, "RoleProvider", "System.Web")
+            || BaseChainHasExternalName(type, "ProfileProvider", "System.Web"))
+        {
+            rootWholeType = true;
+            reason = "config-wired provider";
+        }
+        else if (BaseChainHasExternalName(type, "ConfigurationSection", "System.Configuration") || BaseChainHasExternalName(type, "ConfigurationElement", "System.Configuration"))
+        {
+            rootWholeType = true;
+            reason = "configuration section";
+        }
 
         if (rootWholeType)
         {
@@ -806,6 +853,11 @@ public sealed class GraphBuilder
                 break;
             }
         }
+    }
+
+    bool HasAttributeNamed(INamedTypeSymbol type, string name)
+    {
+        return type.GetAttributes().Any(a => a.AttributeClass?.Name == name);
     }
 
     bool BaseChainHasName(INamedTypeSymbol type, params string[] names)
@@ -983,9 +1035,14 @@ public sealed class GraphBuilder
         if (NodeId(sym) is { } id)
         {
             _graph.AddRoot(id, "assembly attribute", isTest);
+            _graph.AddAssemblyAttrRef(projectName, id);
             return;
         }
-        if (NodeId(sym.ContainingType) is { } tid) { _graph.AddRoot(tid, "assembly attribute", isTest); }
+        if (NodeId(sym.ContainingType) is { } tid)
+        {
+            _graph.AddRoot(tid, "assembly attribute", isTest);
+            _graph.AddAssemblyAttrRef(projectName, tid);
+        }
         var asm = sym.ContainingAssembly?.Name;
         if (asm != null && !_solutionAssemblies.Contains(asm)) { _graph.AddProjectExternalRef(projectName, asm); }
     }
@@ -1124,7 +1181,20 @@ public sealed class GraphBuilder
                 _graph.DynamicMemberNames.Add(dmr.MemberName);
                 break;
         }
-        if (op.Type is INamedTypeSymbol named) { Emit(named); }
+        if (op is IConversionOperation icv && icv.IsImplicit)
+        {
+            // An IMPLICIT conversion has no syntax of its own: its target type (the callee's
+            // parameter type binding an argument, a base type on assignment) is the CALLEE's choice,
+            // never a name the caller's text mentions. A liveness edge here would pin every removed
+            // method's parameter types to their callers and stall the cascade. The caller's PROJECT
+            // still needs the type's assembly to compile the call, so it stays a cleanup need.
+            if (op.Type is INamedTypeSymbol wnamed)
+            {
+                if (suppressed || NodeId(wnamed) == null) { RecordExternal(sourceId, wnamed); }
+                else { _graph.AddWeakRef(sourceId, NodeId(wnamed)); }
+            }
+        }
+        else if (op.Type is INamedTypeSymbol named) { Emit(named); }
         foreach (var child in op.ChildOperations) { HarvestOperation(child, sourceId, skipSpans); }
     }
 
@@ -1221,6 +1291,19 @@ public sealed class GraphBuilder
             }
             var typeArgs = (name as GenericNameSyntax)?.TypeArgumentList.Arguments;
 
+            bool looksTracked = (id == Constants.CreateMapMethodName && typeArgs is { Count: 2 })
+                || Constants.MsDiMethodNames.Contains(id) || Constants.AutofacRegisterMethodNames.Contains(id);
+            if (!looksTracked) { continue; }
+            // A tracked NAME alone is not enough: the resolved method must come from OUTSIDE the
+            // solution (AutoMapper, MS-DI, Autofac) — a domain method that happens to share the
+            // name keeps plain edge semantics, or its call sites would inherit registration
+            // deletability. An unresolvable method (partially loaded legacy solution) still counts
+            // as external. Config "inSolutionRegistrations" opts in solution-declared stand-ins.
+            if (!_config.InSolutionRegistrations)
+            {
+                var resolvedAsm = model.GetSymbolInfo(inv).Symbol?.ContainingAssembly?.Name;
+                if (resolvedAsm != null && _solutionAssemblies.Contains(resolvedAsm)) { continue; }
+            }
             if (id == Constants.CreateMapMethodName && typeArgs is { Count: 2 })
             {
                 HandleCreateMap(inv, typeArgs.Value, sourceId, model, ref skip);
@@ -1642,6 +1725,10 @@ public sealed class GraphBuilder
                 {
                     foreach (var i in it.AllInterfaces)
                     {
+                        // Autofac itself EXCLUDES IDisposable/IAsyncDisposable from the registered
+                        // services: counting them as external services would pin nearly every legacy
+                        // registration (and its implementation) forever.
+                        if (i.ContainingNamespace is { IsGlobalNamespace: false } ins && ins.ToDisplayString() == "System" && i.Name is "IDisposable" or "IAsyncDisposable") { continue; }
                         if (NodeId(i) is { } iId) { services.Add(iId); }
                         // An EXTERNAL interface (IHostedService, IAuthorizationHandler): consumers
                         // resolve through it outside the solution's sight.
