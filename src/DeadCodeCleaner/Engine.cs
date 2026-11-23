@@ -1,5 +1,7 @@
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 using Microsoft.CodeAnalysis.MSBuild;
 using System.Text.RegularExpressions;
 
@@ -44,13 +46,22 @@ public sealed class Engine
         // complaints fire for projects that load fine). What gates delete is a project that is IN
         // the solution file but absent from the loaded set: everything it references is invisible.
         int dropped = 0;
+        int websites = 0;
         var loadedPaths = new HashSet<string>(
             solution.Projects.Where(p => p.FilePath != null).Select(p => Path.GetFullPath(p.FilePath)),
             Constants.PathComparer);
         try
         {
             var slnDir = Path.GetDirectoryName(_opts.SolutionPath) ?? "";
-            foreach (Match m in Regex.Matches(File.ReadAllText(_opts.SolutionPath), "\"([^\"]+\\.(?:cs|vb|fs)proj)\""))
+            var slnText = File.ReadAllText(_opts.SolutionPath);
+            // ASP.NET Web Site projects (no csproj, App_Code + markup): excluded from the analysis
+            // entirely, and what they use in other projects is invisible — delete refuses.
+            foreach (Match m in Regex.Matches(slnText, "Project\\(\"\\{" + Constants.WebSiteProjectTypeGuid + "\\}\"\\)\\s*=\\s*\"([^\"]*)\"", RegexOptions.IgnoreCase))
+            {
+                graph.Warnings.Add($"{m.Groups[1].Value}: ASP.NET Web Site project — excluded from the analysis; code it uses in other projects looks unused, so delete refuses (--allow-website-projects overrides)");
+                websites++;
+            }
+            foreach (Match m in Regex.Matches(slnText, "\"([^\"]+\\.(?:cs|vb|fs)proj)\""))
             {
                 var p = Path.GetFullPath(Path.Combine(slnDir, m.Groups[1].Value.Replace('\\', Path.DirectorySeparatorChar)));
                 if (!loadedPaths.Contains(p))
@@ -64,6 +75,7 @@ public sealed class Engine
 
         var (report, lostAssemblies) = ComputeReport(graph, solution);
         report.ProjectsFailedToLoad = dropped + graph.ProjectsNotAnalyzed.Count;
+        report.WebsiteProjects = websites;
         if (_opts.Mode != "find" && !_opts.NoVerify && _opts.RemoveTargets.Count > 0)
         {
             await Verify(solution, graph, report, lostAssemblies);
@@ -195,16 +207,26 @@ public sealed class Engine
             {
                 return d.Id + "|" + (d.Location.SourceTree?.FilePath ?? "") + "|" + d.GetMessage();
             }
+            // The analysis neutralized warnings-as-errors to load the solution: the project's REAL
+            // settings decide which warnings fail its build.
+            var pinfo = graph.Projects.TryGetValue(newProj.Name, out var pi0) ? pi0 : null;
+            bool FailsBuild(Diagnostic d)
+            {
+                if (d.Severity == DiagnosticSeverity.Error) { return true; }
+                if (d.Severity != DiagnosticSeverity.Warning || pinfo == null) { return false; }
+                if (pinfo.WarningsAsErrors.Contains(d.Id)) { return true; }
+                return pinfo.TreatWarningsAsErrors && !pinfo.WarningsNotAsErrors.Contains(d.Id);
+            }
             // Multiset, not set: a NEW instance of an error identical in message to a pre-existing
             // one (same missing type again, in the same file) must still count as new.
             var baseline = new Dictionary<string, int>(StringComparer.Ordinal);
-            foreach (var d in oldComp.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error))
+            foreach (var d in oldComp.GetDiagnostics().Where(FailsBuild))
             {
                 var k = Key(d);
                 baseline.TryGetValue(k, out var c);
                 baseline[k] = c + 1;
             }
-            foreach (var d in newComp.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error))
+            foreach (var d in newComp.GetDiagnostics().Where(FailsBuild))
             {
                 var k = Key(d);
                 if (baseline.TryGetValue(k, out var c) && c > 0)
@@ -263,6 +285,58 @@ public sealed class Engine
         var r1 = Sweeper.Run(graph, graph.Roots, none);
         var r2 = Sweeper.Run(graph, graph.Roots, removed);
         var rt1 = Sweeper.Run(graph, graph.TestRoots, none);
+
+        // The exclusion list kept code alive purely because it is NAMED somewhere the analysis cannot
+        // follow (views, inactive #if code, dynamic, config). Say so where that alone saved it.
+        if (graph.MentionRoots.Count > 0)
+        {
+            var hardRoots = graph.Roots.Where(r => !graph.MentionRoots.ContainsKey(r)).ToList();
+            var r1Hard = Sweeper.Run(graph, hardRoots, none);
+            var r2Hard = Sweeper.Run(graph, hardRoots, removed);
+            int keptByMention = 0;
+            foreach (var (id, where) in graph.MentionRoots.OrderBy(kv => FqnOf(graph, kv.Key), StringComparer.Ordinal))
+            {                if (removed.Contains(id) || !r1Hard.Contains(id) || r2Hard.Contains(id)) { continue; }
+                keptByMention++;
+                if (keptByMention <= Constants.ShownMentionKeeps)
+                {
+                    report.Warnings.Add($"kept (not deleted): {FqnOf(graph, id)} — no code uses it after the removal, but it is {where}, a use the analysis cannot follow; delete it manually if it is really unused");
+                }
+            }
+            if (keptByMention > Constants.ShownMentionKeeps)
+            {
+                report.Warnings.Add($"... and {keptByMention - Constants.ShownMentionKeeps} more kept for the same reason");
+            }
+        }
+
+        // An explicitly removed class an assembly scan registers: the container may have been
+        // resolving it (Autofac: the LAST registration of a service wins, so even an "old" class may
+        // be the one running).
+        foreach (var id in removedSeeds.Where(graph.ScanMatchedTypes.ContainsKey).OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+        {
+            report.Warnings.Add($"removing {FqnOf(graph, id)}: it is registered by the assembly scan at {graph.ScanMatchedTypes[id]} — the container may have been resolving it at runtime; check before deleting");
+        }
+
+        // Removal targets named in hand-written JavaScript: URLs and calls there ("/Admin/GetRoles")
+        // are invisible to the compiler and the verifier.
+        if (graph.ScriptTexts.Count > 0)
+        {
+            var scriptWords = new Dictionary<string, string>(StringComparer.Ordinal);
+            var wordRegex = new Regex(Constants.IdentifierWordPattern);
+            foreach (var (file, text) in graph.ScriptTexts.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+            {
+                foreach (Match m in wordRegex.Matches(text)) { scriptWords.TryAdd(m.Value, file); }
+            }
+            var warnedNames = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var id in removed.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
+            {
+                if (!graph.Decl.TryGetValue(id, out var rs) || rs is IMethodSymbol { MethodKind: not MethodKind.Ordinary }) { continue; }
+                if (rs.Name.Length < Constants.MinMentionNameLength || !warnedNames.Add(rs.Name)) { continue; }
+                if (scriptWords.TryGetValue(rs.Name, out var sf))
+                {
+                    report.Warnings.Add($"removal target {FqnOf(graph, id)} is named in {sf} — calls and URLs in JavaScript are invisible to the analysis; check before deleting");
+                }
+            }
+        }
 
         var orphanProd = new HashSet<string>(StringComparer.Ordinal);
         foreach (var n in graph.Nodes)
@@ -409,10 +483,37 @@ public sealed class Engine
             var allowed = new HashSet<string>(StringComparer.Ordinal) { typeId };
             allowed.UnionWith(containerMembers);
             var allowedAsms = new HashSet<string>(Constants.EmptyContainerBenignAssemblies, StringComparer.OrdinalIgnoreCase);
+            // Members of the FRAMEWORK base (Profile / Module and above) are the mapping/registration
+            // API itself. A user base class in between (BaseModule with RegisterRepositories) holds
+            // code that does real work when called: only the type and its side-effect-free
+            // constructors are allowed there, any other member call keeps the container.
+            var frameworkBaseName = graph.RootReasons[typeId] == Constants.ReasonAutoMapperProfile ? Constants.AutoMapperProfileBaseName : Constants.AutofacModuleBaseName;
+            var memberAllowedBases = new HashSet<string>(StringComparer.Ordinal);
+            var userBaseCtors = new List<string>();
+            bool frameworkReached = false;
             for (var b = nts.BaseType; b != null; b = b.BaseType)
             {
-                if (Graph.Id(b) is { } bid) { allowed.Add(bid); }
+                if (b.Name == frameworkBaseName) { frameworkReached = true; }
+                if (Graph.Id(b.OriginalDefinition) is { } bid)
+                {
+                    allowed.Add(bid);
+                    if (frameworkReached) { memberAllowedBases.Add(bid); }
+                    else { userBaseCtors.AddRange(b.OriginalDefinition.InstanceConstructors.Select(Graph.Id).Where(id => id != null)); }
+                }
                 if (b.ContainingAssembly?.Name is { } ban) { allowedAsms.Add(ban); }
+            }
+            // A user base constructor is allowed only when it is inert: no statements, no external
+            // calls, and no references beyond the base chain (implicit chaining to the next base ctor).
+            // Topmost first, so a lower constructor chaining upward sees whether the upper one passed.
+            for (int ui = userBaseCtors.Count - 1; ui >= 0; ui--)
+            {
+                var bcId = userBaseCtors[ui];
+                bool inert = !stmtsByMember.ContainsKey(bcId)
+                    && !graph.ExternalCallRefs.ContainsKey(bcId)
+                    && (!graph.Edges.TryGetValue(bcId, out var bcOuts)
+                        || bcOuts.All(t => allowed.Contains(t)
+                            || (graph.ContainerOf.TryGetValue(t, out var btc) && memberAllowedBases.Contains(btc))));
+                if (inert) { allowed.Add(bcId); }
             }
             bool eligible = true;
             int stmtsTotal = 0;
@@ -423,7 +524,7 @@ public sealed class Engine
                     foreach (var t in outs)
                     {
                         bool ok = allowed.Contains(t)
-                            || (graph.ContainerOf.TryGetValue(t, out var tc) && allowed.Contains(tc));
+                            || (graph.ContainerOf.TryGetValue(t, out var tc) && (tc == typeId || containerMembers.Contains(tc) || memberAllowedBases.Contains(tc)));
                         if (!ok)
                         {
                             eligible = false;
@@ -506,7 +607,24 @@ public sealed class Engine
         int publicApiDeleted = 0;
         foreach (var id in allDead.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal).ThenBy(x => x, StringComparer.Ordinal))
         {
-            if (HasDeadContainer(graph, id, allDead)) { continue; }
+            if (HasDeadContainer(graph, id, allDead))
+            {
+                // A requested removal inside a type that dies for another reason: the type's entry
+                // deletes it, but it must still be listed as requested — without parts of its own.
+                if (removed.Contains(id) && graph.Decl.TryGetValue(id, out var coveredSym) && graph.ContainerOf.TryGetValue(id, out var coveringId))
+                {
+                    while (graph.ContainerOf.TryGetValue(coveringId, out var up) && allDead.Contains(up)) { coveringId = up; }
+                    report.Symbols.Add(new SymbolDeletion
+                    {
+                        Fqn = SymbolNames.Fqn(coveredSym),
+                        Kind = SymbolNames.Kind(coveredSym),
+                        Category = Constants.CategoryRemoved,
+                        Parts = new List<SourcePart>(),
+                        CoveredBy = FqnOf(graph, coveringId),
+                    });
+                }
+                continue;
+            }
             if (!graph.Decl.TryGetValue(id, out var symbol)) { continue; }
             var category = removed.Contains(id) ? Constants.CategoryRemoved
                 : orphanProd.Contains(id) ? Constants.CategoryOrphaned
@@ -528,6 +646,14 @@ public sealed class Engine
                     review = true;
                     note = "also references surviving code: " + string.Join(", ", surviving);
                 }
+            }
+            else if (brokenOrphans.Contains(id) && symbol is INamedTypeSymbol bot && FrameworkBaseOf(graph, bot) is { } fw && !ReferencedInSolution(graph, id))
+            {
+                // "Already unused" may only mean the analysis cannot see who uses it: a class built on
+                // an outside framework type that nothing in the solution names is typically created by
+                // that framework at runtime (scanning, conventions). Never deleted unconfirmed.
+                review = true;
+                note = $"possibly created by a framework at runtime: built on {fw} from outside the solution, and nothing in the solution references it";
             }
             var parts = DeclarationParts(graph, symbol, id, allDead, keptInPlace, report.Warnings, report.FileTextLengths, report.FileTextHashes);
             if (parts.Count == 0) { continue; }
@@ -858,7 +984,7 @@ public sealed class Engine
         var deletableFileSet = new HashSet<string>(report.DeletableFiles, Constants.PathComparer);
         foreach (var sym in report.Symbols)
         {
-            sym.InDeletableFile = sym.Parts.All(p => deletableFileSet.Contains(p.File));
+            sym.InDeletableFile = sym.Parts.Count > 0 && sym.Parts.All(p => deletableFileSet.Contains(p.File));
         }
 
         var lostAssemblies = ComputeProjectCleanup(graph, report, allDead, keptInPlace, deletableFileSet, deadStmts);
@@ -902,6 +1028,81 @@ public sealed class Engine
         foreach (var (file, text) in texts)
         {
             if (text.Contains(needle, StringComparison.OrdinalIgnoreCase)) { return file; }
+        }
+        return null;
+    }
+
+    /// <summary>The first base class or interface of the type that comes from outside the solution
+    /// and outside the plain BCL (Exception, IDisposable, IEquatable are not frameworks), or null.</summary>
+    string FrameworkBaseOf(Graph graph, INamedTypeSymbol type)
+    {
+        bool IsFramework(INamedTypeSymbol t)
+        {
+            if (Graph.Id(t.OriginalDefinition) is { } tid && graph.Nodes.Contains(tid)) { return false; }
+            var asm = t.ContainingAssembly?.Name;
+            return asm != null && !Constants.EmptyContainerBenignAssemblies.Contains(asm);
+        }
+        for (var b = type.BaseType; b != null; b = b.BaseType)
+        {
+            if (IsFramework(b)) { return SymbolNames.Fqn(b.OriginalDefinition); }
+        }
+        foreach (var i in type.AllInterfaces)
+        {
+            if (IsFramework(i)) { return SymbolNames.Fqn(i.OriginalDefinition); }
+        }
+        return null;
+    }
+
+    /// <summary>True when any code outside the type (or a tracked statement) references the type or
+    /// one of its members.</summary>
+    bool ReferencedInSolution(Graph graph, string typeId)
+    {
+        bool Inside(string id)
+        {
+            for (var cur = id; cur != null; cur = graph.ContainerOf.TryGetValue(cur, out var c) ? c : null)
+            {
+                if (cur == typeId) { return true; }
+            }
+            return false;
+        }
+        foreach (var (src, outs) in graph.Edges)
+        {
+            if (Inside(src)) { continue; }
+            if (outs.Any(Inside)) { return true; }
+        }
+        return graph.Statements.Any(s => s.InvolvedNodes.Any(Inside));
+    }
+
+    /// <summary>Every package the given package depends on, transitively (from project.assets.json).</summary>
+    HashSet<string> PackageDependencyClosure(ProjectInfo pi, string package)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stack = new Stack<string>();
+        stack.Push(package);
+        while (stack.Count > 0)
+        {
+            if (!pi.PackageDependencies.TryGetValue(stack.Pop(), out var deps)) { continue; }
+            foreach (var d in deps)
+            {
+                if (seen.Add(d)) { stack.Push(d); }
+            }
+        }
+        return seen;
+    }
+
+    /// <summary>The first config-like file (any project) naming the project's assembly as an
+    /// assembly-qualified type's assembly part (", Lib" followed by a quote, comma or line end), or null.</summary>
+    string AssemblyConfigMention(Graph graph, string projectName)
+    {
+        if (!graph.Projects.TryGetValue(projectName, out var pi)) { return null; }
+        var asm = string.IsNullOrEmpty(pi.AssemblyName) ? projectName : pi.AssemblyName;
+        var pattern = new Regex(@",\s*" + Regex.Escape(asm) + @"\s*(?=[""',<]|$)", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        foreach (var texts in graph.ConfigTextsByProject.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Value))
+        {
+            foreach (var (file, text) in texts)
+            {
+                if (pattern.IsMatch(text)) { return file; }
+            }
         }
         return null;
     }
@@ -1050,6 +1251,23 @@ public sealed class Engine
                 }
             }
             var lines = tree.GetLineSpan(node.Span);
+            // A declaration that starts mid-line ("int a; int b;") shares its first line with other
+            // code: its trailing line break belongs to that line and stays, or the next line (a
+            // "#if", say) is joined onto it. Such a part also gets no marker line: the line above
+            // would label the code that starts the shared line.
+            var sourceText = tree.GetText();
+            var startLine = sourceText.Lines[lines.StartLinePosition.Line];
+            bool startsMidLine = sourceText.ToString(TextSpan.FromBounds(startLine.Start, node.Span.Start)).Trim().Length > 0;
+            if (startsMidLine && node is not EnumMemberDeclarationSyntax)
+            {
+                int keptEnd = node.Span.End;
+                foreach (var tr in node.GetTrailingTrivia())
+                {
+                    if (tr.IsKind(SyntaxKind.EndOfLineTrivia)) { break; }
+                    keptEnd = tr.FullSpan.End;
+                }
+                spanEnd = Math.Min(spanEnd, keptEnd);
+            }
             fileLengths[tree.FilePath] = tree.Length;
             fileHashes[tree.FilePath] = TreeHashOf(tree);
             parts.Add(new SourcePart
@@ -1060,6 +1278,7 @@ public sealed class Engine
                 SpanStart = spanStart,
                 SpanLength = spanEnd - spanStart,
                 MarkerLineInsideToken = Editor.LineStartsInsideToken(tree, lines.StartLinePosition.Line),
+                StartsMidLine = startsMidLine,
             });
         }
         return parts;
@@ -1293,6 +1512,24 @@ public sealed class Engine
                 }
                 pc.Add(pkg);
             }
+            // A package another REMAINING package depends on is often listed only to pin its version
+            // upward (a security fix): removing the line silently drops it back to the minimum the
+            // other package accepts. Kept, to a fixed point (a kept package's own dependencies count).
+            bool pinKept = true;
+            while (pinKept)
+            {
+                pinKept = false;
+                foreach (var pkg in pc.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList())
+                {
+                    var dependent = pi.PackageReferences
+                        .Where(other => !pc.Contains(other) && !StringComparer.OrdinalIgnoreCase.Equals(other, pkg))
+                        .FirstOrDefault(other => PackageDependencyClosure(pi, other).Contains(pkg));
+                    if (dependent == null) { continue; }
+                    pc.Remove(pkg);
+                    pinKept = true;
+                    report.Warnings.Add($"{pname}: PackageReference {pkg} lost its last direct user but {dependent} depends on it — left in place (it may pin a newer version), remove manually if appropriate");
+                }
+            }
             foreach (var (refName, include) in pi.ProjectReferences)
             {
                 bool targetDeleted = deletableProjects.Contains(refName);
@@ -1302,6 +1539,14 @@ public sealed class Engine
                 if (!targetDeleted && pi.ConditionalProjectRefIncludes.Contains(include.Replace('\\', '/')))
                 {
                     report.Warnings.Add($"{pname}: ProjectReference {refName} lost its last user but is conditional (build-configuration dependent) — left in place, remove manually if appropriate");
+                    continue;
+                }
+                // An assembly named in configuration ("Lib.LibModule, Lib" in web.config) is loaded at
+                // runtime: dropping the reference stops it shipping. Any project's config counts, since
+                // the assembly flows transitively into every consuming application.
+                if (!targetDeleted && AssemblyConfigMention(graph, refName) is { } refCfg)
+                {
+                    report.Warnings.Add($"{pname}: ProjectReference {refName} lost its last compile-time user but its assembly is named in {refCfg} — left in place, remove manually if appropriate");
                     continue;
                 }
                 rc.Add(refName);
@@ -1461,7 +1706,7 @@ public sealed class Engine
                 {
                     report.CompileEntryRemovals.Add(new ReferenceRemoval { Project = pname, CsprojPath = pi.FilePath, Reference = match });
                 }
-                else if (file.StartsWith(pdir + Path.DirectorySeparatorChar, Constants.PathComparison))
+                else if (!pi.DefaultCompileItems && file.StartsWith(pdir + Path.DirectorySeparatorChar, Constants.PathComparison))
                 {
                     // An explicit-listing project owns the file but none of its <Compile> entries
                     // matched textually (MSBuild property in the Include, odd relative form): the
@@ -1496,21 +1741,27 @@ public sealed class Engine
         var solutionAssemblies = new HashSet<string>(
             graph.Projects.Values.Select(p => p.AssemblyName).Where(a => a.Length > 0),
             StringComparer.OrdinalIgnoreCase);
-        var nameAlive = new Dictionary<string, bool>(StringComparer.Ordinal);
-        void MarkName(string name, bool alive)
+        // Liveness is tracked PER ASSEMBLY: a compiled reference only carries the namespaces its own
+        // surviving types live in, so another project's types under the same namespace name cannot
+        // keep a "using" alive in a consumer that does not reference that project.
+        var nameDeclared = new HashSet<string>(StringComparer.Ordinal);
+        var nameAliveIn = new HashSet<string>(StringComparer.Ordinal);
+        void MarkName(string asm, string name, bool alive)
         {
-            nameAlive[name] = nameAlive.TryGetValue(name, out var a) ? a || alive : alive;
+            nameDeclared.Add(name);
+            if (alive) { nameAliveIn.Add(asm + "|" + name); }
         }
         foreach (var (id, sym) in graph.Decl)
         {
             if (sym is not INamedTypeSymbol t) { continue; }
             bool alive = Stays(id);
-            MarkName(SymbolNames.Fqn(t), alive);
+            var tasm = t.ContainingAssembly?.Name ?? "";
+            MarkName(tasm, SymbolNames.Fqn(t), alive);
             if (t.ContainingType != null) { continue; }
             var ns = t.ContainingNamespace?.IsGlobalNamespace == false ? t.ContainingNamespace.ToDisplayString() : "";
             for (var cur = ns; cur.Length > 0;)
             {
-                MarkName(cur, alive);
+                MarkName(tasm, cur, alive);
                 var dot = cur.LastIndexOf('.');
                 cur = dot < 0 ? "" : cur[..dot];
             }
@@ -1526,8 +1777,9 @@ public sealed class Engine
             if (deletableFiles.Contains(u0.File)) { continue; }
             bool allGone = relevant.All(u => u.Providers.Count > 0
                 && goneByProject.TryGetValue(u.Project, out var gone) && u.Providers.All(gone.Contains));
-            bool nameDies = nameAlive.TryGetValue(u0.ResolvedName, out var stillAlive) && !stillAlive
-                && relevant.All(u => u.Providers.Count > 0 && u.Providers.All(solutionAssemblies.Contains));
+            bool nameDies = nameDeclared.Contains(u0.ResolvedName)
+                && relevant.All(u => u.Providers.Count > 0 && u.Providers.All(solutionAssemblies.Contains)
+                    && !u.Providers.Any(p => nameAliveIn.Contains(p + "|" + u0.ResolvedName)));
             if (allGone || nameDies)
             {
                 report.FileTextLengths[u0.File] = u0.FileTextLength;
@@ -1734,13 +1986,15 @@ public sealed class Engine
             // deleting it would take healthy tests along. Test classes still die whole.
             foreach (var (type, members) in membersOf)
             {
-                if (dead.Contains(type) || seeds.Contains(type) || r2.Contains(type)) { continue; }
+                // A keep-protected type never dies (Kill refuses it): skipping it here also keeps this
+                // loop from re-trying it forever.
+                if (dead.Contains(type) || seeds.Contains(type) || r2.Contains(type) || keptProtected.Contains(type)) { continue; }
                 if (rt1.Contains(type) && !graph.TestNodes.Contains(type)) { continue; }
                 if (!graph.Nodes.Contains(type)) { continue; }
                 if (members.Count > 0 && members.All(m => dead.Contains(m) || seeds.Contains(m)))
                 {
                     Kill(type);
-                    changed = true;
+                    if (dead.Contains(type)) { changed = true; }
                 }
             }
         }

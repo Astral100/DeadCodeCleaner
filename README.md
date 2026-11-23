@@ -22,13 +22,21 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
    its own — its declaring syntax IS the type declaration, so uses of it count as uses of the type.
 2. Entry points ("roots") are detected: `Main`, controllers (name or base class), hosted services,
    `Startup`/`Program`, AutoMapper profiles, Autofac modules, and framework-discovered code that has
-   no static references by design — EF migrations and `IEntityTypeConfiguration<>` classes,
+   no static references by design — EF migrations, `IEntityTypeConfiguration<>` classes and EF6
+   `EntityTypeConfiguration<>`/`ComplexTypeConfiguration<>` subclasses, MVC `AreaRegistration`
+   subclasses, Ninject modules, `[ModuleInitializer]` methods,
    ViewComponents, TagHelpers, Razor PageModels, Blazor components, SignalR hubs, middleware
    (`IMiddleware` or a `RequestDelegate` constructor), Quartz jobs, and the WebForms/legacy surface
-   (`Page`/`UserControl`/`MasterPage` code-behind, `HttpApplication`, `IHttpModule`, `IHttpHandler`,
+   (`Page`/`UserControl`/`MasterPage` code-behind with EVERY method — `Page_Load` and markup-wired
+   handlers are protected and called by name — `HttpApplication` with its `Application_*`/`Session_*`
+   event methods at any accessibility, the method named by `[assembly: PreApplicationStartMethod]`
+   and its WebActivatorEx variants, `IHttpModule`, `IHttpHandler`,
    ASMX `WebService` subclasses, WCF `[ServiceContract]` contracts and their implementations, MEF
    `[Export]` types, and config-wired `MembershipProvider`/`RoleProvider`/`ProfileProvider`/
    `ConfigurationSection` subclasses) — plus anything matched by the config's `keep` patterns.
+   A field or auto-property whose initializer DOES something (a call, or creating an external
+   non-trivial object such as a `Timer`) stays while its type is in use, exactly as the same code
+   in a constructor would.
    Base classes and interfaces are recognized by name only when they come from OUTSIDE the
    solution (the real framework): a solution's own `Profile` or `Hub` class is ordinary code, and
    its subclasses are not roots.
@@ -72,7 +80,11 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   solution (`AddSingleton<IAuthorizationHandler, MinAgeHandler>()`, Autofac `As<IExternal>()`,
   `Keyed<T>`/`Named<T>`, or `AsImplementedInterfaces()` over external interfaces) is resolved by
   the framework at runtime, so no in-solution reference to it can exist: it stays alive (and keeps
-  its implementation alive) while its registering member does.
+  its implementation alive) while its registering member does. Autofac's non-generic forms
+  (`As(typeof(IFoo))`, `Named("x", typeof(IFoo))`, `Keyed(k, typeof(IFoo))`) register services
+  exactly like the generic ones; a `Type` that is not a `typeof`, or any chained call the tool does
+  not know (it may declare services the walk cannot see), keeps the registration alive while its
+  registering member is.
 - **Empty containers**: an AutoMapper profile or Autofac module whose every mapping/registration
   died (and that nothing surviving references) is deleted whole — unless a config `keep` pattern
   matches it, or any of its members still calls into an external assembly beyond a small benign
@@ -84,17 +96,23 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   `Load` blocks the deletion even on .NET Framework, where everything lives in `mscorlib`. Writes
   to external members count as such side effects too (`ServicePointManager.SecurityProtocol = ...`,
   `CultureInfo.DefaultThreadCurrentCulture = ...`, event subscriptions), except writes to the
-  container's own state. Code in nested types counts as part of the container, and the pass repeats
+  container's own state. Calls into a USER base class between the container and the framework base
+  (`OrdersModule : BaseModule` calling `RegisterRepositories(b)`) block it too: such helpers do the
+  real registering. Code in nested types counts as part of the container, and the pass repeats
   until nothing more dies. Constructor initializers (`: base("name")`, explicit or the implicit base
   call) do NOT count as such calls — they die with the type. Chained generic type
   arguments (`ConvertUsing<TConverter>()`, `Include<TDerived, TOther>()`) are statement references
   too: they stay alive while the map lives and die with it.
 - **Build plumbing cascades too**: a NuGet `PackageReference` or `ProjectReference` whose last
   surviving user was deleted is removed from the csproj (entries under a `Condition` are left in
-  place with a warning — only one build configuration is analyzed); `using` directives that no
+  place with a warning — only one build configuration is analyzed — and so is a project reference
+  whose assembly a config file names, as in `type="Lib.Module, Lib"`, and a package another
+  remaining package depends on: it may be listed only to pin a newer version, and removing it would
+  silently downgrade); `using` directives that no
   assembly can satisfy any more are removed (matched under their RESOLVED names, so `using Sub;`
   inside `namespace A` means `A.Sub`; a file banner above the first using is never deleted with
-  it); a project whose every declaration is deleted is removed from the
+  it). A namespace is judged per referenced assembly: another project's types under the same name
+  do not keep a `using` alive in a consumer that never references that project. A project whose every declaration is deleted is removed from the
   solution and its csproj deleted (directory too, when nothing but code remained) — unless one of
   its files carries inactive `#if` regions or duplicate type names; then the project stays, with a
   warning, and only its code is deleted file by file. Transitive
@@ -140,6 +158,57 @@ reaches the type: a sibling member kept alive by a healthy test references nothi
 the broken member goes and the class, its test-live members and their tests all stay. The same
 holds for the empty-shell pass: a production type tests still construct keeps its (empty) shell.
 
+"Already orphaned" can also mean the analysis cannot see who uses the code: frameworks create
+classes by scanning and conventions with no line of the solution naming them. So a broken-orphan
+CLASS built on an outside framework type (a base class or interface from outside the solution and
+outside the plain BCL — `Exception` or `IDisposable` do not count) that nothing in the solution
+references is flagged `[REVIEW]` ("possibly created by a framework at runtime"), and `delete`
+refuses while any exist (`--delete-review-orphans` deletes them as-is). Plain leftover classes are
+still deleted automatically.
+
+### Assembly scanning
+
+Registrations by assembly scanning name no class, so each scan is read from the code: Autofac's
+`RegisterAssemblyTypes(...)` along its fluent chain, and the Scrutor / StructureMap / Lamar /
+Windsor / Ninject / Unity forms over their whole statement.
+
+- **Which assemblies**: `typeof(X).Assembly`, `FromAssemblyOf<X>()`, `FromThisAssembly()`,
+  `Assembly.GetExecutingAssembly()`, ...; anything else (a variable, `FromLoadedAssemblies()`)
+  means every solution assembly, with a warning.
+- **Which classes** (Autofac `.Where(t => ...)` and `AssignableTo<T>()`): `t.Name`/`t.Namespace`/
+  `t.FullName` with `EndsWith`/`StartsWith`/`Contains`/`==`/`!=`, `t.IsSubclassOf(typeof(B))`,
+  `t.IsAssignableTo(typeof(B))`, `typeof(B).IsAssignableFrom(t)`, `t.IsClass`/`IsAbstract`/...,
+  combined with `&&`, `||`, `!`. A part that cannot be read widens the filter (warned); other
+  libraries' filters are not read at all — every class matches.
+- **How they register**: under every interface (`AsImplementedInterfaces()` and equivalents — a
+  matching class lives while the scanning code and ANY of its interfaces live), under the interface
+  named `I` + class name only (`WithDefaultConventions()`, `FromMatchingInterface`,
+  `BindDefaultInterface()`, `WithServiceDefaultInterfaces()`, `AsMatchingInterface()`), or as
+  itself only (`AsSelf()`, Autofac's default — the user of such a class names it in code anyway).
+
+So a scanned class whose interface nobody uses any more still dies with it, and a class the filter
+excludes stays deletable. Explicitly removing a class a scan registers warns: the container may
+have been resolving it (with Autofac the LAST registration of a service wins).
+
+### The exclusion list
+
+Some uses cannot be traced reliably. Code named there is never deleted — it is treated as in use,
+and a "kept (not deleted)" warning names it whenever that alone saved it:
+
+1. Razor views (`.cshtml`, `.vbhtml`, `.razor`) — any class or member whose name appears.
+2. WebForms markup (`.aspx`, `.ascx`, `.master`, `.asax`) — the same; code-behind classes are roots.
+3. Config files (`.config`, `.json`) — any class whose full name appears.
+4. Inactive `#if` code — any class or member whose name appears.
+5. `dynamic` access — any member with the accessed name.
+6. JavaScript (`.js`, minified bundles skipped) — scanned for the removal targets' names (a warning).
+7. ASP.NET Web Site projects (no csproj, `App_Code`) — never analyzed or edited; `delete` refuses
+   while the solution has one, since what they use elsewhere looks unused
+   (`--allow-website-projects` overrides).
+8. Generated code (`obj/`, source generators) — never edited.
+
+Matching is by name (3+ characters), so it over-keeps. An explicit removal target is still removed
+even when mentioned — with a warning naming where.
+
 ## Usage
 
 ```bash
@@ -175,16 +244,21 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   one file (linked files on a case-insensitive filesystem under case-sensitive path rules, e.g.
   WSL `/mnt`) are collapsed to the on-disk spelling, so one file is never edited as two. `mark`
   skips (with a warning) any file — csproj included — whose decoded text no longer matches the
-  analysis, and any marker whose line begins inside a multi-line string literal (the marker line
-  would become part of the string). Span edits
+  analysis, any marker whose line begins inside a multi-line string literal (the marker line
+  would become part of the string), and any declaration that starts after other code on its line
+  (the marker would label that other code; such a deletion also leaves the line break in place, so
+  the next line is never joined onto it). Span edits
   are applied before any whole file is deleted. Edits preserve each file's
-  encoding (BOMs, UTF-32 included; non-UTF-8 files are handled byte-preserving via Latin-1) and every untouched
+  encoding (BOMs, UTF-32 included; non-UTF-8 files are decoded with the same legacy code page the
+  compiler uses — the system ANSI page, else Windows-1252 — when that round-trips their bytes,
+  and byte-preserving via Latin-1 otherwise) and every untouched
   line's own line ending, never swallow a `#region`/`#if` directive whose counterpart survives,
   and never delete a file whole when it carries global usings, assembly attributes, or inactive
   `#if` regions (code the compiler cannot see). Deleting an enum member takes its separator comma;
   deleting a partial method/property deletes BOTH parts; old-style csproj `<Compile>` entries of
   deleted files are removed too (a deletable file in an explicit-listing project whose entry
-  cannot be matched textually gets a loud CS2001 warning instead of a silent broken build).
+  cannot be matched textually gets a loud CS2001 warning instead of a silent broken build; an
+  SDK-style project with default compile items never needs one, even when it lists a linked file).
   csproj edits get the same safety net as source edits: every csproj to be edited is hashed at
   analysis time and validated, and its new text computed, BEFORE anything touches the disk — a
   stale csproj aborts with nothing changed, a failed write rolls the whole plan back, and a
@@ -203,7 +277,11 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   overrides both) — and while any removal target is still
   referenced by surviving code, which would break the callers or silently rebind them to another
   overload (`--allow-still-referenced` overrides; deliberately NOT waived by `--no-verify`, which
-  only skips the in-memory rebuild).
+  only skips the in-memory rebuild), and while no production entry point was detected at all
+  (every caller of a target would be deleted with it; `--allow-no-roots` overrides). The
+  verification honours each project's REAL warnings-as-errors settings (`TreatWarningsAsErrors`,
+  `WarningsAsErrors`, `WarningsNotAsErrors`, read from the csproj and every `Directory.Build.props`
+  above it), although the analysis itself neutralizes them to load the solution.
 - `--config cfg.json` supports `{ "keep": ["Ns.Something*", ...], "strictMembers": false,
   "inSolutionRegistrations": false }` — `keep` patterns are extra entry points that are never
   orphaned, by any pass (use for reflection-only code). Registration/mapping calls (`AddScoped`,
@@ -220,25 +298,17 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 
 ## Known limitations
 
-- References the compiler cannot see are invisible: reflection by string, routes referenced from
-  JavaScript, `web.config`/XML wiring, `RedirectToAction("X", "Y")` strings, Razor views, XAML and
-  WCF/handler wiring. A warning
-  is emitted when such files exist in the solution, and view/markup files (`.cshtml`, `.aspx`,
-  `.ascx`, `.master`, ...) are additionally scanned by TEXT: a deleted symbol whose name appears in
-  one gets a per-symbol warning, because views compile at runtime where the verifier cannot see
-  them. Every deleted name is scanned, members of wholly-deleted types included (a view names a
-  controller's actions, not the controller). Use the config `keep` list for such roots, and
-  treat the report as a very strong draft, not gospel. Code inside inactive `#if` regions is
-  equally invisible (to the analysis AND the verifier, which compiles with the same symbols): when
-  a deleted symbol's name still appears in such a region, a warning names it.
-- Runtime-only references get targeted warnings, since neither the analysis nor the verifier can
-  decide them: a deleted member whose name is accessed through `dynamic` anywhere; a deleted type
-  or removed package whose name appears in a `.config`/`.json` file under a project directory
-  (such packages are left in place; a config or view file over 1 MB is not scanned, with a warning); DI
-  registration by assembly scanning (`RegisterAssemblyTypes`,
-  `Scan`, ...) anywhere in the solution; and a constructor deleted while its type stays in use
-  (DI or reflection may construct through it). A solution in which no production entry points are
-  detected warns loudly — everything would count as already orphaned. On the console, `VERIFY`,
+- References the compiler cannot see beyond the exclusion list stay invisible: reflection by
+  string, `RedirectToAction("X", "Y")` strings, XAML and WCF/handler wiring. A warning is emitted
+  when such files exist in the solution; use the config `keep` list for such roots, and treat the
+  report as a very strong draft, not gospel. A removal target named in a view, inactive `#if` code,
+  config file or script, or accessed through `dynamic`, is removed as requested but warned about;
+  a removed package named in a config file is left in place. Files over 1 MB are not scanned (with
+  a warning). A constructor deleted while its type stays in use warns (DI or reflection may
+  construct through it). A solution in which no production entry points are
+  detected warns loudly — everything would count as already orphaned — and `delete` refuses.
+  A requested removal inside a type that dies anyway is still listed under the requested removals,
+  as "deleted with" that type. On the console, `VERIFY`,
   `STILL REFERENCED` and "registration deleted although still in use" warnings are always printed,
   even past the 100-warning cap.
 - Deleting an enum member that is not the last renumbers every later member without an explicit
@@ -268,7 +338,7 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 
 ## Tests
 
-`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (123 checks covering
+`tests/run-fixture-tests.sh` runs known-answer checks against `tests/Fixture` (141 checks covering
 MediatR, AutoMapper (incl. `ForMember` chains), DI (generic and `typeof` forms), test poisoning,
 broken-test isolation, pre-existing orphans, member/overload-level removal, project-reference
 cleanup, chain-segment deletion, override and partial-method survival, enum-member removal,
@@ -282,4 +352,11 @@ test-live classes, test-project classification (test library AND a test, never t
 inherited-test fixtures, assembly-attribute reference needs, the `AsImplementedInterfaces` cascade
 with `IDisposable` excluded, keep patterns protecting test code, member names of deleted types in
 views, empty profiles kept for external writes, chained in-solution mapping extensions, mark skipping
-markers inside multi-line strings, and in-solution `Profile` base classes not counting as roots).
+markers inside multi-line strings, in-solution `Profile` base classes not counting as roots, an
+exact-name keep on a test class, and — against EXTERNAL stub assemblies — Global.asax/`Page_Load`/
+`PreApplicationStartMethod`/EF6-configuration roots, Autofac `typeof`/unknown-call registrations, a
+side-effecting field initializer, a base-module helper blocking the empty-container pass,
+warnings-as-errors verification, mid-line deletions before `#if`, per-assembly namespace
+liveness for `using` removal, Autofac assembly scanning with a name filter, the framework-built
+orphan review and its delete refusal, the exclusion list for `dynamic` and inactive `#if` names,
+the Web Site project refusal, and no false `<Compile>` warning in SDK projects).

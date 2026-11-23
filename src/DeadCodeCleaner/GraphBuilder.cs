@@ -20,6 +20,7 @@ public sealed class GraphBuilder
     readonly Dictionary<SyntaxTree, string> _treeHashes = new();
     readonly HashSet<string> _solutionAssemblies = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<SyntaxNode, AnchorInfo> _anchors = new();
+    readonly HashSet<SyntaxNode> _scanRegions = new();
 
     /// <summary>Everything known about one anchor statement shared by tracked registrations: which
     /// chain invocations the registrations claim as their own, and the statements on the anchor.</summary>
@@ -160,10 +161,8 @@ public sealed class GraphBuilder
             foreach (var s in ai.Statements) { s.WholeAnchorAllowed = allowed && s.ManualReason == null; }
         }
 
-        if (_graph.AssemblyScanSite != null)
-        {
-            _graph.Warnings.Add($"solution registers services by assembly scanning ({_graph.AssemblyScanSite}) — scanned implementations are INVISIBLE to this analysis; add keep patterns for them before trusting the report");
-        }
+        ApplyScanRules(compilations.Select(c => c.Comp.Assembly.Name).ToList());
+        ApplyMentionRoots();
         return _graph;
     }
 
@@ -214,6 +213,13 @@ public sealed class GraphBuilder
                         // View/markup text is kept for the deleted-symbol mention scan: views
                         // compile at runtime and are invisible to the compiler AND the verifier.
                         if (Constants.ViewFileExtensions.Contains(Path.GetExtension(f)) && !_graph.ViewTexts.ContainsKey(f)) { _graph.ViewTexts[f] = ReadConfigText(f); }
+                        // Hand-written scripts (minified bundles are noise): scanned for removal
+                        // targets' names, since a URL like "/Admin/GetRoles" is invisible to the compiler.
+                        if (Path.GetExtension(f) == Constants.ScriptExtension && !f.EndsWith(Constants.MinifiedScriptSuffix, StringComparison.OrdinalIgnoreCase)
+                            && !_graph.ScriptTexts.ContainsKey(f) && new FileInfo(f).Length <= Constants.MaxScannedConfigFileBytes)
+                        {
+                            _graph.ScriptTexts[f] = ReadConfigText(f);
+                        }
                         if (!IsConfigLikeFile(f)) { continue; }
                         var txt = ReadConfigText(f);
                         // This tool's own reports (saved under any --json name) mention every deleted
@@ -354,6 +360,13 @@ public sealed class GraphBuilder
                     info.CompileItems.Add(include);
                 }
             }
+            ReadWarningsAsErrors(project.FilePath, info);
+            // SDK-style projects include every .cs file by default; an explicit <Compile> there is the
+            // exception (a linked file), not a listing every deleted file must appear in.
+            bool sdkStyle = xml.Root?.Attribute("Sdk") != null
+                || xml.Descendants().Any(d => d.Name.LocalName is "Sdk" or "Import" && d.Attribute("Sdk") != null);
+            bool defaultsOff = xml.Descendants().Any(d => d.Name.LocalName == "EnableDefaultCompileItems" && StringComparer.OrdinalIgnoreCase.Equals(d.Value.Trim(), "false"));
+            info.DefaultCompileItems = sdkStyle && !defaultsOff;
             var assetsPath = Path.Combine(Path.GetDirectoryName(project.FilePath), "obj", "project.assets.json");
             if (File.Exists(assetsPath))
             {
@@ -409,6 +422,55 @@ public sealed class GraphBuilder
         _graph.Projects[project.Name] = info;
     }
 
+    /// <summary>The analysis neutralizes warnings-as-errors so design-time builds load; the verifier
+    /// needs the REAL settings back. Read from the csproj and every Directory.Build.props above it.
+    /// Conservative: a conditional "true" counts as on (a stricter verifier only refuses more).</summary>
+    void ReadWarningsAsErrors(string csprojPath, ProjectInfo info)
+    {
+        var files = new List<string> { csprojPath };
+        for (var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath)); dir != null; dir = Path.GetDirectoryName(dir))
+        {
+            var props = Path.Combine(dir, Constants.DirectoryBuildPropsFileName);
+            if (File.Exists(props)) { files.Add(props); }
+        }
+        foreach (var file in files)
+        {
+            XDocument doc;
+            try
+            {
+                doc = XDocument.Load(file);
+            }
+            catch (Exception e) when (e is XmlException or IOException or UnauthorizedAccessException)
+            {
+                _graph.Warnings.Add($"{info.Name}: could not read {file} for warnings-as-errors settings ({e.Message}) — verification may miss warnings the real build treats as errors");
+                continue;
+            }
+            foreach (var el in doc.Descendants())
+            {
+                var value = el.Value.Trim();
+                switch (el.Name.LocalName)
+                {
+                    case "TreatWarningsAsErrors":
+                        if (StringComparer.OrdinalIgnoreCase.Equals(value, "true")) { info.TreatWarningsAsErrors = true; }
+                        break;
+                    case "WarningsAsErrors":
+                        info.WarningsAsErrors.UnionWith(SplitWarningIds(value));
+                        break;
+                    case "WarningsNotAsErrors":
+                        info.WarningsNotAsErrors.UnionWith(SplitWarningIds(value));
+                        break;
+                }
+            }
+        }
+    }
+
+    IEnumerable<string> SplitWarningIds(string value)
+    {
+        return value.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(id => !id.StartsWith("$(", StringComparison.Ordinal))
+            .Select(id => id.All(char.IsDigit) ? "CS" + id.PadLeft(4, '0') : id);
+    }
+
     bool ReferencesTestLibrary(Project project)
     {
         // Only DIRECT test-framework dependencies count: transitive flow through a shared project
@@ -452,7 +514,11 @@ public sealed class GraphBuilder
     /// <summary>The attribute's class name without its "Attribute" suffix ("Fact" for FactAttribute).</summary>
     string ShortAttributeName(AttributeData attr)
     {
-        var an = attr.AttributeClass?.Name ?? "";
+        return ShortAttributeName(attr.AttributeClass?.Name ?? "");
+    }
+
+    string ShortAttributeName(string an)
+    {
         return an.EndsWith("Attribute", StringComparison.Ordinal) ? an[..^9] : an;
     }
 
@@ -732,6 +798,8 @@ public sealed class GraphBuilder
     void DetectRoots(INamedTypeSymbol type, string typeId, System.Collections.Immutable.ImmutableArray<ISymbol> members, bool isTest)
     {
         bool rootWholeType = false;
+        bool rootAllMethods = false;
+        string[] rootNamePrefixes = Array.Empty<string>();
         string reason = "";
 
         if (type.Name.EndsWith("Controller", StringComparison.Ordinal) || BaseChainHasName(type, "Controller", "ControllerBase", "ApiController"))
@@ -771,11 +839,27 @@ public sealed class GraphBuilder
             rootWholeType = true;
             reason = "framework component";
         }
-        else if (BaseChainHasExternalName(type, "Page", "System.Web") || BaseChainHasExternalName(type, "UserControl", "System.Web")
-            || BaseChainHasExternalName(type, "MasterPage", "System.Web") || BaseChainHasExternalName(type, "HttpApplication", "System.Web"))
+        else if (BaseChainHasName(type, "EntityTypeConfiguration", "ComplexTypeConfiguration", "AreaRegistration", "NinjectModule"))
         {
+            // EF6 configurations (AddFromAssembly), MVC areas (RegisterAllAreas), Ninject modules:
+            // all discovered by assembly scanning.
             rootWholeType = true;
+            reason = "framework-discovered subclass";
+        }
+        else if (BaseChainHasExternalName(type, "Page", "System.Web") || BaseChainHasExternalName(type, "UserControl", "System.Web")
+            || BaseChainHasExternalName(type, "MasterPage", "System.Web"))
+        {
+            // Page_Load (AutoEventWireup) and markup-wired handlers are protected and called by name.
+            rootWholeType = true;
+            rootAllMethods = true;
             reason = "WebForms code-behind";
+        }
+        else if (BaseChainHasExternalName(type, "HttpApplication", "System.Web"))
+        {
+            // Application_Start / Session_Start / Application_Error are protected and called by name.
+            rootWholeType = true;
+            rootNamePrefixes = Constants.HttpApplicationEventPrefixes;
+            reason = "Global.asax application";
         }
         else if (type.AllInterfaces.Any(i => i.Name is "IEntityTypeConfiguration" or "IMiddleware" or "IHttpModule" or "IHttpHandler" or "IJob" or "ITagHelper" && IsFrameworkType(i)))
         {
@@ -821,7 +905,9 @@ public sealed class GraphBuilder
             {
                 if (NodeId(m) is not { } mId) { continue; }
                 bool isCtor = m is IMethodSymbol c && c.MethodKind == MethodKind.Constructor;
-                if (isCtor || m.DeclaredAccessibility == Accessibility.Public)
+                bool byConvention = m is IMethodSymbol { MethodKind: MethodKind.Ordinary }
+                    && (rootAllMethods || rootNamePrefixes.Any(p => m.Name.StartsWith(p, StringComparison.Ordinal)));
+                if (isCtor || byConvention || m.DeclaredAccessibility == Accessibility.Public)
                 {
                     _graph.AddRoot(mId, reason, isTest);
                 }
@@ -965,6 +1051,10 @@ public sealed class GraphBuilder
         {
             foreach (var al in cu2.AttributeLists)
             {
+                foreach (var at in al.Attributes)
+                {
+                    RootNamedStartMethod(at, model, projectName, isTest);
+                }
                 foreach (var node in al.DescendantNodesAndSelf())
                 {
                     ISymbol sym = node switch
@@ -1033,6 +1123,10 @@ public sealed class GraphBuilder
                 }
                 if (NodeId(sym) is not { } memberId) { continue; }
                 WalkMember(member, memberId, model);
+                if (member is PropertyDeclarationSyntax { Initializer: { } pInit })
+                {
+                    KeepIfInitializerActs(sym, memberId, pInit.Value, model);
+                }
             }
         }
 
@@ -1049,15 +1143,69 @@ public sealed class GraphBuilder
         var ids = new List<string>();
         foreach (var v in decl.Variables)
         {
-            if (NodeId(model.GetDeclaredSymbol(v)) is not { } fId) { continue; }
+            var fSym = model.GetDeclaredSymbol(v);
+            if (NodeId(fSym) is not { } fId) { continue; }
             ids.Add(fId);
-            if (v.Initializer != null) { WalkMember(v.Initializer, fId, model); }
+            if (v.Initializer != null)
+            {
+                WalkMember(v.Initializer, fId, model);
+                KeepIfInitializerActs(fSym, fId, v.Initializer.Value, model);
+            }
             if (v.ArgumentList != null) { WalkMember(v.ArgumentList, fId, model); }
         }
         foreach (var fId in ids)
         {
             WalkMember(decl.Type, fId, model);
             foreach (var al in attrs) { WalkMember(al, fId, model); }
+        }
+    }
+
+    /// <summary>An initializer runs with every construction (static: on first use of the type), so one
+    /// that DOES something — starts a timer, calls a method — keeps its field/property while the type
+    /// is in use, exactly as the same code inside a constructor would. Pure BCL calls and creations
+    /// (collections, strings, math) do nothing observable; lambda bodies do not run at initialization.</summary>
+    void KeepIfInitializerActs(ISymbol member, string memberId, ExpressionSyntax value, SemanticModel model)
+    {
+        if (member?.ContainingType == null || NodeId(member.ContainingType) is not { } typeId) { return; }
+        if (model.GetOperation(value) is not { } op) { return; }
+        var pending = new Stack<IOperation>();
+        pending.Push(op);
+        while (pending.Count > 0)
+        {
+            var cur = pending.Pop();
+            if (cur is IAnonymousFunctionOperation or ILocalFunctionOperation) { continue; }
+            bool acts = cur switch
+            {
+                IInvocationOperation inv => !IsPureBclTarget(inv.TargetMethod.OriginalDefinition),
+                IObjectCreationOperation oc => oc.Constructor != null && NodeId(oc.Constructor.ContainingType) == null && !IsPureBclTarget(oc.Constructor.OriginalDefinition),
+                _ => false,
+            };
+            if (acts)
+            {
+                _graph.AddRule(new object[] { typeId }, new object[] { memberId }, "initializer with side effects kept with type");
+                return;
+            }
+            foreach (var child in cur.ChildOperations) { pending.Push(child); }
+        }
+    }
+
+    /// <summary>[assembly: PreApplicationStartMethod(typeof(X), "Start")] and the WebActivatorEx variants
+    /// name the method by STRING: every method of X with that name is rooted.</summary>
+    void RootNamedStartMethod(AttributeSyntax at, SemanticModel model, string projectName, bool isTest)
+    {
+        if (model.GetSymbolInfo(at).Symbol is not IMethodSymbol attrCtor) { return; }
+        var attrName = ShortAttributeName(attrCtor.ContainingType.Name);
+        if (!Constants.StartMethodAttributeNames.Contains(attrName) || at.ArgumentList == null) { return; }
+        var args = at.ArgumentList.Arguments.Select(a => a.Expression).ToList();
+        var typeOf = args.OfType<TypeOfExpressionSyntax>().FirstOrDefault();
+        var name = args.Select(a => model.GetConstantValue(a)).Where(c => c.HasValue && c.Value is string).Select(c => (string)c.Value).FirstOrDefault();
+        if (typeOf == null || name == null) { return; }
+        if (model.GetTypeInfo(typeOf.Type).Type is not INamedTypeSymbol target) { return; }
+        foreach (var m in target.GetMembers(name))
+        {
+            if (NodeId(m) is not { } mId) { continue; }
+            _graph.AddRoot(mId, $"[assembly: {attrName}] method", isTest);
+            _graph.AddAssemblyAttrRef(projectName, mId);
         }
     }
 
@@ -1330,6 +1478,406 @@ public sealed class GraphBuilder
         return NodeId(target.ContainingType);
     }
 
+    // --------------------------------------------- hard-to-trace mentions
+
+    /// <summary>The exclusion list: code named where the analysis cannot follow the use — runtime-compiled
+    /// views and markup, inactive #if code, 'dynamic' member access, type names in config files — is
+    /// treated as in use (a root), never deleted. Matching is by name, so it over-keeps; that is the
+    /// safe side. Explicit removal targets are still removed (the sweep ignores roots that are targets).</summary>
+    void ApplyMentionRoots()
+    {
+        var viewWords = WordIndex(_graph.ViewTexts, Constants.IdentifierWordPattern);
+        var disabledWords = WordIndex(_graph.DisabledTexts, Constants.IdentifierWordPattern);
+        var configTexts = new Dictionary<string, string>(Constants.PathComparer);
+        foreach (var texts in _graph.ConfigTextsByProject.Values)
+        {
+            foreach (var (file, text) in texts)
+            {
+                if (text.Length > 0) { configTexts.TryAdd(file, text); }
+            }
+        }
+        var configNames = WordIndex(configTexts, Constants.DottedNameWordPattern);
+        foreach (var (id, sym) in _graph.Decl.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            if (sym is IMethodSymbol { MethodKind: not MethodKind.Ordinary }) { continue; }
+            string where = null;
+            if (sym.Name.Length >= Constants.MinMentionNameLength)
+            {
+                if (viewWords.TryGetValue(sym.Name, out var vf)) { where = $"named in {vf}"; }
+                else if (disabledWords.TryGetValue(sym.Name, out var df)) { where = $"named in inactive #if code in {df}"; }
+            }
+            if (where == null && sym is not INamedTypeSymbol && _graph.DynamicMemberNames.Contains(sym.Name))
+            {
+                where = "accessed by that name through 'dynamic'";
+            }
+            if (where == null && sym is INamedTypeSymbol nt)
+            {
+                var fqn = SymbolNames.Fqn(nt);
+                var metadataFqn = nt.ContainingType == null ? fqn : SymbolNames.MetadataFqn(nt);
+                if (configNames.TryGetValue(fqn, out var cf) || configNames.TryGetValue(metadataFqn, out cf)) { where = $"named in {cf}"; }
+            }
+            if (where == null) { continue; }
+            // Already an entry point for a real reason: the mention adds nothing.
+            if (_graph.Roots.Contains(id) || _graph.TestRoots.Contains(id)) { continue; }
+            _graph.MentionRoots[id] = where;
+            _graph.AddRoot(id, "mentioned: " + where, _graph.TestNodes.Contains(id));
+        }
+    }
+
+    /// <summary>Every word (by the pattern) of the texts -> the first file (in path order) holding it.</summary>
+    Dictionary<string, string> WordIndex(Dictionary<string, string> texts, string pattern)
+    {
+        var index = new Dictionary<string, string>(StringComparer.Ordinal);
+        var regex = new Regex(pattern, RegexOptions.Compiled);
+        foreach (var (file, text) in texts.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            foreach (Match m in regex.Matches(text)) { index.TryAdd(m.Value, file); }
+        }
+        return index;
+    }
+
+    // --------------------------------------------- assembly-scanning registrations
+
+    /// <summary>Reads one assembly-scanning registration: which assemblies it scans, which classes
+    /// its filter admits, and how they register. Autofac's RegisterAssemblyTypes is read along its
+    /// fluent chain (filters included); other libraries (Scrutor, StructureMap, Windsor, Ninject,
+    /// Unity) are read over their whole statement, filters not interpreted (every class matches).</summary>
+    void RecordScan(InvocationExpressionSyntax inv, string name, string sourceId, SemanticModel model)
+    {
+        // Like registrations: a solution method that merely shares the name is not a scan.
+        if (!_config.InSolutionRegistrations)
+        {
+            var resolvedAsm = model.GetSymbolInfo(inv).Symbol?.ContainingAssembly?.Name;
+            if (resolvedAsm != null && _solutionAssemblies.Contains(resolvedAsm)) { return; }
+        }
+        var currentAsm = model.Compilation.Assembly.Name;
+        var loc = inv.GetLocation().GetLineSpan();
+        var site = $"{inv.SyntaxTree.FilePath}:{loc.StartLinePosition.Line + 1}";
+        HashSet<string> assemblies = new(StringComparer.OrdinalIgnoreCase);
+        bool assembliesKnown = true;
+        var callNames = new HashSet<string>(StringComparer.Ordinal);
+        Func<INamedTypeSymbol, bool> filter = null;
+        bool filterExact = true;
+        bool isAutofac = name == Constants.AutofacScanMethodName;
+        SyntaxNode region;
+
+        if (isAutofac)
+        {
+            region = inv;
+            foreach (var arg in inv.ArgumentList.Arguments)
+            {
+                if (ScanAssemblyOf(arg.Expression, model, currentAsm) is { } a) { assemblies.Add(a); }
+                else { assembliesKnown = false; }
+            }
+            if (inv.ArgumentList.Arguments.Count == 0) { assembliesKnown = false; }
+            // The fluent chain upward: every Where narrows the matched set (AND); AssignableTo<T> too.
+            var cur = inv;
+            while (cur.Parent is MemberAccessExpressionSyntax ma && ma.Parent is InvocationExpressionSyntax pInv)
+            {
+                var mname = ma.Name.Identifier.Text;
+                callNames.Add(mname);
+                if (mname == "Where" && pInv.ArgumentList.Arguments.Count == 1 && pInv.ArgumentList.Arguments[0].Expression is LambdaExpressionSyntax lambda)
+                {
+                    var (f, exact) = ParseScanFilter(lambda, model);
+                    if (!exact) { filterExact = false; }
+                    if (f != null) { filter = AndFilter(filter, f); }
+                }
+                else if (mname is "AssignableTo" && ma.Name is GenericNameSyntax ag && ag.TypeArgumentList.Arguments.Count == 1
+                    && model.GetTypeInfo(ag.TypeArgumentList.Arguments[0]).Type is INamedTypeSymbol at)
+                {
+                    filter = AndFilter(filter, t => IsAssignableTo(t, at));
+                }
+                region = pInv;
+                cur = pInv;
+            }
+        }
+        else
+        {
+            // The whole outermost statement: Scan(s => s.FromAssemblyOf<X>().AddClasses().AsMatchingInterface()).
+            region = inv.AncestorsAndSelf().OfType<ExpressionStatementSyntax>().LastOrDefault() ?? (SyntaxNode)inv;
+            bool anyAssemblySource = false;
+            foreach (var call in region.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>())
+            {
+                if (GetMethodName(call) is not { } cn) { continue; }
+                var cname = cn.Identifier.Text;
+                callNames.Add(cname);
+                if (Constants.ScanAssemblyOfTypeNames.Contains(cname))
+                {
+                    anyAssemblySource = true;
+                    ITypeSymbol of = cn is GenericNameSyntax gn && gn.TypeArgumentList.Arguments.Count == 1
+                        ? model.GetTypeInfo(gn.TypeArgumentList.Arguments[0]).Type
+                        : call.ArgumentList.Arguments.Select(a => a.Expression).OfType<TypeOfExpressionSyntax>().Select(t => model.GetTypeInfo(t.Type).Type).FirstOrDefault();
+                    if (of?.ContainingAssembly?.Name is { } oa) { assemblies.Add(oa); }
+                    else { assembliesKnown = false; }
+                }
+                else if (Constants.ScanCurrentAssemblyNames.Contains(cname))
+                {
+                    anyAssemblySource = true;
+                    assemblies.Add(currentAsm);
+                }
+                else if (Constants.ScanUnknownAssemblyNames.Contains(cname))
+                {
+                    anyAssemblySource = true;
+                    // FromAssemblies(typeof(X).Assembly) is still precise.
+                    foreach (var arg in call.ArgumentList.Arguments)
+                    {
+                        if (ScanAssemblyOf(arg.Expression, model, currentAsm) is { } a) { assemblies.Add(a); }
+                        else { assembliesKnown = false; }
+                    }
+                    if (call.ArgumentList.Arguments.Count == 0) { assembliesKnown = false; }
+                }
+            }
+            foreach (var ma in region.DescendantNodesAndSelf().OfType<MemberAccessExpressionSyntax>())
+            {
+                if (ma.Name.Identifier.Text == "Assembly" && ma.Expression is TypeOfExpressionSyntax tof && model.GetTypeInfo(tof.Type).Type?.ContainingAssembly?.Name is { } ta)
+                {
+                    anyAssemblySource = true;
+                    assemblies.Add(ta);
+                }
+                else if (Constants.ScanMatchingInterfaceNames.Contains(ma.Name.Identifier.Text) || Constants.ScanAllInterfacesNames.Contains(ma.Name.Identifier.Text))
+                {
+                    // Unity passes WithMappings.FromMatchingInterface as a method group, not a call.
+                    callNames.Add(ma.Name.Identifier.Text);
+                }
+            }
+            // No assembly vocabulary at all: not a registration scan (some other "Scan" method).
+            if (!anyAssemblySource) { return; }
+            filterExact = false;
+        }
+        if (!_scanRegions.Add(region)) { return; }
+
+        ScanMode mode;
+        if (callNames.Overlaps(Constants.ScanAllInterfacesNames) || (isAutofac && callNames.Contains("As"))) { mode = ScanMode.AllInterfaces; }
+        else if (callNames.Overlaps(Constants.ScanMatchingInterfaceNames)) { mode = ScanMode.MatchingInterface; }
+        // Autofac registers scanned types as themselves unless told otherwise.
+        else if (callNames.Overlaps(Constants.ScanSelfNames) || isAutofac) { mode = ScanMode.SelfOnly; }
+        else { mode = ScanMode.Unknown; }
+
+        _graph.ScanRegistrations.Add(new ScanRegistration
+        {
+            SourceId = sourceId,
+            Site = site,
+            Assemblies = assembliesKnown && assemblies.Count > 0 ? assemblies : null,
+            Filter = filter,
+            FilterExact = filterExact,
+            Mode = mode,
+        });
+    }
+
+    /// <summary>The assembly an expression like typeof(X).Assembly or Assembly.GetExecutingAssembly()
+    /// names, or null when it cannot be determined.</summary>
+    string ScanAssemblyOf(ExpressionSyntax expr, SemanticModel model, string currentAsm)
+    {
+        if (expr is MemberAccessExpressionSyntax ma && ma.Name.Identifier.Text == "Assembly")
+        {
+            var inner = ma.Expression;
+            // typeof(X).GetTypeInfo().Assembly
+            if (inner is InvocationExpressionSyntax gti && gti.Expression is MemberAccessExpressionSyntax gtiMa && gtiMa.Name.Identifier.Text == "GetTypeInfo") { inner = gtiMa.Expression; }
+            if (inner is TypeOfExpressionSyntax tof) { return model.GetTypeInfo(tof.Type).Type?.ContainingAssembly?.Name; }
+            return null;
+        }
+        if (expr is InvocationExpressionSyntax call && GetMethodName(call) is { } n && Constants.ScanCurrentAssemblyNames.Contains(n.Identifier.Text))
+        {
+            return currentAsm;
+        }
+        return null;
+    }
+
+    Func<INamedTypeSymbol, bool> AndFilter(Func<INamedTypeSymbol, bool> a, Func<INamedTypeSymbol, bool> b)
+    {
+        if (a == null) { return b; }
+        return t => a(t) && b(t);
+    }
+
+    bool IsAssignableTo(INamedTypeSymbol t, INamedTypeSymbol target)
+    {
+        var def = target.OriginalDefinition;
+        for (var b = (INamedTypeSymbol)t; b != null; b = b.BaseType)
+        {
+            if (SymbolEqualityComparer.Default.Equals(b.OriginalDefinition, def)) { return true; }
+        }
+        return t.AllInterfaces.Any(i => SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, def));
+    }
+
+    /// <summary>Interprets a scan filter lambda (t => t.Name.EndsWith("Service") || t.IsSubclassOf(typeof(B))).
+    /// Returns the predicate and whether it is EXACT. A part that cannot be read is widened to
+    /// "matches" (a superset: classes are over-kept, never under-kept); null means "every class".</summary>
+    (Func<INamedTypeSymbol, bool> Filter, bool Exact) ParseScanFilter(LambdaExpressionSyntax lambda, SemanticModel model)
+    {
+        string param = lambda switch
+        {
+            SimpleLambdaExpressionSyntax s => s.Parameter.Identifier.Text,
+            ParenthesizedLambdaExpressionSyntax p when p.ParameterList.Parameters.Count == 1 => p.ParameterList.Parameters[0].Identifier.Text,
+            _ => null,
+        };
+        if (param == null || lambda.Body is not ExpressionSyntax body) { return (null, false); }
+        return ParseScanPredicate(body, param, model);
+    }
+
+    (Func<INamedTypeSymbol, bool> Filter, bool Exact) ParseScanPredicate(ExpressionSyntax e, string p, SemanticModel model)
+    {
+        switch (e)
+        {
+            case ParenthesizedExpressionSyntax pe:
+                return ParseScanPredicate(pe.Expression, p, model);
+            case BinaryExpressionSyntax b when b.IsKind(SyntaxKind.LogicalAndExpression):
+            {
+                var (l, le) = ParseScanPredicate(b.Left, p, model);
+                var (r, re) = ParseScanPredicate(b.Right, p, model);
+                // An unreadable side of an AND only widens the set: keep the readable side.
+                if (l == null) { return (r, false); }
+                if (r == null) { return (l, false); }
+                return (t => l(t) && r(t), le && re);
+            }
+            case BinaryExpressionSyntax b when b.IsKind(SyntaxKind.LogicalOrExpression):
+            {
+                var (l, le) = ParseScanPredicate(b.Left, p, model);
+                var (r, re) = ParseScanPredicate(b.Right, p, model);
+                if (l == null || r == null) { return (null, false); }
+                return (t => l(t) || r(t), le && re);
+            }
+            case PrefixUnaryExpressionSyntax u when u.IsKind(SyntaxKind.LogicalNotExpression):
+            {
+                // Negating an approximation is not safe: only an exact inner predicate may be negated.
+                var (inner, exact) = ParseScanPredicate(u.Operand, p, model);
+                if (inner == null || !exact) { return (null, false); }
+                return (t => !inner(t), true);
+            }
+            case BinaryExpressionSyntax eq when eq.IsKind(SyntaxKind.EqualsExpression) || eq.IsKind(SyntaxKind.NotEqualsExpression):
+            {
+                var lhs = TypeStringOf(eq.Left, p);
+                var rhs = TypeStringOf(eq.Right, p);
+                var lit = lhs != null ? StringLiteral(eq.Right, model) : StringLiteral(eq.Left, model);
+                var getter = lhs ?? rhs;
+                if (getter == null || lit == null) { return (null, false); }
+                bool negate = eq.IsKind(SyntaxKind.NotEqualsExpression);
+                return (t => (getter(t) == lit) != negate, true);
+            }
+            case InvocationExpressionSyntax call when call.Expression is MemberAccessExpressionSyntax cma:
+            {
+                var method = cma.Name.Identifier.Text;
+                var args = call.ArgumentList.Arguments;
+                // t.Name.EndsWith("Service") / StartsWith / Contains, optionally with a StringComparison.
+                if (method is "EndsWith" or "StartsWith" or "Contains" && args.Count >= 1 && TypeStringOf(cma.Expression, p) is { } getter
+                    && StringLiteral(args[0].Expression, model) is { } lit)
+                {
+                    var cmp = StringComparison.Ordinal;
+                    if (args.Count == 2)
+                    {
+                        var cmpText = args[1].Expression.ToString();
+                        if (cmpText.EndsWith("IgnoreCase", StringComparison.Ordinal)) { cmp = StringComparison.OrdinalIgnoreCase; }
+                    }
+                    return method switch
+                    {
+                        "EndsWith" => (t => getter(t).EndsWith(lit, cmp), true),
+                        "StartsWith" => (t => getter(t).StartsWith(lit, cmp), true),
+                        _ => (t => getter(t).Contains(lit, cmp), true),
+                    };
+                }
+                // t.IsSubclassOf(typeof(B)) / t.IsAssignableTo(typeof(B))
+                if (method is "IsSubclassOf" or "IsAssignableTo" && IsParam(cma.Expression, p) && args.Count == 1
+                    && args[0].Expression is TypeOfExpressionSyntax tof && model.GetTypeInfo(tof.Type).Type is INamedTypeSymbol bt)
+                {
+                    if (method == "IsSubclassOf") { return (t => !SymbolEqualityComparer.Default.Equals(t.OriginalDefinition, bt.OriginalDefinition) && IsAssignableTo(t, bt) && bt.TypeKind != TypeKind.Interface, true); }
+                    return (t => IsAssignableTo(t, bt), true);
+                }
+                // typeof(B).IsAssignableFrom(t)
+                if (method == "IsAssignableFrom" && cma.Expression is TypeOfExpressionSyntax tof2 && args.Count == 1 && IsParam(args[0].Expression, p)
+                    && model.GetTypeInfo(tof2.Type).Type is INamedTypeSymbol at)
+                {
+                    return (t => IsAssignableTo(t, at), true);
+                }
+                return (null, false);
+            }
+            case MemberAccessExpressionSyntax flag when IsParam(flag.Expression, p):
+            {
+                // Boolean Type properties: t.IsClass, t.IsAbstract, t.IsPublic, ...
+                Func<INamedTypeSymbol, bool> f = flag.Name.Identifier.Text switch
+                {
+                    "IsClass" => t => t.TypeKind == TypeKind.Class,
+                    "IsInterface" => t => t.TypeKind == TypeKind.Interface,
+                    "IsAbstract" => t => t.IsAbstract,
+                    "IsSealed" => t => t.IsSealed,
+                    "IsGenericType" => t => t.IsGenericType,
+                    "IsPublic" => t => t.DeclaredAccessibility == Accessibility.Public && t.ContainingType == null,
+                    _ => null,
+                };
+                return (f, f != null);
+            }
+            default:
+                return (null, false);
+        }
+    }
+
+    bool IsParam(ExpressionSyntax e, string p)
+    {
+        return e is IdentifierNameSyntax id && id.Identifier.Text == p;
+    }
+
+    /// <summary>A reader for t.Name / t.Namespace / t.FullName, or null.</summary>
+    Func<INamedTypeSymbol, string> TypeStringOf(ExpressionSyntax e, string p)
+    {
+        if (e is not MemberAccessExpressionSyntax ma || !IsParam(ma.Expression, p)) { return null; }
+        return ma.Name.Identifier.Text switch
+        {
+            "Name" => t => t.MetadataName,
+            "Namespace" => t => t.ContainingNamespace?.IsGlobalNamespace == false ? t.ContainingNamespace.ToDisplayString() : null,
+            "FullName" => t => SymbolNames.MetadataFqn(t),
+            _ => null,
+        };
+    }
+
+    string StringLiteral(ExpressionSyntax e, SemanticModel model)
+    {
+        var c = model.GetConstantValue(e);
+        return c.HasValue && c.Value is string s ? s : null;
+    }
+
+    /// <summary>Turns every read scan into rules: a matched class lives while the scanning member AND
+    /// one interface it is registered under live (as any registration does), so implementations of
+    /// interfaces nobody uses any more still die.</summary>
+    void ApplyScanRules(List<string> solutionAssemblies)
+    {
+        foreach (var scan in _graph.ScanRegistrations)
+        {
+            if (!scan.FilterExact)
+            {
+                _graph.Warnings.Add($"assembly scan at {scan.Site}: its class filter could not be read in full — every class it might match is assumed registered (over-keeps)");
+            }
+            if (scan.Assemblies == null)
+            {
+                _graph.Warnings.Add($"assembly scan at {scan.Site}: the scanned assemblies could not be determined — every solution assembly is assumed scanned (over-keeps)");
+            }
+            var asms = scan.Assemblies ?? new HashSet<string>(solutionAssemblies, StringComparer.OrdinalIgnoreCase);
+            foreach (var (type, _) in _types)
+            {
+                if (type.TypeKind != TypeKind.Class || type.IsAbstract || type.IsStatic) { continue; }
+                if (type.ContainingAssembly?.Name is not { } tasm || !asms.Contains(tasm)) { continue; }
+                if (scan.Filter != null && !scan.Filter(type)) { continue; }
+                if (NodeId(type) is not { } typeId) { continue; }
+                _graph.ScanMatchedTypes.TryAdd(typeId, scan.Site);
+                if (scan.Mode == ScanMode.SelfOnly) { continue; }
+                var payload = new List<object> { typeId };
+                payload.AddRange(type.InstanceConstructors.Select(NodeId).Where(id => id != null));
+                foreach (var iface in type.AllInterfaces)
+                {
+                    // Autofac itself excludes these from AsImplementedInterfaces.
+                    if (iface.ContainingNamespace is { IsGlobalNamespace: false } ins && ins.ToDisplayString() == "System" && iface.Name is "IDisposable" or "IAsyncDisposable") { continue; }
+                    if (scan.Mode == ScanMode.MatchingInterface && iface.Name != "I" + type.Name) { continue; }
+                    if (NodeId(iface) is { } ifaceId)
+                    {
+                        _graph.AddRule(new object[] { scan.SourceId, ifaceId }, payload, "assembly-scan registration");
+                    }
+                    else
+                    {
+                        // An external service: resolved outside the solution's sight.
+                        _graph.AddRule(new object[] { scan.SourceId }, payload, "assembly-scan registration (external service)");
+                    }
+                }
+            }
+        }
+    }
+
     // --------------------------------------------- co-dependent statements
 
     List<TextSpan> MatchStatements(SyntaxNode subtree, string sourceId, SemanticModel model)
@@ -1341,11 +1889,7 @@ public sealed class GraphBuilder
             var name = GetMethodName(inv);
             if (name == null) { continue; }
             var id = name.Identifier.Text;
-            if (_graph.AssemblyScanSite == null && Constants.AssemblyScanMethodNames.Contains(id))
-            {
-                var scanLoc = inv.GetLocation().GetLineSpan();
-                _graph.AssemblyScanSite = $"{inv.SyntaxTree.FilePath}:{scanLoc.StartLinePosition.Line + 1}";
-            }
+            if (Constants.AssemblyScanMethodNames.Contains(id)) { RecordScan(inv, id, sourceId, model); }
             var typeArgs = (name as GenericNameSyntax)?.TypeArgumentList.Arguments;
 
             bool looksTracked = (id == Constants.CreateMapMethodName && typeArgs is { Count: 2 })
@@ -1768,7 +2312,35 @@ public sealed class GraphBuilder
         while (cur.Parent is MemberAccessExpressionSyntax ma && ma.Parent is InvocationExpressionSyntax pInv)
         {
             var mname = ma.Name.Identifier.Text;
-            if (mname == "As" && ma.Name is GenericNameSyntax g)
+            if (mname is "As" or "Keyed" or "Named" && ma.Name is not GenericNameSyntax)
+            {
+                // Non-generic forms: As(typeof(IFoo), ...), Named("x", typeof(IFoo)), Keyed(k, typeof(IFoo)).
+                // Every Type argument is a service; one that is not a typeof (a variable) is unknown,
+                // so the registration must live as long as its containing member.
+                bool anyService = false;
+                foreach (var arg in pInv.ArgumentList.Arguments)
+                {
+                    if (arg.Expression is TypeOfExpressionSyntax tof)
+                    {
+                        anyService = true;
+                        if (ResolveTypeNode(tof.Type, model) is { } s)
+                        {
+                            services.Add(s);
+                            textualRefs.Add(s);
+                            AddSkip(ref skip, tof.Span);
+                            CollectTypeRefNodes(tof.Type, model, argNodes);
+                        }
+                        else { hasExternalService = true; }
+                    }
+                    else if (model.GetTypeInfo(arg.Expression).Type is { Name: "Type" } argType && argType.ContainingNamespace?.ToDisplayString() == "System")
+                    {
+                        anyService = true;
+                        hasExternalService = true;
+                    }
+                }
+                if (!anyService) { hasExternalService = true; }
+            }
+            else if (mname == "As" && ma.Name is GenericNameSyntax g)
             {
                 foreach (var ta in g.TypeArgumentList.Arguments)
                 {
@@ -1815,7 +2387,18 @@ public sealed class GraphBuilder
                     else { hasExternalService = true; }
                 }
             }
-            else if (!Constants.AutofacChainContinuers.Contains(mname)) { break; }
+            else if (!Constants.AutofacChainContinuers.Contains(mname) && !Constants.AutofacExtraLifetimeNames.Contains(mname))
+            {
+                // An unknown call may declare services this walk cannot see (an As<IFoo>() can follow
+                // it): the registration then lives as long as its containing member. The walk goes on
+                // through calls that still return a registration builder, and stops elsewhere.
+                hasExternalService = true;
+                var curType = model.GetTypeInfo(cur).Type;
+                var nextType = model.GetTypeInfo(pInv).Type;
+                bool stillBuilder = curType is { TypeKind: not TypeKind.Error } && nextType is { TypeKind: not TypeKind.Error }
+                    && curType.OriginalDefinition.Name == nextType.OriginalDefinition.Name;
+                if (!stillBuilder) { break; }
+            }
             _processedInvocations.Add(pInv);
             claimed.Add(pInv);
             outermost = pInv;

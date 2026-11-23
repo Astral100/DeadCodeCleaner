@@ -10,6 +10,8 @@ public static class Constants
     /// <summary>XmlMarker without the closing "-->", for prefix checks against already-marked lines.</summary>
     public const string XmlMarkerPrefix = "<!-- todo: to be deleted";
     public const string DefaultReportFileName = "deadcode-report.json";
+    public const string DirectoryBuildPropsFileName = "Directory.Build.props";
+    public const int WindowsWesternCodePage = 1252;
 
     public const int ConsoleListLimit = 100;
     public const int FindMatchLimit = 200;
@@ -26,6 +28,15 @@ public static class Constants
     public const int ShownConfigMentions = 10;
     public const int ShownViewMentions = 10;
     public const int MaxScannedConfigFileBytes = 1_000_000;
+    public const int MinMentionNameLength = 3;
+    public const int ShownMentionKeeps = 20;
+    public const string IdentifierWordPattern = @"[A-Za-z_][A-Za-z0-9_]*";
+    /// <summary>Dotted names as config files write types: "Ns.Type", "Ns.Outer+Inner".</summary>
+    public const string DottedNameWordPattern = @"[A-Za-z_][A-Za-z0-9_]*(?:[.+][A-Za-z_][A-Za-z0-9_]*)*";
+    public const string ScriptExtension = ".js";
+    public const string MinifiedScriptSuffix = ".min.js";
+    /// <summary>Solution-file project type of an ASP.NET Web Site project (no csproj; App_Code).</summary>
+    public const string WebSiteProjectTypeGuid = "E24C65DC-7377-472B-9ABA-BC803B73C61A";
 
     public const string CategoryRemoved = "removed";
     public const string CategoryOrphaned = "orphaned";
@@ -36,6 +47,8 @@ public static class Constants
     public const string ReasonAutoMapperProfile = "AutoMapper profile";
     public const string ReasonAutofacModule = "Autofac module";
     public const string CreateMapMethodName = "CreateMap";
+    public const string AutoMapperProfileBaseName = "Profile";
+    public const string AutofacModuleBaseName = "Module";
 
     /// <summary>File paths are case-insensitive on Windows (linked files can be written with another
     /// casing) but case-sensitive on Linux, where Foo.cs and foo.cs are different files.</summary>
@@ -74,7 +87,51 @@ public static class Constants
     /// warrants a warning.</summary>
     public static readonly HashSet<string> AssemblyScanMethodNames = new(StringComparer.Ordinal)
     {
-        "RegisterAssemblyTypes", "RegisterAssemblyModules", "Scan",
+        "RegisterAssemblyTypes", "Scan", "FromThisAssembly", "FromAssemblyContaining", "FromAssemblyOf",
+        "FromLoadedAssemblies", "TheCallingAssembly", "AssemblyContainingType", "FromAssembliesMatching",
+        "FromApplicationDependencies", "FromAssemblyInThisApplication",
+    };
+
+    public const string AutofacScanMethodName = "RegisterAssemblyTypes";
+
+    /// <summary>Scan vocabulary naming the scanned assembly by a type argument: FromAssemblyOf&lt;X&gt;().</summary>
+    public static readonly HashSet<string> ScanAssemblyOfTypeNames = new(StringComparer.Ordinal)
+    {
+        "FromAssemblyOf", "FromAssemblyContaining", "AssemblyContainingType", "AssemblyContaining",
+    };
+
+    /// <summary>Scan vocabulary meaning "the assembly whose code runs the scan".</summary>
+    public static readonly HashSet<string> ScanCurrentAssemblyNames = new(StringComparer.Ordinal)
+    {
+        "FromThisAssembly", "TheCallingAssembly", "GetExecutingAssembly", "GetCallingAssembly", "FromCallingAssembly",
+    };
+
+    /// <summary>Scan vocabulary naming assemblies the analysis cannot pin down: every solution
+    /// assembly is assumed.</summary>
+    public static readonly HashSet<string> ScanUnknownAssemblyNames = new(StringComparer.Ordinal)
+    {
+        "FromLoadedAssemblies", "FromApplicationDependencies", "FromAssembliesMatching", "FromAssemblyInThisApplication",
+        "AssembliesFromApplicationBaseDirectory", "AssembliesFromPath", "FromAssemblyInDirectory", "FromAssemblies",
+        "FromAssembly", "AssemblyContainingTypes",
+    };
+
+    /// <summary>Registration calls of a scan meaning "under every interface the class implements".</summary>
+    public static readonly HashSet<string> ScanAllInterfacesNames = new(StringComparer.Ordinal)
+    {
+        "AsImplementedInterfaces", "WithServiceAllInterfaces", "BindAllInterfaces", "FromAllInterfaces", "AsAllInterfaces",
+    };
+
+    /// <summary>Registration calls of a scan meaning "under the interface named I + class name".</summary>
+    public static readonly HashSet<string> ScanMatchingInterfaceNames = new(StringComparer.Ordinal)
+    {
+        "WithDefaultConventions", "FromMatchingInterface", "BindDefaultInterface", "BindDefaultInterfaces",
+        "WithServiceDefaultInterfaces", "AsMatchingInterface",
+    };
+
+    /// <summary>Registration calls of a scan meaning "as the class itself only".</summary>
+    public static readonly HashSet<string> ScanSelfNames = new(StringComparer.Ordinal)
+    {
+        "AsSelf", "WithServiceSelf", "BindToSelf",
     };
 
     /// <summary>Assemblies whose use does not AUTOMATICALLY block deleting an "empty" profile/module
@@ -136,7 +193,7 @@ public static class Constants
     /// <summary>Whole package/assembly ids only (anchored): "xunit.abstractions" alone marks a
     /// LIBRARY that extends a test framework, not a test project, and must not match. Matched
     /// against the id part of parsed PackageReference/Reference Include values, never raw text.</summary>
-    public const string TestPackageIdPattern = @"^(xunit(\.v3)?(\.core|\.runner\.[\w.]+|\.extensibility\.[\w.]+)?|nunit|nunit\.framework|nunit3testadapter|nunitlite|mstest(\.testframework|\.testadapter)?|microsoft\.net\.test\.sdk|microsoft\.visualstudio\.qualitytools\.unittestframework)$";
+    public const string TestPackageIdPattern = @"^(xunit(\.v3)?(\.core|\.runner\.[\w.]+|\.extensibility\.[\w.]+)?|nunit|nunit\.framework|nunit3testadapter|nunitlite|mstest(\.testframework|\.testadapter)?|microsoft\.net\.test\.sdk|microsoft\.visualstudio\.qualitytools\.unittestframework|microsoft\.visualstudio\.testplatform\.testframework(\.extensions)?)$";
     /// <summary>Legacy csproj ProjectTypeGuids entry marking an MSTest project.</summary>
     public const string TestProjectTypeGuid = "3AC096D0-A1C2-E12C-1390-A8335801FDAB";
 
@@ -181,7 +238,24 @@ public static class Constants
 
     public static readonly HashSet<string> ProdRootAttributeNames = new(StringComparer.Ordinal)
     {
-        "FunctionName", "Function", "Benchmark", "GlobalSetup", "GlobalCleanup",
+        "FunctionName", "Function", "Benchmark", "GlobalSetup", "GlobalCleanup", "ModuleInitializer",
+    };
+
+    /// <summary>Global.asax event-method prefixes: ASP.NET calls these by name, whatever their accessibility.</summary>
+    public static readonly string[] HttpApplicationEventPrefixes = { "Application_", "Session_" };
+
+    /// <summary>Assembly attributes naming a startup method by STRING next to its type (System.Web,
+    /// WebActivatorEx): the type alone is not enough, the named method must be rooted too.</summary>
+    public static readonly HashSet<string> StartMethodAttributeNames = new(StringComparer.Ordinal)
+    {
+        "PreApplicationStartMethod", "PostApplicationStartMethod", "ApplicationShutdownMethod",
+    };
+
+    /// <summary>Autofac registration-builder calls from integration packages (MVC/Web API): lifetimes
+    /// that declare no service, so the chain walk continues past them.</summary>
+    public static readonly HashSet<string> AutofacExtraLifetimeNames = new(StringComparer.Ordinal)
+    {
+        "InstancePerHttpRequest", "InstancePerApiRequest",
     };
 
     /// <summary>Members kept while their type is in use: pattern-based language features and framework

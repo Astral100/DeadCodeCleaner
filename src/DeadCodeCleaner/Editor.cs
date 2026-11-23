@@ -39,10 +39,15 @@ public static class Editor
 
         // line -> marker suffix ("" for plain; review notes carry the reason)
         var perFile = new Dictionary<string, SortedDictionary<int, string>>(Constants.PathComparer);
-        void Plan(string fileRaw, int line, string suffix, bool insideToken)
+        void Plan(string fileRaw, int line, string suffix, bool insideToken, bool midLine = false)
         {
             var file = CanonicalPath(fileRaw);
             if (deletableFiles.Contains(file)) { return; }
+            if (midLine)
+            {
+                log($"  WARNING: {file}:{line} — the code to delete starts after other code on the same line; a marker line would label that other code, so it is skipped (the deletion itself is unaffected)");
+                return;
+            }
             // The line begins inside a multi-line string that ends on it: an inserted marker line
             // would become part of the string. Skipped; delete mode needs no marker.
             if (insideToken)
@@ -57,7 +62,7 @@ public static class Editor
         {
             var suffix = sym.Review && sym.ReviewNote != null
                 ? $" (review: {Truncate(sym.ReviewNote, Constants.ReviewNoteMaxLength)})" : "";
-            foreach (var p in sym.Parts) { Plan(p.File, p.StartLine, suffix, p.MarkerLineInsideToken); }
+            foreach (var p in sym.Parts) { Plan(p.File, p.StartLine, suffix, p.MarkerLineInsideToken, p.StartsMidLine); }
         }
         foreach (var st in report.Statements) { Plan(st.File, st.StartLine, "", st.MarkerLineInsideToken); }
         foreach (var ur in report.UsingRemovals) { Plan(ur.File, ur.Line, "", false); }
@@ -825,8 +830,49 @@ public static class Editor
         }
         catch (DecoderFallbackException)
         {
+            // Not UTF-8: the compiler decodes such a file with the system ANSI code page (Windows-1252
+            // on Western systems), so the editor must too, or "’" and "“" (0x80-0x9F) read differently
+            // from the analyzed text. Used only when it round-trips the bytes EXACTLY; otherwise
+            // Latin-1 keeps the bytes and the hash guard skips the file instead of mangling it.
+            var ansi = LegacyAnsiEncoding();
+            if (ansi != null)
+            {
+                var ansiText = ansi.GetString(bytes);
+                bool roundTrips;
+                try
+                {
+                    roundTrips = ansi.GetBytes(ansiText).AsSpan().SequenceEqual(bytes);
+                }
+                catch (EncoderFallbackException)
+                {
+                    roundTrips = false;
+                }
+                if (roundTrips)
+                {
+                    encoding = ansi;
+                    return ansiText;
+                }
+            }
             encoding = Encoding.Latin1;
             return Encoding.Latin1.GetString(bytes);
+        }
+    }
+
+    /// <summary>The fallback encoding the C# compiler uses for non-UTF-8 files: the system ANSI code
+    /// page, or Windows-1252. Null when code pages are unavailable.</summary>
+    static Encoding LegacyAnsiEncoding()
+    {
+        try
+        {
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            var ansi = Encoding.GetEncoding(0);
+            // A UTF-8 "ANSI" page (Linux) is not a legacy code page: the compiler then uses 1252.
+            if (ansi.CodePage == Encoding.UTF8.CodePage) { ansi = Encoding.GetEncoding(Constants.WindowsWesternCodePage); }
+            return Encoding.GetEncoding(ansi.CodePage, EncoderFallback.ExceptionFallback, DecoderFallback.ReplacementFallback);
+        }
+        catch (Exception e) when (e is NotSupportedException or ArgumentException)
+        {
+            return null;
         }
     }
 

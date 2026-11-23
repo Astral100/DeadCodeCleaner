@@ -139,9 +139,16 @@ public sealed class Graph
     /// <summary>Member names accessed through 'dynamic': those bindings happen at runtime, so a
     /// deleted member sharing such a name warrants a warning.</summary>
     public HashSet<string> DynamicMemberNames { get; } = new(StringComparer.Ordinal);
-    /// <summary>file:line of the first assembly-scanning registration call (RegisterAssemblyTypes,
-    /// Scan, ...), or null when none exists.</summary>
-    public string AssemblyScanSite { get; set; }
+    /// <summary>Assembly-scanning registrations (RegisterAssemblyTypes, Scrutor/StructureMap Scan, ...)
+    /// as read from the code: which assemblies, which filter, and how matched classes register.</summary>
+    public List<ScanRegistration> ScanRegistrations { get; } = new();
+    /// <summary>Type id -> file:line of a scan registration that registers it.</summary>
+    public Dictionary<string, string> ScanMatchedTypes { get; } = new(StringComparer.Ordinal);
+    /// <summary>Roots that exist only because a name is mentioned where the analysis cannot follow
+    /// it (views, inactive #if code, dynamic calls, config files): id -> where it is mentioned.</summary>
+    public Dictionary<string, string> MentionRoots { get; } = new(StringComparer.Ordinal);
+    /// <summary>JavaScript texts (not minified), scanned for removal targets' names only.</summary>
+    public Dictionary<string, string> ScriptTexts { get; } = new(Constants.PathComparer);
     /// <summary>Files declaring a type whose full name another project declared first: the graph
     /// tracks only the first declaration, so these files must never be deleted whole.</summary>
     public HashSet<string> FilesWithDuplicateDecls { get; } = new(Constants.PathComparer);
@@ -275,6 +282,12 @@ public sealed class ProjectInfo
     public required string Name { get; init; }
     public required string FilePath { get; init; }
     public string AssemblyName { get; set; } = "";
+    /// <summary>The project's real warnings-as-errors settings (the analysis itself neutralizes them).</summary>
+    public bool TreatWarningsAsErrors { get; set; }
+    /// <summary>SDK-style with default compile items on: .cs files need no &lt;Compile&gt; entry.</summary>
+    public bool DefaultCompileItems { get; set; }
+    public HashSet<string> WarningsAsErrors { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> WarningsNotAsErrors { get; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> PackageReferences { get; } = new();
     /// <summary>Referenced project name -> Include path as written in the csproj.</summary>
     public Dictionary<string, string> ProjectReferences { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -344,4 +357,38 @@ public sealed class CliOptions
     /// <summary>Delete review-flagged tests (tests that also reference surviving code) without
     /// refusing. Default: delete mode stops while any exist, so they can be adjusted first.</summary>
     public bool DeleteReviewTests;
+    /// <summary>Let delete run although no production entry point was detected. Default: refuse.</summary>
+    public bool AllowNoRoots;
+    /// <summary>Delete [REVIEW]-flagged pre-existing orphans (possibly framework-activated) as-is.</summary>
+    public bool DeleteReviewOrphans;
+    /// <summary>Let delete run although the solution holds Web Site projects (invisible to the analysis).</summary>
+    public bool AllowWebsiteProjects;
+}
+
+/// <summary>How the classes a scan matches are registered.</summary>
+public enum ScanMode
+{
+    /// <summary>Not recognised: treated like AllInterfaces (the safe side).</summary>
+    Unknown,
+    /// <summary>Every matched class under every interface it implements (Autofac AsImplementedInterfaces).</summary>
+    AllInterfaces,
+    /// <summary>Only under the interface named like the class, "I" + name (StructureMap default conventions).</summary>
+    MatchingInterface,
+    /// <summary>Only as the class itself: whoever resolves it names it in code.</summary>
+    SelfOnly,
+}
+
+/// <summary>One assembly-scanning registration as read from the code.</summary>
+public sealed class ScanRegistration
+{
+    /// <summary>The member whose code runs the scan: the registrations live while it does.</summary>
+    public required string SourceId { get; init; }
+    public required string Site { get; init; }
+    /// <summary>Scanned assembly names; null when not determinable (every solution assembly is assumed).</summary>
+    public HashSet<string> Assemblies { get; init; }
+    /// <summary>Type filter; null when there is none or it could not be read (every class matches).</summary>
+    public Func<INamedTypeSymbol, bool> Filter { get; init; }
+    /// <summary>False when part of the filter could not be read and was widened to "matches".</summary>
+    public bool FilterExact { get; init; }
+    public required ScanMode Mode { get; init; }
 }

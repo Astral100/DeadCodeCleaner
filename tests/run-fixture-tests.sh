@@ -13,8 +13,10 @@ SCRATCH5=""
 SCRATCH6=""
 SCRATCH7=""
 SCRATCH8=""
+SCRATCH9=""
+SCRATCH10=""
 KEEPCFG=$(mktemp)
-trap 'rm -rf "$SCRATCH" "$SCRATCH2" "$SCRATCH3" "$SCRATCH4" "$SCRATCH5" "$SCRATCH6" "$SCRATCH7" "$SCRATCH8"; rm -f "$REPORT" "$KEEPCFG"' EXIT
+trap 'rm -rf "$SCRATCH" "$SCRATCH2" "$SCRATCH3" "$SCRATCH4" "$SCRATCH5" "$SCRATCH6" "$SCRATCH7" "$SCRATCH8" "$SCRATCH9" "$SCRATCH10"; rm -f "$REPORT" "$KEEPCFG"' EXIT
 FAIL=0
 
 check() { # check <description> <jq filter that must output true>
@@ -97,8 +99,9 @@ check "file with inactive #if region NOT deletable" \
     '[.deletableFiles[]] | map(select(endswith("Conditional.cs"))) | length == 0'
 check "inactive-region file-kept warning emitted" \
     '[.warnings[]] | map(select(contains("file kept (contains inactive"))) | length == 1'
-check "deleted symbol mentioned in inactive #if code warns" \
-    '[.warnings[]] | map(select(contains("mentioned in inactive #if"))) | length >= 1'
+check "class named in inactive #if code is KEPT (exclusion list), with a warning" \
+    '([.symbols[].fqn] | map(select(startswith("Fixture.Domain.InactiveUse"))) | length == 0)
+     and ([.warnings[]] | map(select(startswith("kept (not deleted): Fixture.Domain.InactiveUse") and contains("inactive #if"))) | length >= 1)'
 check "record with orphaned primary ctor survives whole" \
     '[.symbols[].fqn] | map(select(startswith("Fixture.Domain.WidgetTag"))) | length == 0'
 check "base ctor called via primary base call survives" \
@@ -113,8 +116,9 @@ check "healthy sibling test and its class survive" \
     '[.symbols[].fqn] | map(select(startswith("Fixture.Tests.MixedTests"))) | length == 1'
 check "verification clean (plan introduces no compile errors)" \
     '[.warnings[] | select(startswith("VERIFY"))] | length == 0'
-check "deleted member accessed via dynamic warns" \
-    '[.warnings[]] | map(select(contains("accessed dynamically"))) | length >= 1'
+check "member accessed by name through dynamic is KEPT (exclusion list), with a warning" \
+    '([.symbols[].fqn] | map(select(startswith("Fixture.Domain.DynamicTarget"))) | length == 0)
+     and ([.warnings[]] | map(select(startswith("kept (not deleted): Fixture.Domain.DynamicTarget.Summarize") and contains("dynamic"))) | length >= 1)'
 check "attribute ctor survives via surviving method's attribute" \
     '[.symbols[] | select(.fqn == "Fixture.Domain.AuditAttribute..ctor")] | length == 0'
 check "chained generic converter NOT orphaned (its map survives)" \
@@ -462,6 +466,13 @@ check "kept test NOT deleted" \
 check "kept test referencing deleted code reported as STILL REFERENCED" \
     '[.warnings[]] | map(select(startswith("STILL REFERENCED: config-kept Fixture.Tests.WidgetsControllerTests"))) | length >= 1'
 check "delete would refuse (counted as still referenced)" '.stillReferencedTargets >= 1'
+# Exact type name (no '*'): the class is kept but its broken test is not — this used to loop forever.
+printf '{ "inSolutionRegistrations": true, "keep": ["Fixture.Tests.WidgetsControllerTests"] }\n' > "$KEEPCFG"
+timeout 600 dotnet run --project src/DeadCodeCleaner -- analyze --config "$KEEPCFG" \
+    --solution tests/Fixture/Fixture.sln \
+    --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED (or hung)"; exit 1; }
+check "exact-name keep: class kept, its broken test deleted" \
+    '[.symbols[].fqn] | map(select(startswith("Fixture.Tests.WidgetsControllerTests"))) == ["Fixture.Tests.WidgetsControllerTests.GetWidget_when_called_then_widget_is_returned"]'
 
 echo "== Case 14: empty-profile side effects, chained in-solution extension, marker inside a string (scratch)"
 SCRATCH7=$(mktemp -d)
@@ -627,6 +638,264 @@ dotnet run --project src/DeadCodeCleaner -- analyze \
 check "in-solution Profile subclass is ordinary (pre-existing orphan deleted with its broken reference)" \
     '[.symbols[] | select(.fqn=="Plain.AdminProfile") | .category] == ["broken-orphan"]'
 check "no STILL REFERENCED (it was never a root)" '.stillReferencedTargets == 0'
+
+echo "== Case 16: legacy framework entry points and registrations with EXTERNAL stub assemblies (scratch)"
+SCRATCH9=$(mktemp -d)
+mkdir -p "$SCRATCH9/stubs/SysWeb" "$SCRATCH9/stubs/Autofac" "$SCRATCH9/Web"
+cat > "$SCRATCH9/stubs/SysWeb/SysWeb.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>System.Web.Stubs</AssemblyName></PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH9/stubs/SysWeb/Stubs.cs" <<'CSFILE'
+using System;
+namespace System.Web { public class HttpApplication { } }
+namespace System.Web { [AttributeUsage(AttributeTargets.Assembly, AllowMultiple = true)] public sealed class PreApplicationStartMethodAttribute : Attribute { public PreApplicationStartMethodAttribute(Type t, string m) { } } }
+namespace System.Web.UI { public class Page { } }
+namespace System.Web.Mvc { public abstract class Controller { } }
+namespace System.Data.Entity.ModelConfiguration { public class EntityTypeConfiguration<T> { } }
+namespace Some.Bus { public interface IHandleMessages<T> { void Handle(T message); } }
+CSFILE
+cat > "$SCRATCH9/stubs/Autofac/Autofac.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>Autofac</AssemblyName></PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH9/stubs/Autofac/Stubs.cs" <<'CSFILE'
+using System;
+namespace Autofac
+{
+    public class Reg<T>
+    {
+        public Reg<T> As<TS>() { return this; }
+        public Reg<T> As(params Type[] t) { return this; }
+        public Reg<T> Named(string name, Type t) { return this; }
+        public Reg<T> WithMetadata(string key, object value) { return this; }
+        public Reg<T> Where(Func<Type, bool> predicate) { return this; }
+        public Reg<T> AsImplementedInterfaces() { return this; }
+        public Reg<T> AsSelf() { return this; }
+    }
+    public class ContainerBuilder
+    {
+        public Reg<T> RegisterType<T>() { return new Reg<T>(); }
+        public Reg<object> RegisterAssemblyTypes(params System.Reflection.Assembly[] assemblies) { return new Reg<object>(); }
+        public object Build() { return null; }
+    }
+    public abstract class Module { protected virtual void Load(ContainerBuilder b) { } }
+}
+CSFILE
+dotnet build "$SCRATCH9/stubs/SysWeb/SysWeb.csproj" -o "$SCRATCH9/stubs/out" > /dev/null 2>&1 \
+    && dotnet build "$SCRATCH9/stubs/Autofac/Autofac.csproj" -o "$SCRATCH9/stubs/out" > /dev/null 2>&1 \
+    || { echo "STUB BUILD FAILED"; exit 1; }
+cat > "$SCRATCH9/Web/Web.csproj" <<CSPROJ
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Web.Stubs"><HintPath>$SCRATCH9/stubs/out/System.Web.Stubs.dll</HintPath></Reference>
+    <Reference Include="Autofac"><HintPath>$SCRATCH9/stubs/out/Autofac.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH9/Web/App.cs" <<'CSFILE'
+[assembly: System.Web.PreApplicationStartMethod(typeof(Web.Bootstrap), "Start")]
+namespace Web
+{
+    // Every helper is used by Admin AND by exactly one framework-reached place: removing Admin must
+    // delete none of them — each would die if its place were not recognised as live.
+    public class Global : System.Web.HttpApplication
+    {
+        public static Heartbeat Beat;
+        protected void Application_Start() { HelperG.Go(); Beat = new Heartbeat(); AutofacConfig.Register(); ScanConfig.Register(); }
+    }
+    public static class Bootstrap { public static void Start() { HelperS.Go(); } }
+    public class Page1 : System.Web.UI.Page { protected void Page_Load(object s, System.EventArgs e) { HelperP.Go(); } }
+    public class Order { public string LegacyCode = ""; }
+    public class OrderConfig : System.Data.Entity.ModelConfiguration.EntityTypeConfiguration<Order> { public OrderConfig() { HelperE.Go(); } }
+    public interface IFoo { } public class Foo : IFoo { public Foo() { HelperF.Go(); } }
+    public interface IBar { } public class Bar : IBar { public Bar() { HelperB.Go(); } }
+    public interface IBaz { } public class Baz : IBaz { public Baz() { HelperZ.Go(); } }
+    public static class AutofacConfig
+    {
+        public static void Register()
+        {
+            var b = new Autofac.ContainerBuilder();
+            b.RegisterType<Foo>().Named("foo", typeof(IFoo));
+            b.RegisterType<Bar>().As(typeof(IBar));
+            b.RegisterType<Baz>().WithMetadata("k", 1).As<IBaz>();
+            b.Build();
+        }
+    }
+    // The timer's initializer starts a background job: losing Stop() must not delete it.
+    public class Heartbeat
+    {
+        private readonly System.Threading.Timer _timer = new System.Threading.Timer(Tick, null, 1000, 1000);
+        static void Tick(object s) { HelperT.Go(); }
+        public void Stop() { _timer.Dispose(); }
+    }
+    // Losing Set leaves _n never assigned: CS0649, an ERROR under TreatWarningsAsErrors.
+    public static class Counter
+    {
+        private static int _n;
+        public static void Set(int v) { _n = v; }
+        public static int Read() { return _n; }
+    }
+    public static class Mid
+    {
+        public static void Keep() { } public static void Drop() { }
+#if NEVER_DEFINED
+        public static void Hidden() { }
+#endif
+    }
+    public class HomeController : System.Web.Mvc.Controller
+    {
+        public HomeController(IFoo f, IBar b, IBaz z) { }
+        public void Admin() { HelperG.Go(); HelperS.Go(); HelperP.Go(); HelperE.Go(); HelperF.Go(); HelperB.Go(); HelperZ.Go(); HelperT.Go(); Global.Beat.Stop(); Counter.Set(5); Mid.Drop(); }
+        public int Other() { Mid.Keep(); return Counter.Read(); }
+    }
+    public static class HelperG { public static void Go() { } }
+    public static class HelperS { public static void Go() { } }
+    public static class HelperP { public static void Go() { } }
+    public static class HelperE { public static void Go() { } }
+    public static class HelperF { public static void Go() { } }
+    public static class HelperB { public static void Go() { } }
+    public static class HelperZ { public static void Go() { } }
+    public static class HelperT { public static void Go() { } }
+    // A user base module whose helper registers: the derived module must not die as "empty".
+    public interface IRepo { } public class Repo : IRepo { }
+    public interface IOrderSvc { } public class OrderSvc : IOrderSvc { }
+    public abstract class BaseModule : Autofac.Module
+    {
+        protected void RegisterRepos(Autofac.ContainerBuilder b) { b.RegisterType<Repo>().As<IRepo>(); }
+    }
+    public class OrdersModule : BaseModule
+    {
+        protected override void Load(Autofac.ContainerBuilder b) { b.RegisterType<OrderSvc>().As<IOrderSvc>(); RegisterRepos(b); }
+    }
+    public class OrdersController : System.Web.Mvc.Controller { public OrdersController(IOrderSvc s) { } }
+    public class ReposController : System.Web.Mvc.Controller { public ReposController(IRepo r) { } }
+    // Assembly scanning: classes whose name ends with "Service" register under all their interfaces.
+    public static class ScanConfig
+    {
+        public static void Register()
+        {
+            var b = new Autofac.ContainerBuilder();
+            b.RegisterAssemblyTypes(typeof(ScanConfig).Assembly).Where(t => t.Name.EndsWith("Service")).AsImplementedInterfaces();
+        }
+    }
+    public interface IAuditService { }
+    public class AuditService : IAuditService { }        // matches the filter: kept while IAuditService is used
+    public class OldAuditService : IAuditService { }     // matches too: Autofac registers it as well
+    public class AuditWriter : IAuditService { }         // filtered out: deletable
+    public interface IReportService { }
+    public class ReportService : IReportService { }      // matches, but its interface dies: deletable
+    public class ScanController : System.Web.Mvc.Controller
+    {
+        public ScanController(IAuditService a) { }
+        public void Build() { _ = new AuditService(); _ = new OldAuditService(); _ = new AuditWriter(); IReportService r = new ReportService(); _ = r; }
+    }
+    // A pre-existing orphan built on an OUTSIDE framework interface, referenced nowhere: probably
+    // created by that framework at runtime — flagged for review, never deleted unconfirmed.
+    public class OrderPlacedHandler : Some.Bus.IHandleMessages<string> { public void Handle(string message) { HelperJ.Go(); } }
+    // A plain pre-existing orphan: still deleted with its broken reference.
+    public class PlainOld { public void Touch() { HelperJ.Go(); } }
+    public class JobsController : System.Web.Mvc.Controller { public void Run() { HelperJ.Go(); } }
+    public static class HelperJ { public static void Go() { } }
+}
+CSFILE
+(cd "$SCRATCH9" && dotnet new sln -n Scratch --force > /dev/null 2>&1 && dotnet sln Scratch.sln add Web/Web.csproj > /dev/null 2>&1)
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH9/Scratch.sln" \
+    --remove Web.HomeController.Admin --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "Global.asax/Page_Load/start method/EF config/Autofac typeof+unknown-call registrations keep their code" \
+    '[.symbols[].fqn] | sort == ["Web.Counter.Set", "Web.Heartbeat.Stop", "Web.HomeController.Admin", "Web.Mid.Drop"]'
+check "no registration statement deleted" '.statements | length == 0'
+check "warning-as-error CS0649 caught by verification" \
+    '[.warnings[]] | map(select(startswith("VERIFY") and contains("CS0649"))) | length >= 1'
+check "mid-line deletion does not join the next line onto #if (no CS1040)" \
+    '[.warnings[]] | map(select(contains("CS1040"))) | length == 0'
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH9/Scratch.sln" \
+    --remove Web.OrdersController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "module calling a base-module helper is not deleted as empty" \
+    '[.symbols[].fqn] | (index("Web.OrdersModule") == null and index("Web.Repo") == null)'
+check "the dead service and its registration go" \
+    '([.symbols[].fqn] | index("Web.OrderSvc") != null) and (.statements | length == 1)'
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH9/Scratch.sln" \
+    --remove Web.ScanController.Build --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "scanned classes matching the filter, with a used interface, are kept" \
+    '[.symbols[].fqn] | (index("Web.AuditService") == null and index("Web.OldAuditService") == null)'
+check "a class the scan filter excludes is deleted" '[.symbols[].fqn] | index("Web.AuditWriter") != null'
+check "a scanned class whose interface died is deleted with it" \
+    '[.symbols[].fqn] | (index("Web.ReportService") != null and index("Web.IReportService") != null)'
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH9/Scratch.sln" \
+    --remove Web.JobsController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "framework-built pre-existing orphan is flagged [REVIEW]" \
+    '[.symbols[] | select(.fqn=="Web.OrderPlacedHandler") | (.category == "broken-orphan" and .review)] == [true]'
+check "plain pre-existing orphan is deleted without review" \
+    '[.symbols[] | select(.fqn=="Web.PlainOld") | (.category == "broken-orphan" and (.review | not))] == [true]'
+cp -r "$SCRATCH9/Web" "$SCRATCH9/WebDel" && rm -rf "$SCRATCH9/WebDel/obj" "$SCRATCH9/WebDel/bin"
+(cd "$SCRATCH9" && dotnet new sln -n Del --force > /dev/null 2>&1 && dotnet sln Del.sln add WebDel/Web.csproj > /dev/null 2>&1)
+dotnet run --project src/DeadCodeCleaner -- delete \
+    --solution "$SCRATCH9/Del.sln" --remove Web.JobsController --json "$REPORT" > /dev/null 2> "$SCRATCH9/del.err"
+if [ $? -eq 1 ] && grep -q "may be created by a framework" "$SCRATCH9/del.err" && [ -f "$SCRATCH9/WebDel/App.cs" ] && grep -q "class OrderPlacedHandler" "$SCRATCH9/WebDel/App.cs"; then
+    pass "delete refuses while a framework-built orphan awaits review (nothing deleted)"
+else
+    failx "delete refuses while a framework-built orphan awaits review (nothing deleted)"
+fi
+
+echo "== Case 17: a namespace shared across projects dies in the referenced assembly (scratch)"
+SCRATCH10=$(mktemp -d)
+mkdir -p "$SCRATCH10/A" "$SCRATCH10/B" "$SCRATCH10/C"
+for p in B C; do
+    printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>\n</Project>\n' > "$SCRATCH10/$p/$p.csproj"
+done
+# One explicitly linked file: an SDK-style project still needs no <Compile> entry for the others.
+printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework><OutputType>Exe</OutputType></PropertyGroup>\n  <ItemGroup><ProjectReference Include="../B/B.csproj" /><Compile Include="../Shared/Version.cs" Link="Version.cs" /></ItemGroup>\n</Project>\n' > "$SCRATCH10/A/A.csproj"
+mkdir -p "$SCRATCH10/Shared"
+printf 'namespace AApp { public static class AppVersion { public const int V = 1; } }\n' > "$SCRATCH10/Shared/Version.cs"
+cat > "$SCRATCH10/B/B.cs" <<'CSFILE'
+namespace Shared.Helpers { public static class BHelper { public static int X() { return 1; } } }
+namespace BOther { public static class Keep { public static int Z() { return 3; } } }
+CSFILE
+# C also declares Shared.Helpers, but A never references C.
+cat > "$SCRATCH10/C/C.cs" <<'CSFILE'
+namespace Shared.Helpers { public static class CHelper { public static int Y() { return 2; } } }
+namespace CApp { public class CController { public int Go() { return Shared.Helpers.CHelper.Y(); } } }
+CSFILE
+cat > "$SCRATCH10/A/Program.cs" <<'CSFILE'
+using Shared.Helpers;
+namespace AApp
+{
+    public static class Program { public static void Main() { BOther.Keep.Z(); } }
+}
+CSFILE
+cat > "$SCRATCH10/A/FeatureController.cs" <<'CSFILE'
+namespace AApp
+{
+    public class FeatureController { public int Run() { return Shared.Helpers.BHelper.X(); } }
+}
+CSFILE
+(cd "$SCRATCH10" && dotnet new sln -n Scratch --force > /dev/null 2>&1 && dotnet sln Scratch.sln add A/A.csproj B/B.csproj C/C.csproj > /dev/null 2>&1)
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH10/Scratch.sln" \
+    --remove AApp.FeatureController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "B's last Shared.Helpers type dies" '[.symbols[].fqn] | index("Shared.Helpers.BHelper") != null'
+check "A's using Shared.Helpers is removed although C still has the namespace" \
+    '[.usingRemovals[] | select(.namespace=="Shared.Helpers") | .file] | map(endswith("A/Program.cs")) | any'
+check "no false missing-<Compile>-entry warning in an SDK project with one linked file" \
+    '[.warnings[]] | map(select(contains("no textually matching <Compile> entry"))) | length == 0'
+# An ASP.NET Web Site project (no csproj) in the solution: excluded, and delete refuses.
+sed -i 's/^Global\r\?$/Project("{E24C65DC-7377-472B-9ABA-BC803B73C61A}") = "OldSite", "http:\/\/localhost\/OldSite", "{11111111-2222-3333-4444-555555555555}"\r\nEndProject\r\nGlobal\r/' "$SCRATCH10/Scratch.sln"
+dotnet run --project src/DeadCodeCleaner -- delete \
+    --solution "$SCRATCH10/Scratch.sln" --remove AApp.FeatureController --json "$REPORT" > /dev/null 2> "$SCRATCH10/del.err"
+if [ $? -eq 1 ] && grep -q "Web Site project" "$SCRATCH10/del.err" && [ -f "$SCRATCH10/A/FeatureController.cs" ]; then
+    pass "delete refuses with a Web Site project in the solution (nothing deleted)"
+else
+    failx "delete refuses with a Web Site project in the solution (nothing deleted)"
+fi
+check "the Web Site project is reported" '.websiteProjects == 1'
 
 if [ "$FAIL" = 1 ]; then echo "RESULT: FAILURES PRESENT"; exit 1; fi
 echo "RESULT: all checks passed"

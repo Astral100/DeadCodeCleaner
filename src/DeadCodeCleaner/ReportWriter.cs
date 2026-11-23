@@ -90,7 +90,7 @@ public static class ReportWriter
         foreach (var item in items.Take(limit))
         {
             var p = item.Parts.FirstOrDefault();
-            var where = p == null ? "" : $"  ({p.File}:{p.StartLine})";
+            var where = p != null ? $"  ({p.File}:{p.StartLine})" : item.CoveredBy != null ? $"  (deleted with {item.CoveredBy})" : "";
             var review = item.Review ? $"  [REVIEW: {item.ReviewNote}]" : "";
             var whole = item.InDeletableFile ? "  [whole file]" : "";
             Console.WriteLine($"  {item.Kind,-11} {item.Fqn}{where}{whole}{review}");

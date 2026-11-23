@@ -30,6 +30,8 @@ public sealed class DeletionReport
     /// <summary>Workspace load failures plus solution projects the analysis could not see at all
     /// (non-C#, failed evaluation): references from them are invisible, so delete refuses.</summary>
     public int ProjectsFailedToLoad { get; set; }
+    /// <summary>ASP.NET Web Site projects in the solution: excluded and invisible, so delete refuses.</summary>
+    public int WebsiteProjects { get; set; }
     /// <summary>File -> length of the text the spans were computed against: the editor refuses to
     /// touch a file whose on-disk text decodes to a different length (encoding mismatch, or the
     /// file changed since the analysis).</summary>
@@ -53,6 +55,9 @@ public sealed class SymbolDeletion
     public bool Review { get; init; }
     public string ReviewNote { get; init; }
     public bool InDeletableFile { get; set; }
+    /// <summary>Set on a requested removal whose containing type is deleted anyway (another
+    /// category's entry): that type's parts delete it, so this entry has none of its own.</summary>
+    public string CoveredBy { get; init; }
 }
 
 public sealed class SourcePart
@@ -65,6 +70,9 @@ public sealed class SourcePart
     /// <summary>True when StartLine begins inside a multi-line token (a string literal ending there):
     /// mark mode must not insert a marker line at it.</summary>
     public bool MarkerLineInsideToken { get; init; }
+    /// <summary>True when the declaration starts after other code on its first line: a marker line
+    /// above it would label that other code, so mark mode skips it.</summary>
+    public bool StartsMidLine { get; init; }
 }
 
 /// <summary>A whole project whose every declaration is deleted: remove it from the solution.</summary>

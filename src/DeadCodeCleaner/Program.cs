@@ -96,6 +96,16 @@ public static class Program
                         Console.Error.WriteLine($"error: {report.ProjectsWithCompileErrors} project(s) had compile errors during analysis — references in them are invisible and the cascade may over-delete; fix the build first, or pass --allow-compile-errors; nothing was deleted");
                         return 1;
                     }
+                    if (report.WebsiteProjects > 0 && !opts.AllowWebsiteProjects)
+                    {
+                        Console.Error.WriteLine($"error: the solution contains {report.WebsiteProjects} ASP.NET Web Site project(s) — they are excluded from the analysis, so code they use in other projects looks unused and could be deleted; pass --allow-website-projects to delete anyway; nothing was deleted");
+                        return 1;
+                    }
+                    if (report.Stats.ProductionRoots == 0 && !opts.AllowNoRoots)
+                    {
+                        Console.Error.WriteLine("error: no production entry points were detected — nothing counts as in use, so every caller of a removal target would be deleted with it; declare roots via --config keep/roots, or pass --allow-no-roots; nothing was deleted");
+                        return 1;
+                    }
                     // Deliberately NOT tied to --no-verify: skipping the expensive rebuild for speed
                     // must never also waive this independent, already-computed refusal.
                     if (report.StillReferencedTargets > 0 && !opts.AllowStillReferenced)
@@ -103,10 +113,16 @@ public static class Program
                         Console.Error.WriteLine($"error: {report.StillReferencedTargets} removal target(s) are still referenced by surviving code (see the STILL REFERENCED warnings) — deleting them breaks the callers, or silently rebinds them to another overload; fix the callers first (--allow-still-referenced overrides); nothing was deleted");
                         return 1;
                     }
-                    var reviewTests = report.Symbols.Count(s => s.Review);
+                    var reviewTests = report.Symbols.Count(s => s.Review && s.Category == Constants.CategoryBrokenTest);
                     if (reviewTests > 0 && !opts.DeleteReviewTests)
                     {
                         Console.Error.WriteLine($"error: {reviewTests} test(s) to be deleted also reference surviving code (see the [REVIEW] entries) — adjust or remove them first, or pass --delete-review-tests to delete them as-is; nothing was deleted");
+                        return 1;
+                    }
+                    var reviewOrphans = report.Symbols.Count(s => s.Review && s.Category != Constants.CategoryBrokenTest);
+                    if (reviewOrphans > 0 && !opts.DeleteReviewOrphans)
+                    {
+                        Console.Error.WriteLine($"error: {reviewOrphans} pre-existing orphan(s) to be deleted may be created by a framework at runtime (see the [REVIEW] entries) — confirm they are really unused (add a keep pattern if not), or pass --delete-review-orphans to delete them as-is; nothing was deleted");
                         return 1;
                     }
                     if (report.VerificationErrors > 0)
@@ -160,6 +176,9 @@ public static class Program
                 case "--allow-still-referenced": opts.AllowStillReferenced = true; break;
                 case "--allow-compile-errors": opts.AllowCompileErrors = true; break;
                 case "--delete-review-tests": opts.DeleteReviewTests = true; break;
+                case "--allow-no-roots": opts.AllowNoRoots = true; break;
+                case "--delete-review-orphans": opts.DeleteReviewOrphans = true; break;
+                case "--allow-website-projects": opts.AllowWebsiteProjects = true; break;
                 case "--verbose" or "-v": opts.Verbose = true; break;
                 default: throw new ArgumentException($"unknown option '{args[i]}'");
             }
@@ -193,6 +212,9 @@ public static class Program
               --allow-still-referenced  let delete run although surviving code still references a removal target
               --allow-compile-errors  let delete run although some projects failed to compile during analysis
               --delete-review-tests   delete review-flagged tests too (default: delete refuses while any exist)
+              --allow-no-roots        let delete run although no production entry points were detected
+              --delete-review-orphans delete review-flagged pre-existing orphans (possibly framework-created) too
+              --allow-website-projects  let delete run although the solution holds ASP.NET Web Site projects
               --verbose               print full lists instead of the first 100
 
             The FQN format is Namespace.Type.Member without parameters, e.g.

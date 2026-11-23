@@ -35,7 +35,8 @@ public class WidgetsController
     {
         var holder = new TagHolder("badge");
         _ = holder;
-        return shape.Render() + new WidgetFormatter().FormatWidget() + new WidgetExtra().Tag() + new WidgetTag("w").Show();
+        return shape.Render() + new WidgetFormatter().FormatWidget() + new WidgetExtra().Tag() + new WidgetTag("w").Show()
+            + DynamicTarget.Summarize() + new InactiveUse().Ping();
     }
 
     // Overload with its own private dependency: removable individually by signature.
@@ -60,7 +61,7 @@ public class GadgetsController
     public string DescribeDynamically(object source)
     {
         dynamic d = source;
-        return (string)d.Describe();
+        return (string)d.Summarize();
     }
 
     public GadgetsController(IGadgetService svc)
