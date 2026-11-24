@@ -1,3 +1,4 @@
+using System.Text;
 using Xunit;
 
 namespace DeadCodeCleaner.Tests;
@@ -10,6 +11,8 @@ public class EditorTests
         _ = EditRuns.DeleteWidgetServiceAndEnumMember.Value;
         _ = EditRuns.DeleteAuditNote.Value;
         _ = EditRuns.MarkShopBetaController.Value;
+        _ = EditRuns.DeleteWidgetsControllerFromEncodedFiles.Value;
+        _ = EditRuns.DeleteFeatureController.Value;
     }
 
     // ------------------------------------------------ mark, mark again, delete (tests/Fixture)
@@ -164,6 +167,68 @@ public class EditorTests
         var actualIndex = Array.FindIndex(actualLines, l => l.Contains("Banner = @\"first"));
         Assert.StartsWith(expectedNextLine, actualLines[actualIndex + 1]);
         Assert.Contains(actualLines, l => l.Contains(TestConstants.Marker));
+    }
+
+    // ------------------------------------------------ safety of the edit itself
+
+    [Fact]
+    public async Task Delete_when_a_file_changed_after_the_analysis_then_nothing_is_written()
+    {
+        // Arrange
+        var solution = TestSolutions.FreshFixture();
+        var dir = Path.GetDirectoryName(solution);
+        var report = await EditRuns.AnalyzeFresh(solution, TestSolutions.FixtureConfig(), "Fixture.Web.WidgetsController");
+        File.AppendAllText(Path.Combine(dir, TestConstants.FixtureControllersPath), "// edited after the analysis\n");
+        var expectedSnapshot = TestSolutions.Snapshot(dir);
+        var expectedExit = 1;
+
+        // Act
+        var actualExit = Editor.Delete(report, _ => { });
+
+        // Assert
+        Assert.Equal(expectedExit, actualExit);
+        Assert.Equal(expectedSnapshot, TestSolutions.Snapshot(dir));
+    }
+
+    [Fact]
+    public async Task Delete_when_files_are_saved_in_windows_1252_or_with_a_bom_then_they_keep_their_encoding()
+    {
+        // Arrange
+        var sut = EditRuns.DeleteWidgetsControllerFromEncodedFiles;
+        var expectedAccent = Encoding.Latin1.GetBytes("café");
+        var expectedPreamble = Encoding.UTF8.GetPreamble();
+
+        // Act
+        var actualRun = await sut.Value;
+
+        // Assert
+        Assert.Equal(0, actualRun.DeleteExitCode);
+        var actualControllers = File.ReadAllBytes(Path.Combine(actualRun.Directory, TestConstants.FixtureControllersPath));
+        Assert.True(actualControllers.AsSpan().IndexOf(expectedAccent) >= 0);
+        Assert.DoesNotContain("class WidgetsController", Encoding.Latin1.GetString(actualControllers));
+        var actualProgram = File.ReadAllBytes(Path.Combine(actualRun.Directory, TestConstants.FixtureProgramPath));
+        Assert.Equal(expectedPreamble, actualProgram.Take(expectedPreamble.Length));
+        Assert.DoesNotContain("IWidgetService", Encoding.UTF8.GetString(actualProgram));
+        Assert.Empty(actualRun.CompileErrorsAfter);
+    }
+
+    [Fact]
+    public async Task Delete_when_a_projects_last_user_is_deleted_then_the_project_leaves_the_solution_and_the_disk()
+    {
+        // Arrange
+        var sut = EditRuns.DeleteFeatureController;
+
+        // Act
+        var actualRun = await sut.Value;
+
+        // Assert
+        Assert.Equal(0, actualRun.DeleteExitCode);
+        Assert.False(Directory.Exists(Path.Combine(actualRun.Directory, "Feature")));
+        Assert.DoesNotContain("Feature.csproj", actualRun.ReadFile(TestConstants.ScenarioSolutionFileName));
+        var actualApp = actualRun.ReadFile(Path.Combine("App", "App.csproj"));
+        Assert.DoesNotContain("FeatureController.cs", actualApp);
+        Assert.DoesNotContain("Feature.csproj", actualApp);
+        Assert.Empty(actualRun.CompileErrorsAfter);
     }
 
     Lazy<Task<EditRun>> DeleteRun(string name)

@@ -30,6 +30,11 @@ public class EngineTests
     static readonly Analysis ScanStylesScenario = new(() => TestSolutions.Scenario("ScanStyles"), () => TestSolutions.KeepConfig("Web.ExportPlugin", inSolutionRegistrations: false), "Web.HomeController.Admin");
     static readonly Analysis ProjectPlumbingScenario = new(() => TestSolutions.Scenario("ProjectPlumbing"), () => new AnalyzerConfig(), "App.FeatureController", "Cons.OldController");
     static readonly Analysis NullableScenario = new(() => TestSolutions.Scenario("ProjectPlumbing"), () => new AnalyzerConfig(), "App.HomeController.Old");
+    static readonly Analysis GadgetConverterRemoved = new(() => TestSolutions.Fixture, TestSolutions.FixtureConfig, "Fixture.Domain.GadgetConverter");
+    static readonly Analysis MapSourceRemoved = new(() => TestSolutions.Scenario("RuntimeWiring"), () => new AnalyzerConfig(), "Api.Order.ComputeTotal");
+    static readonly Analysis MapDestinationRemoved = new(() => TestSolutions.Scenario("RuntimeWiring"), () => new AnalyzerConfig(), "Api.OrderDto.Total");
+    static readonly Analysis RuntimeWiringRemovals = new(() => TestSolutions.Scenario("RuntimeWiring"), () => new AnalyzerConfig(),
+        "Api.AB", "Api.C1", "Api.CustomerRepository", "Api.LegacyController", "Api.SvcController", "Api.ReportsController.Run", "Api.DoomedController", "Web.OldController");
 
     public EngineTests()
     {
@@ -63,7 +68,7 @@ public class EngineTests
     [Theory]
     [InlineData("Fixture.Domain.SharedService")]
     [InlineData("Fixture.Domain.GadgetService")]
-    public async Task Analyze_when_widgets_controller_is_removed_then_code_still_in_use_is_not_orphaned(string expectedFqn)
+    public async Task Analyze_when_widgets_controller_is_removed_then_code_still_in_use_is_not_deleted(string expectedSurvivor)
     {
         // Arrange
         var sut = WidgetsControllerRemoved;
@@ -72,7 +77,7 @@ public class EngineTests
         var actualReport = await sut.Analyze();
 
         // Assert
-        Assert.DoesNotContain(expectedFqn, Fqns(actualReport, Constants.CategoryOrphaned));
+        Assert.False(TestSolutions.IsDeleted(actualReport, expectedSurvivor));
     }
 
     [Theory]
@@ -89,7 +94,7 @@ public class EngineTests
     [InlineData("Fixture.Domain.EnumNoteAttribute")]
     [InlineData("Fixture.Domain.GadgetDto.Deconstruct")]
     [InlineData("Fixture.Domain.AuditAttribute..ctor")]
-    public async Task Analyze_when_widgets_controller_is_removed_then_surviving_symbol_is_not_reported(string expectedFqn)
+    public async Task Analyze_when_widgets_controller_is_removed_then_surviving_symbol_is_not_deleted(string expectedSurvivor)
     {
         // Arrange
         var sut = WidgetsControllerRemoved;
@@ -98,7 +103,7 @@ public class EngineTests
         var actualReport = await sut.Analyze();
 
         // Assert
-        Assert.DoesNotContain(expectedFqn, Fqns(actualReport));
+        Assert.False(TestSolutions.IsDeleted(actualReport, expectedSurvivor));
     }
 
     [Theory]
@@ -134,11 +139,11 @@ public class EngineTests
     }
 
     [Fact]
-    public async Task Analyze_when_a_shared_declaration_sibling_stays_in_use_then_the_kept_field_warns_once()
+    public async Task Analyze_when_a_shared_declaration_sibling_stays_in_use_then_the_unused_sibling_lives_without_a_warning()
     {
         // Arrange
         var sut = WidgetsControllerRemoved;
-        var expectedCount = 1;
+        var expectedCount = 0;
 
         // Act
         var actualReport = await sut.Analyze();
@@ -600,6 +605,22 @@ public class EngineTests
         Assert.DoesNotContain(actualReport.Statements, s => s.Kind == "AutoMapper.CreateMap");
         Assert.Single(actualReport.Warnings, w => w.StartsWith("map configuration removed", StringComparison.Ordinal));
         Assert.Equal(0, actualReport.VerificationErrors);
+        Assert.Equal(0, actualReport.StillReferencedTargets);
+    }
+
+    [Fact]
+    public async Task Analyze_when_a_converter_a_live_mapping_uses_is_removed_then_it_is_still_referenced()
+    {
+        // Arrange
+        var sut = GadgetConverterRemoved;
+        var expectedCount = 1;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        Assert.Equal(expectedCount, actualReport.StillReferencedTargets);
+        Assert.Contains(actualReport.Warnings, w => w.StartsWith("STILL REFERENCED: removing Fixture.Domain.GadgetConverter breaks the live mapping", StringComparison.Ordinal));
     }
 
     // ------------------------------------------------ the fixture: container escalation
@@ -989,6 +1010,171 @@ public class EngineTests
 
         // Assert
         Assert.Contains(actualReport.Warnings, w => w.StartsWith("VERIFY", StringComparison.Ordinal) && w.Contains("CS8618"));
+    }
+
+    // ------------------------------------------------ scenario: runtime wiring
+
+    [Fact]
+    public async Task Analyze_when_a_service_loses_its_only_registration_then_each_uncovered_service_is_reported()
+    {
+        // Arrange
+        var sut = RuntimeWiringRemovals;
+        var expectedCount = 2;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        var actualWarnings = actualReport.Warnings.Where(w => w.StartsWith(Constants.ServiceLeftUnregisteredPrefix, StringComparison.Ordinal)).ToList();
+        Assert.Equal(expectedCount, actualReport.ServicesLeftUnregistered);
+        Assert.Contains(actualWarnings, w => w.Contains("Api.IA "));
+        Assert.Contains(actualWarnings, w => w.Contains("Api.IRepository"));
+    }
+
+    [Theory]
+    [InlineData("Api.IB")]
+    [InlineData("Api.IC")]
+    [InlineData("Api.IValidator")]
+    public async Task Analyze_when_another_live_registration_registers_the_same_service_then_it_is_not_reported(string expectedCovered)
+    {
+        // Arrange
+        var sut = RuntimeWiringRemovals;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        Assert.DoesNotContain(actualReport.Warnings, w => w.StartsWith(Constants.ServiceLeftUnregisteredPrefix, StringComparison.Ordinal) && w.Contains(expectedCovered));
+    }
+
+    [Theory]
+    [InlineData("Api.GreeterService.SayHello")]
+    [InlineData("Api.GreetingFormatter")]
+    [InlineData("Api.Greeter.BindService")]
+    public async Task Analyze_when_a_generated_binder_is_named_in_an_attribute_then_the_service_override_stays(string expectedSurvivor)
+    {
+        // Arrange
+        var sut = RuntimeWiringRemovals;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        Assert.False(TestSolutions.IsDeleted(actualReport, expectedSurvivor));
+    }
+
+    [Fact]
+    public async Task Analyze_when_an_unused_field_shares_a_declaration_with_a_used_one_then_what_it_references_stays()
+    {
+        // Arrange
+        var sut = RuntimeWiringRemovals;
+        var expectedSurvivor = "Api.Old";
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        Assert.False(TestSolutions.IsDeleted(actualReport, expectedSurvivor));
+        Assert.DoesNotContain(actualReport.Warnings, w => w.StartsWith("STILL REFERENCED", StringComparison.Ordinal));
+        Assert.Equal(0, actualReport.StillReferencedTargets);
+    }
+
+    [Fact]
+    public async Task Analyze_when_a_view_names_a_type_of_a_referenced_project_then_the_reference_stays()
+    {
+        // Arrange
+        var sut = RuntimeWiringRemovals;
+        var expectedWarning = "Web: ProjectReference Lib lost its last compile-time user but a view names Lib.Models.MenuVm";
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        Assert.Contains("Lib.Helper", Fqns(actualReport));
+        Assert.DoesNotContain(actualReport.ProjectRefRemovals, r => r.Project == "Web");
+        Assert.Contains(actualReport.Warnings, w => w.StartsWith(expectedWarning, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Analyze_when_tests_use_a_derived_test_attribute_then_they_count_as_tests()
+    {
+        // Arrange
+        var sut = RuntimeWiringRemovals;
+        var expectedCategory = Constants.CategoryBrokenTest;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        var actualBroken = actualReport.Symbols.Single(s => s.Fqn == "T.CustomTests.Uses_doomed_and_keep");
+        Assert.Equal(expectedCategory, actualBroken.Category);
+        Assert.True(actualBroken.Review);
+        Assert.False(TestSolutions.IsDeleted(actualReport, "T.CustomTests.Healthy"));
+    }
+
+    [Fact]
+    public async Task Analyze_when_a_container_built_class_is_created_only_by_tests_or_dead_code_then_its_dead_method_is_held_for_review()
+    {
+        // Arrange
+        var sut = RuntimeWiringRemovals;
+        var expectedCategory = Constants.CategoryBrokenOrphan;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        var actualSymbol = actualReport.Symbols.Single(s => s.Fqn == "Api.Reporter.Old");
+        Assert.Equal(expectedCategory, actualSymbol.Category);
+        Assert.True(actualSymbol.Review);
+    }
+
+    [Fact]
+    public async Task Analyze_when_a_map_from_source_of_a_live_mapping_is_removed_then_it_is_still_referenced()
+    {
+        // Arrange
+        var sut = MapSourceRemoved;
+        var expectedCount = 1;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        Assert.Equal(expectedCount, actualReport.StillReferencedTargets);
+        Assert.Contains(actualReport.Warnings, w => w.StartsWith("STILL REFERENCED: removing Api.Order.ComputeTotal breaks the live mapping", StringComparison.Ordinal) && w.Contains(".ForMember"));
+    }
+
+    [Fact]
+    public async Task Analyze_when_the_destination_member_a_mapping_configures_is_removed_then_only_its_segment_goes()
+    {
+        // Arrange
+        var sut = MapDestinationRemoved;
+
+        // Act
+        var actualReport = await sut.Analyze();
+
+        // Assert
+        Assert.Equal(0, actualReport.StillReferencedTargets);
+        Assert.Single(actualReport.Statements, s => s.Kind.EndsWith("(segment)", StringComparison.Ordinal) && s.Snippet.Contains("Total"));
+        Assert.Equal(0, actualReport.VerificationErrors);
+    }
+
+    [Fact]
+    public async Task Analyze_when_a_dying_namespace_is_imported_by_a_generated_global_using_then_the_generated_file_is_not_edited()
+    {
+        // Arrange
+        var solution = TestSolutions.FreshScenario("RuntimeWiring");
+        var generated = Path.Combine(Path.GetDirectoryName(solution), TestConstants.GeneratedGlobalUsingsPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(generated));
+        File.WriteAllText(generated, "global using global::Api.Feature;\n");
+        var expectedWarning = "manual: the using of Api.Feature in generated";
+
+        // Act
+        var actualReport = await EditRuns.AnalyzeFresh(solution, new AnalyzerConfig(), "Api.Feature.FeatureController");
+
+        // Assert
+        Assert.DoesNotContain(actualReport.UsingRemovals, u => u.File.Contains("/obj/", StringComparison.Ordinal));
+        Assert.Contains(actualReport.Warnings, w => w.StartsWith(expectedWarning, StringComparison.Ordinal));
+        Assert.True(actualReport.VerificationErrors > 0);
     }
 
     // ------------------------------------------------ helpers

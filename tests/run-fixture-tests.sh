@@ -53,8 +53,8 @@ check "pre-existing orphan referencing deleted code IS deleted" \
     '[.symbols[] | select(.category=="broken-orphan") | .fqn] | index("Fixture.Domain.DeadWidgetAdmirer") != null'
 check "shared-declaration field KEPT (sibling in use)" \
     '[.symbols[].fqn] | index("Fixture.Domain.SharedService.WidgetCounter") == null'
-check "kept-field warning emitted" \
-    '[.warnings[]] | map(select(contains("WidgetCounter"))) | length == 1'
+check "no kept-field warning (siblings live together)" \
+    '[.warnings[]] | map(select(contains("WidgetCounter"))) | length == 0'
 check "other shared field NOT orphaned" \
     '[.symbols[].fqn] | index("Fixture.Domain.SharedService.GadgetCounter") == null'
 check "public field kept with its in-use type" \
@@ -962,8 +962,7 @@ namespace Scrutor
         public Selector AddClasses() { return this; }
         public Selector AsMatchingInterface() { return this; }
     }
-    public class Services { }
-    public static class ScanExtensions { public static Services Scan(this Services s, Action<Selector> a) { return s; } }
+    public class Services { public Services Scan(Action<Selector> a) { return this; } }
 }
 CSFILE
 cat > "$SCRATCH11/stubs/Hosting/Hosting.csproj" <<'CSPROJ'

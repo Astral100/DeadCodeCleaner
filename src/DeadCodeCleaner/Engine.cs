@@ -837,17 +837,18 @@ public sealed class Engine
 
         // A kept-in-place field survives physically: anything it references must not be deleted
         // silently, or the surviving text no longer compiles.
+        // Counted like a still-referenced target, so delete refuses even under --no-verify.
+        var keptInPlaceBroken = new HashSet<string>(StringComparer.Ordinal);
         foreach (var id in keptInPlace.OrderBy(x => FqnOf(graph, x), StringComparer.Ordinal))
         {
             if (!graph.Edges.TryGetValue(id, out var outs)) { continue; }
-            var broken = outs.Where(t => allDead.Contains(t) && !keptInPlace.Contains(t))
-                .Select(t => FqnOf(graph, t)).Distinct().OrderBy(x => x, StringComparer.Ordinal)
-                .Take(Constants.ShownSurvivingRefs).ToList();
-            if (broken.Count > 0)
-            {
-                report.Warnings.Add($"STILL REFERENCED: kept-in-place {FqnOf(graph, id)} references deleted {string.Join(", ", broken)} — adjust manually or the build will fail");
-            }
+            var brokenIds = outs.Where(t => allDead.Contains(t) && !keptInPlace.Contains(t)).ToList();
+            if (brokenIds.Count == 0) { continue; }
+            keptInPlaceBroken.UnionWith(brokenIds);
+            var broken = brokenIds.Select(t => FqnOf(graph, t)).Distinct().OrderBy(x => x, StringComparer.Ordinal).Take(Constants.ShownSurvivingRefs);
+            report.Warnings.Add($"STILL REFERENCED: kept-in-place {FqnOf(graph, id)} references deleted {string.Join(", ", broken)} — adjust manually or the build will fail");
         }
+        report.StillReferencedTargets += keptInPlaceBroken.Count;
         // Config-kept code the production sweep does not reach (test-world code) is shielded from the
         // poison pass, so a reference from it into deleted code is a build break the user must fix:
         // counted like a still-referenced target, so delete refuses.
@@ -865,17 +866,45 @@ public sealed class Engine
 
         // A live registration lost with a deleted implementation leaves its still-used service with
         // nothing registered — it compiles, and fails when the container first resolves a consumer —
-        // unless another surviving registration names the same surviving type.
+        // unless another surviving registration registers that same service. Coverage is per service:
+        // a registration that merely mentions the type (a nested type argument, a factory lambda) or
+        // covers only one of several services registers nothing for the others.
+        var liveRegistrations = graph.Statements
+            .Where(o => o.Kind == Constants.StatementKindDiRegister && !deadStmts.Contains(o) && r2.Contains(o)).ToList();
         foreach (var lost in lostRegistrations)
         {
-            var survivingTypes = lost.InvolvedNodes.Where(n => !allDead.Contains(n)).ToHashSet(StringComparer.Ordinal);
-            if (survivingTypes.Count == 0) { continue; }
-            bool covered = graph.Statements.Any(o => o != lost && o.Kind == Constants.StatementKindDiRegister && !deadStmts.Contains(o)
-                && r2.Contains(o) && o.InvolvedNodes.Any(survivingTypes.Contains));
-            if (covered) { continue; }
+            var uncovered = lost.ServiceNodes
+                .Where(n => !allDead.Contains(n) && r2.Contains(n) && !liveRegistrations.Any(o => o != lost && o.ServiceNodes.Contains(n)))
+                .Distinct().ToList();
+            if (uncovered.Count == 0) { continue; }
             report.ServicesLeftUnregistered++;
-            report.Warnings.Add($"{Constants.ServiceLeftUnregisteredPrefix} {string.Join(", ", survivingTypes.Select(n => FqnOf(graph, n)).Distinct())} stay in use but lose their only registration at {lost.FilePath}:{lost.StartLine} — the container fails when it first creates a consumer: {lost.Snippet}");
+            report.Warnings.Add($"{Constants.ServiceLeftUnregisteredPrefix} {string.Join(", ", uncovered.Select(n => FqnOf(graph, n)))} stay in use but lose their only registration at {lost.FilePath}:{lost.StartLine} — the container fails when it first creates a consumer: {lost.Snippet}");
         }
+
+        // An explicitly removed converter or MapFrom source that a mapping still uses: the mapping
+        // (or its member configuration) would be cut although it stays in use — it compiles, and
+        // then fails or silently maps differently at runtime. Counted like a still-referenced target.
+        // Removing a mapped type, or the member a segment configures, is the intended cut.
+        var mappingBreaks = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var stmt in graph.Statements.OrderBy(x => x.FilePath, StringComparer.Ordinal).ThenBy(x => x.AnchorStart))
+        {
+            if (!r2.Contains(stmt) || allDead.Contains(stmt.ContainingMember) || HasDeadContainer(graph, stmt.ContainingMember, allDead)) { continue; }
+            var usedGone = stmt.UsedRefs.Where(removed.Contains).ToList();
+            if (usedGone.Count > 0 && !stmt.InvolvedNodes.Any(n => allDead.Contains(n) && !stmt.UsedRefs.Contains(n)))
+            {
+                mappingBreaks.UnionWith(usedGone);
+                report.Warnings.Add($"STILL REFERENCED: removing {string.Join(", ", usedGone.Select(n => FqnOf(graph, n)).Distinct())} breaks the live mapping at {stmt.FilePath}:{stmt.StartLine} — the whole mapping would be deleted and fail at runtime; change the mapping first: {stmt.Snippet}");
+            }
+            if (deadStmts.Contains(stmt)) { continue; }
+            foreach (var seg in stmt.ChainSegments)
+            {
+                var segGone = seg.UsedRefs.Where(removed.Contains).ToList();
+                if (segGone.Count == 0 || seg.Refs.Any(r => allDead.Contains(r) && !seg.UsedRefs.Contains(r))) { continue; }
+                mappingBreaks.UnionWith(segGone);
+                report.Warnings.Add($"STILL REFERENCED: removing {string.Join(", ", segGone.Select(n => FqnOf(graph, n)).Distinct())} breaks the live mapping at {stmt.FilePath}:{seg.Line} — its .{seg.MethodName}(...) would be cut and the member silently mapped differently; change the mapping first: {seg.Snippet}");
+            }
+        }
+        report.StillReferencedTargets += mappingBreaks.Count(t => !stillReferenced.ContainsKey(t));
 
         // Statement entries (only when their containing member survives). Statements sharing one
         // anchor (fluent chains) delete only their own segment when a sibling survives.
@@ -1265,7 +1294,7 @@ public sealed class Engine
             }
             // Generated code that DOES land on disk (gRPC stubs, XAML .g.cs) lives under obj/ and
             // regenerates on build: editing it is pointless and masks the real (regenerating) state.
-            if (tree.FilePath.Replace('\\', '/').Contains("/obj/", StringComparison.OrdinalIgnoreCase))
+            if (IsUnderObj(tree.FilePath))
             {
                 var omsg = $"skipped: {SymbolNames.Fqn(s)} is declared in {tree.FilePath}, generated under obj/ — it is left to regenerate";
                 if (!warnings.Contains(omsg)) { warnings.Add(omsg); }
@@ -1540,6 +1569,25 @@ public sealed class Engine
             }
         }
 
+        // Views compile at runtime against their project's references: a surviving type a view names
+        // ("@model Lib.Models.MenuVm") needs its project referenced, invisibly to the compiler.
+        var viewWordRegex = new Regex(Constants.IdentifierWordPattern);
+        string ViewNamedType(ProjectInfo referencing, string refName)
+        {
+            var dir = Path.GetDirectoryName(referencing.FilePath);
+            if (dir == null || !nodesByProject.TryGetValue(refName, out var refNodes)) { return null; }
+            var prefix = dir.TrimEnd('/', '\\') + Path.DirectorySeparatorChar;
+            var words = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var (file, text) in graph.ViewTexts)
+            {
+                if (!file.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) { continue; }
+                foreach (Match m in viewWordRegex.Matches(text)) { words.Add(m.Value); }
+            }
+            if (words.Count == 0) { return null; }
+            return refNodes.FirstOrDefault(n => Stays(n) && graph.Decl.TryGetValue(n, out var d) && d is INamedTypeSymbol
+                && d.Name.Length >= Constants.MinMentionNameLength && words.Contains(d.Name));
+        }
+
         // Initial removal candidates from each project's own usage.
         var pkgCandidates = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         var refCandidates = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
@@ -1606,6 +1654,11 @@ public sealed class Engine
                 if (!targetDeleted && AssemblyConfigMention(graph, refName) is { } refCfg)
                 {
                     report.Warnings.Add($"{pname}: ProjectReference {refName} lost its last compile-time user but its assembly is named in {refCfg} — left in place, remove manually if appropriate");
+                    continue;
+                }
+                if (!targetDeleted && ViewNamedType(pi, refName) is { } viewType)
+                {
+                    report.Warnings.Add($"{pname}: ProjectReference {refName} lost its last compile-time user but a view names {FqnOf(graph, viewType)} — left in place, remove manually if appropriate");
                     continue;
                 }
                 // Entry points a framework discovers in the referenced assembly at runtime
@@ -1855,11 +1908,20 @@ public sealed class Engine
             if (relevant.Count == 0) { continue; }
             var u0 = relevant[0];
             if (deletableFiles.Contains(u0.File)) { continue; }
+            bool generated = !File.Exists(u0.File) || IsUnderObj(u0.File);
             bool allGone = relevant.All(u => u.Providers.Count > 0
                 && goneByProject.TryGetValue(u.Project, out var gone) && u.Providers.All(gone.Contains));
             bool nameDies = nameDeclared.Contains(u0.ResolvedName)
                 && relevant.All(u => u.Providers.Count > 0 && u.Providers.All(solutionAssemblies.Contains)
                     && !u.Providers.Any(p => nameAliveIn.Contains(p + "|" + u0.ResolvedName)));
+            if ((allGone || nameDies) && generated)
+            {
+                // Generated (global usings from <Using Include>, generator output): an edit here is
+                // regenerated away on the next build. Left in place, the verifier sees the break.
+                var usedNs = u0.Namespace.StartsWith("global::", StringComparison.Ordinal) ? u0.Namespace["global::".Length..] : u0.Namespace;
+                report.Warnings.Add($"manual: the using of {usedNs} in generated {u0.File} dies with deleted code — remove its source (a <Using Include=\"{usedNs}\" /> item in the project file) manually");
+                continue;
+            }
             if (allGone || nameDies)
             {
                 report.FileTextLengths[u0.File] = u0.FileTextLength;
@@ -1872,6 +1934,12 @@ public sealed class Engine
         report.PackageRefRemovals.Sort((a, b) => string.CompareOrdinal(a.Project, b.Project) is var c && c != 0 ? c : string.CompareOrdinal(a.Reference, b.Reference));
         report.ProjectRefRemovals.Sort((a, b) => string.CompareOrdinal(a.Project, b.Project) is var c && c != 0 ? c : string.CompareOrdinal(a.Reference, b.Reference));
         return goneByProject;
+    }
+
+    /// <summary>True for a file under an obj/ directory: build output that regenerates on build.</summary>
+    bool IsUnderObj(string path)
+    {
+        return path.Replace('\\', '/').Contains("/obj/", StringComparison.OrdinalIgnoreCase);
     }
 
     HashSet<string> ResolveRemovals(Graph graph)

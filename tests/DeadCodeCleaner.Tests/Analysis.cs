@@ -41,6 +41,6 @@ public sealed class Analysis
         var options = new CliOptions { SolutionPath = solutionPath };
         options.RemoveTargets.AddRange(_targets);
         var (report, _) = await new Engine(options, _config(), _ => { }).Analyze(loaded);
-        return report;
+        return TestSolutions.RequireCleanLoad(report);
     }
 }

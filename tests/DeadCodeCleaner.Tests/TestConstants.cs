@@ -19,6 +19,12 @@ public static class TestConstants
     public const string ReferencePackFramework = "net9.0";
     public const string ReferencePackVersionPrefix = "9.";
     public const string Marker = "todo: to be deleted";
+    public const string ReportFileName = "report.json";
+    public const string FixtureControllersPath = "Fixture.Web/Controllers.cs";
+    public const string FixtureProgramPath = "Fixture.Web/Program.cs";
+    /// <summary>Prepended to a fixture file in Windows-1252: 'é' is one byte there, two in UTF-8.</summary>
+    public const string AccentedComment = "// café\n";
+    public const string GeneratedGlobalUsingsPath = "Api/obj/Gen/Api.GlobalUsings.g.cs";
 
     /// <summary>MSBuild loads at once: each opens a design-time build host, so too many at a time only thrash.</summary>
     public const int MaxParallelLoads = 4;

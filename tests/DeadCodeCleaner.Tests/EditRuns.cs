@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace DeadCodeCleaner.Tests;
 
 /// <summary>The result of editing a private copy of a solution: its directory, the report of the
@@ -40,6 +42,12 @@ public static class EditRuns
     /// <summary>Scenario ShopProfiles: mark BetaController, whose dead helper starts inside a multi-line string.</summary>
     public static readonly Lazy<Task<EditRun>> MarkShopBetaController = new(() => Task.Run(() => Mark(TestSolutions.FreshScenario("ShopProfiles"), TestSolutions.FixtureConfig(), "Shop.BetaController")));
 
+    /// <summary>tests/Fixture: delete WidgetsController from files saved as Windows-1252 and as UTF-8 with a BOM.</summary>
+    public static readonly Lazy<Task<EditRun>> DeleteWidgetsControllerFromEncodedFiles = new(() => Task.Run(DeleteFromEncodedFiles));
+
+    /// <summary>Scenario ProjectRemoval: delete the only user of a project, which goes whole.</summary>
+    public static readonly Lazy<Task<EditRun>> DeleteFeatureController = new(() => Task.Run(() => Delete(TestSolutions.FreshScenario("ProjectRemoval"), new AnalyzerConfig(), "App.FeatureController")));
+
     /// <summary>Analyzes a solution loaded afresh from disk (its files may have changed).</summary>
     public static async Task<DeletionReport> AnalyzeFresh(string solutionPath, AnalyzerConfig config, params string[] targets)
     {
@@ -47,7 +55,7 @@ public static class EditRuns
         var options = new CliOptions { SolutionPath = solutionPath };
         options.RemoveTargets.AddRange(targets);
         var (report, _) = await new Engine(options, config, _ => { }).Analyze(loaded);
-        return report;
+        return TestSolutions.RequireCleanLoad(report);
     }
 
     static async Task<EditRun> MarkTwiceThenDelete(string solutionPath, AnalyzerConfig config, params string[] targets)
@@ -70,6 +78,18 @@ public static class EditRuns
         var exit = Editor.Delete(report, _ => { });
         var errors = await TestSolutions.CompileErrors(solutionPath);
         return new EditRun { Directory = Path.GetDirectoryName(solutionPath), Report = report, DeleteExitCode = exit, CompileErrorsAfter = errors };
+    }
+
+    static async Task<EditRun> DeleteFromEncodedFiles()
+    {
+        var solutionPath = TestSolutions.FreshFixture();
+        var dir = Path.GetDirectoryName(solutionPath);
+        var controllers = Path.Combine(dir, TestConstants.FixtureControllersPath);
+        File.WriteAllBytes(controllers, Encoding.Latin1.GetBytes(TestConstants.AccentedComment).Concat(File.ReadAllBytes(controllers)).ToArray());
+        var program = Path.Combine(dir, TestConstants.FixtureProgramPath);
+        File.WriteAllBytes(program, Encoding.UTF8.GetPreamble().Concat(File.ReadAllBytes(program)).ToArray());
+        var run = await Delete(solutionPath, TestSolutions.FixtureConfig(), "Fixture.Web.WidgetsController");
+        return run;
     }
 
     static async Task<EditRun> Mark(string solutionPath, AnalyzerConfig config, params string[] targets)

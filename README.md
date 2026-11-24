@@ -37,7 +37,10 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
    `ConfigurationSection` subclasses) — plus anything matched by the config's `keep` patterns.
    A field or auto-property whose initializer DOES something (a call, or creating an external
    non-trivial object such as a `Timer`) stays while its type is in use, exactly as the same code
-   in a constructor would.
+   in a constructor would. An attribute pairing `typeof(T)` with a string that names one of T's
+   members hands that member to a framework, so the member counts as referenced — gRPC's generated
+   `[BindServiceMethod(typeof(Greeter), "BindService")]` is the only route to the binder, and through
+   it to every service override.
    Base classes and interfaces are recognized by name only when they come from OUTSIDE the
    solution (the real framework): a solution's own `Profile` or `Hub` class is ordinary code, and
    its subclasses are not roots.
@@ -113,12 +116,17 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   remaining package depends on: it may be listed only to pin a newer version, and removing it would
   silently downgrade, and a project reference to a project that still holds entry points frameworks
   find by scanning referenced assemblies — controllers, view components, profiles, modules,
-  migrations, MEF exports — since they stop shipping with it; test projects are exempt); `using` directives that no
+  migrations, MEF exports — since they stop shipping with it; test projects are exempt — and one
+  whose surviving type a view of the referencing project names, since views compile at runtime
+  against the project's references); `using` directives that no
   assembly can satisfy any more are removed (matched under their RESOLVED names, so `using Sub;`
   inside `namespace A` means `A.Sub`; a file banner above the first using is never deleted with
   it). A namespace is judged per referenced assembly: another project's types under the same name
   do not keep a `using` alive in a consumer that never references that project, while a file linked
-  into several projects provides its namespace through each of them. A project whose every declaration is deleted is removed from the
+  into several projects provides its namespace through each of them. A using in a generated file
+  (the global usings MSBuild writes from `<Using Include>` items) is never edited — it would come
+  back on the next build — so a warning names the project item to remove, and verification refuses
+  until it is gone. A project whose every declaration is deleted is removed from the
   solution and its csproj deleted (directory too, when nothing but code remained) — unless one of
   its files carries inactive `#if` regions or duplicate type names; then the project stays, with a
   warning, and only its code is deleted file by file. Transitive
@@ -128,7 +136,11 @@ that becomes orphaned as a result**, transitively, in one pass — while leaving
   only A uses C). When no kept reference can cover a need (the only path ran through a deleted
   project), a warning asks for a manual direct reference. "Already unused before" references
   stay, like symbols. Removing a symbol that SURVIVING code still references cannot compile:
-  such targets are flagged with a `STILL REFERENCED` warning naming the referrers.
+  such targets are flagged with a `STILL REFERENCED` warning naming the referrers. The same goes
+  for a target a surviving mapping USES — a `ConvertUsing<X>()` converter, or a `MapFrom(s =>
+  s.ComputeTotal())` source — since cutting the mapping compiles but fails, or silently maps
+  differently, at runtime. Removing a mapped type, or the destination member a `ForMember`
+  configures (`d => d.AuditNote`), still cuts the mapping or just that segment, as intended.
 
 ### Tests
 
@@ -136,7 +148,8 @@ Test projects never keep production code in use. A project is a test project onl
 references a test library (a direct test-framework package or assembly reference, `<IsTestProject>`,
 a test `ProjectTypeGuids` entry or the `MSTest.Sdk` SDK — parsed as XML from the csproj and the
 `Directory.Build.props` files it imports, so a commented-out package is not evidence) AND contains at least one actual test (`[Fact]`, `[Theory]`, `[Test]`, `[TestCase]`,
-`[TestMethod]`, or a `[TestFixture]`/`[TestClass]` class). The name never counts: "X.Tests" without
+`[TestMethod]`, `[DataTestMethod]`, or a `[TestFixture]`/`[TestClass]` class — or any attribute derived
+from one, such as `[SkippableFact]`). The name never counts: "X.Tests" without
 tests is production code, and a test-library project without any test (shared test helpers) is
 production code with a warning. A class with no test of its own is still a test class when it
 carries `[TestFixture]`/`[TestClass]` or inherits tests from a base fixture. When production code is
@@ -274,7 +287,9 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   are applied before any whole file is deleted. Edits preserve each file's
   encoding (BOMs, UTF-32 included; non-UTF-8 files are decoded with the same legacy code page the
   compiler uses — the system ANSI page, else Windows-1252 — when that round-trips their bytes,
-  and byte-preserving via Latin-1 otherwise) and every untouched
+  and byte-preserving via Latin-1 otherwise; where the analysis read such a file as UTF-8 with
+  replacement characters, as Roslyn does on Linux, the edit still applies when every byte maps to
+  one character, and otherwise `delete` asks for the file to be converted to UTF-8) and every untouched
   line's own line ending, never swallow a `#region`/`#if` directive whose counterpart survives,
   and never delete a file whole when it carries global usings, assembly attributes, or inactive
   `#if` regions (code the compiler cannot see). Deleting an enum member takes its separator comma;
@@ -288,8 +303,10 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   `<Compile>` entry that cannot be matched while its source file is planned for deletion aborts up
   front (a dangling entry would break the build). A project planned for removal is validated the
   same way: its csproj must be unchanged, and a C# file that appeared under it since the analysis
-  aborts the delete (removing the project would strand it). Only `dotnet sln remove` and the
-  removal of a whole project's files stay best-effort (exit code 3 on leftovers). A tracked
+  aborts the delete (removing the project would strand it). Deleted projects leave the solution
+  (`dotnet sln remove`) after every file edit; if that fails, the solution file and every edit are
+  restored. Only deleting a removed project's csproj and directory stays best-effort (exit code 3 on
+  leftovers, which no longer build). A tracked
   registration nested inside a dying one's arguments or chain is never deleted along with it: the
   dying statement is reported for manual removal instead.
   `delete` refuses to run while verification reports new compile
@@ -302,8 +319,9 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
   overload (`--allow-still-referenced` overrides; deliberately NOT waived by `--no-verify`, which
   only skips the in-memory rebuild), and while no production entry point was detected at all
   (every caller of a target would be deleted with it; `--allow-no-roots` overrides), and while a
-  still-used service would lose its only DI registration with a deleted implementation
-  (`--allow-unregistered-services` overrides, e.g. when a replacement is registered next). The
+  still-used service would lose its only DI registration with a deleted implementation — judged per
+  service: another surviving registration must register that same service, not merely mention the
+  type — (`--allow-unregistered-services` overrides, e.g. when a replacement is registered next). The
   verification honours each project's REAL warnings-as-errors settings (`TreatWarningsAsErrors`,
   `WarningsAsErrors` — the `nullable` group included — and `WarningsNotAsErrors`, read from the
   csproj and the `Directory.Build.props` files it imports), although the analysis itself neutralizes them to load the solution.
@@ -350,10 +368,11 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 - Packages declared centrally (`Directory.Packages.props`, `Directory.Build.props`) are not listed
   in the csprojs the tool edits, so they are never removed automatically (over-keep, never
   over-delete).
-- A field in a multi-variable declaration (`int a, b;`): when every sibling is orphaned too the
-  whole line is deleted; when a sibling is still in use the orphaned field is KEPT in place and a
-  "kept in place" warning is emitted (it becomes a pre-existing orphan for future runs). An
-  orphaned positional record property (declared by a parameter) is kept in place the same way.
+- A field in a multi-variable declaration (`int a, b = Old.Seed;`) lives as long as any sibling
+  does — its text, initializer included, stays in the file — and the whole line goes only when every
+  sibling dies. An orphaned positional record property (declared by a parameter) is kept in place
+  with a "kept in place" warning; anything such a kept declaration still references counts as
+  STILL REFERENCED, so `delete` refuses.
 - A csproj element sharing a line with anything else (a sibling element, the ItemGroup tags) is
   never edited — a warning asks for manual removal, since the edits are line-granular. A file
   declaring a type whose full name another project also declares is never deleted whole.
@@ -363,13 +382,16 @@ dotnet run --project src/DeadCodeCleaner -- find   --solution ... --find Admin  
 
 ## Tests
 
-`dotnet test tests/DeadCodeCleaner.Tests` runs the suite in about half a minute: one process loads
+`dotnet test tests/DeadCodeCleaner.Tests` runs the suite in under a minute: one process loads
 each solution once (MSBuild) and shares it between analyses, which run in parallel; stub framework
 assemblies are compiled in memory; delete results are checked by recompiling in memory. The fixture
 and every scenario under `tests/Scenarios/<name>/` (projects, plus `stubs/<Name>/` compiled to
 `stubs/out/<AssemblyName>.dll`) are copied to a temp directory first, so the originals never change.
-`EngineTests` assert on analysis reports, `EditorTests` on mark/delete results, `ProgramTests` on
-delete's refusals through the real entry point.
+Every analysis must load cleanly (no project failing to load or compile), or the test fails rather
+than asserting on a partial view. `EngineTests` assert on analysis reports, `EditorTests` on
+mark/delete results (encodings, a stale file aborting, a whole project leaving the solution),
+`ProgramTests` on delete's refusals and overrides through `Program.Run`, which takes its output
+writers as arguments so the tests run in parallel without touching the console.
 
 The older script below checks the same things through the CLI (about 20 minutes) and is kept for now.
 

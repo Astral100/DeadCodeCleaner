@@ -36,6 +36,13 @@ public sealed class StatementNode
     /// <summary>Node ids the statement's text references (service/implementation/mapped types, chain
     /// lambdas): the statement cannot compile without them, so it dies when any of them dies.</summary>
     public List<string> InvolvedNodes { get; } = new();
+    /// <summary>For a registration: the in-solution service types it registers (the implementation
+    /// itself for a self registration). Nested type arguments and lambda mentions are not services.</summary>
+    public List<string> ServiceNodes { get; } = new();
+    /// <summary>For a mapping: references it USES rather than configures (a ConvertUsing converter,
+    /// an Include target). Explicitly removing one while the mapping otherwise stands breaks it at
+    /// runtime, so it counts as still referenced.</summary>
+    public List<string> UsedRefs { get; } = new();
     /// <summary>Member-level chain segments (".ForMember(d => d.X, ...)"): each dies ALONE when its
     /// refs die while the statement survives, leaving the rest of the mapping standing.</summary>
     public List<StatementSegment> ChainSegments { get; } = new();
@@ -56,6 +63,9 @@ public sealed class StatementSegment
     public required string MethodName { get; init; }
     public required string Snippet { get; init; }
     public required List<string> Refs { get; init; }
+    /// <summary>The refs the segment USES (a MapFrom source, its own chained call), as opposed to the
+    /// member it configures (its first argument, d => d.Total).</summary>
+    public List<string> UsedRefs { get; init; } = new();
     /// <summary>See StatementNode.MarkerLineInsideToken, for this segment's Line.</summary>
     public required bool MarkerLineInsideToken { get; init; }
 }
@@ -401,6 +411,9 @@ public sealed class ScanRegistration
     /// <summary>Services named by type (As&lt;Base&gt;, AsClosedTypesOf(typeof(IHandler&lt;&gt;)), Named&lt;T&gt;):
     /// a matched class assignable to one is registered under it, whatever the mode.</summary>
     public List<INamedTypeSymbol> ServiceTypes { get; init; } = new();
+    /// <summary>True when every matched class is registered as itself (AsSelf, or Autofac's default
+    /// when no service is named).</summary>
+    public bool RegistersSelf { get; init; }
 }
 
 /// <summary>A solution opened with MSBuild, with the load failures its workspace reported. Disposing it

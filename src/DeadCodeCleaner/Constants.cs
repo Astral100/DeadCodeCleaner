@@ -303,7 +303,7 @@ public static class Constants
 
     public static readonly HashSet<string> TestAttributeNames = new(StringComparer.Ordinal)
     {
-        "Fact", "Theory", "Test", "TestMethod", "TestCase", "TestCaseSource", "SetUp", "TearDown",
+        "Fact", "Theory", "Test", "TestMethod", "DataTestMethod", "TestCase", "TestCaseSource", "SetUp", "TearDown",
         "OneTimeSetUp", "OneTimeTearDown", "TestInitialize", "TestCleanup", "ClassInitialize",
         "ClassCleanup", "AssemblyInitialize", "AssemblyCleanup",
     };

@@ -16,18 +16,20 @@ public static class Program
             Console.Error.WriteLine("error: no MSBuild / .NET SDK installation was found: " + e.Message);
             return 2;
         }
-        var exitCode = await Run(args);
+        var exitCode = await Run(args, Console.Out, Console.Error);
         return exitCode;
     }
 
-    static async Task<int> Run(string[] args)
+    /// <summary>The whole command line run, writing to the given streams instead of the console.
+    /// MSBuild must already be registered.</summary>
+    public static async Task<int> Run(string[] args, TextWriter output, TextWriter error)
     {
         CliOptions opts;
         try { opts = Parse(args); }
         catch (Exception e) when (e is ArgumentException or NotSupportedException)
         {
-            Console.Error.WriteLine("error: " + e.Message);
-            PrintUsage();
+            error.WriteLine("error: " + e.Message);
+            PrintUsage(output);
             return 2;
         }
 
@@ -47,12 +49,12 @@ public static class Program
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException)
             {
-                Console.Error.WriteLine($"error: could not read config {opts.ConfigPath}: {e.Message}");
+                error.WriteLine($"error: could not read config {opts.ConfigPath}: {e.Message}");
                 return 2;
             }
         }
 
-        Action<string> log = Console.WriteLine;
+        Action<string> log = output.WriteLine;
         var engine = new Engine(opts, config, log);
 
         try
@@ -70,15 +72,15 @@ public static class Program
                     .ToList();
                 foreach (var (fqn, symbol) in matches)
                 {
-                    Console.WriteLine($"{SymbolNames.Kind(symbol),-11} {fqn}");
+                    output.WriteLine($"{SymbolNames.Kind(symbol),-11} {fqn}");
                 }
-                Console.WriteLine($"({matches.Count} match(es))");
+                output.WriteLine($"({matches.Count} match(es))");
                 return 0;
             }
 
-            ReportWriter.WriteConsole(report, opts.Verbose);
+            ReportWriter.WriteConsole(report, opts.Verbose, output);
             var jsonPath = opts.JsonPath ?? Path.Combine(Environment.CurrentDirectory, Constants.DefaultReportFileName);
-            ReportWriter.WriteJson(report, jsonPath);
+            ReportWriter.WriteJson(report, jsonPath, output);
 
             switch (opts.Mode)
             {
@@ -88,51 +90,51 @@ public static class Program
                 case "delete":
                     if (report.ProjectsFailedToLoad > 0 && !opts.AllowCompileErrors)
                     {
-                        Console.Error.WriteLine($"error: {report.ProjectsFailedToLoad} project(s)/load failure(s) left parts of the solution INVISIBLE to the analysis (see the workspace warnings) — references in them cannot be seen and the cascade may over-delete; fix the load problems first, or pass --allow-compile-errors; nothing was deleted");
+                        error.WriteLine($"error: {report.ProjectsFailedToLoad} project(s)/load failure(s) left parts of the solution INVISIBLE to the analysis (see the workspace warnings) — references in them cannot be seen and the cascade may over-delete; fix the load problems first, or pass --allow-compile-errors; nothing was deleted");
                         return 1;
                     }
                     if (report.ProjectsWithCompileErrors > 0 && !opts.AllowCompileErrors)
                     {
-                        Console.Error.WriteLine($"error: {report.ProjectsWithCompileErrors} project(s) had compile errors during analysis — references in them are invisible and the cascade may over-delete; fix the build first, or pass --allow-compile-errors; nothing was deleted");
+                        error.WriteLine($"error: {report.ProjectsWithCompileErrors} project(s) had compile errors during analysis — references in them are invisible and the cascade may over-delete; fix the build first, or pass --allow-compile-errors; nothing was deleted");
                         return 1;
                     }
                     if (report.WebsiteProjects > 0 && !opts.AllowWebsiteProjects)
                     {
-                        Console.Error.WriteLine($"error: the solution contains {report.WebsiteProjects} ASP.NET Web Site project(s) — they are excluded from the analysis, so code they use in other projects looks unused and could be deleted; pass --allow-website-projects to delete anyway; nothing was deleted");
+                        error.WriteLine($"error: the solution contains {report.WebsiteProjects} ASP.NET Web Site project(s) — they are excluded from the analysis, so code they use in other projects looks unused and could be deleted; pass --allow-website-projects to delete anyway; nothing was deleted");
                         return 1;
                     }
                     if (report.Stats.ProductionRoots == 0 && !opts.AllowNoRoots)
                     {
-                        Console.Error.WriteLine("error: no production entry points were detected — nothing counts as in use, so every caller of a removal target would be deleted with it; declare roots via --config keep/roots, or pass --allow-no-roots; nothing was deleted");
+                        error.WriteLine("error: no production entry points were detected — nothing counts as in use, so every caller of a removal target would be deleted with it; declare roots via --config keep/roots, or pass --allow-no-roots; nothing was deleted");
                         return 1;
                     }
                     // Deliberately NOT tied to --no-verify: skipping the expensive rebuild for speed
                     // must never also waive this independent, already-computed refusal.
                     if (report.StillReferencedTargets > 0 && !opts.AllowStillReferenced)
                     {
-                        Console.Error.WriteLine($"error: {report.StillReferencedTargets} removal target(s) are still referenced by surviving code (see the STILL REFERENCED warnings) — deleting them breaks the callers, or silently rebinds them to another overload; fix the callers first (--allow-still-referenced overrides); nothing was deleted");
+                        error.WriteLine($"error: {report.StillReferencedTargets} removal target(s) are still referenced by surviving code (see the STILL REFERENCED warnings) — deleting them breaks the callers, or silently rebinds them to another overload; fix the callers first (--allow-still-referenced overrides); nothing was deleted");
                         return 1;
                     }
                     if (report.ServicesLeftUnregistered > 0 && !opts.AllowUnregisteredServices)
                     {
-                        Console.Error.WriteLine($"error: {report.ServicesLeftUnregistered} service(s) still in use would lose their only registration (see the SERVICE LEFT UNREGISTERED warnings) — the build passes but the container fails at runtime; register a replacement first, or pass --allow-unregistered-services; nothing was deleted");
+                        error.WriteLine($"error: {report.ServicesLeftUnregistered} service(s) still in use would lose their only registration (see the SERVICE LEFT UNREGISTERED warnings) — the build passes but the container fails at runtime; register a replacement first, or pass --allow-unregistered-services; nothing was deleted");
                         return 1;
                     }
                     var reviewTests = report.Symbols.Count(s => s.Review && s.Category == Constants.CategoryBrokenTest);
                     if (reviewTests > 0 && !opts.DeleteReviewTests)
                     {
-                        Console.Error.WriteLine($"error: {reviewTests} test(s) to be deleted also reference surviving code (see the [REVIEW] entries) — adjust or remove them first, or pass --delete-review-tests to delete them as-is; nothing was deleted");
+                        error.WriteLine($"error: {reviewTests} test(s) to be deleted also reference surviving code (see the [REVIEW] entries) — adjust or remove them first, or pass --delete-review-tests to delete them as-is; nothing was deleted");
                         return 1;
                     }
                     var reviewOrphans = report.Symbols.Count(s => s.Review && s.Category != Constants.CategoryBrokenTest);
                     if (reviewOrphans > 0 && !opts.DeleteReviewOrphans)
                     {
-                        Console.Error.WriteLine($"error: {reviewOrphans} pre-existing orphan(s) to be deleted may be created or called by a framework at runtime (see the [REVIEW] entries) — confirm they are really unused (add a keep pattern if not), or pass --delete-review-orphans to delete them as-is; nothing was deleted");
+                        error.WriteLine($"error: {reviewOrphans} pre-existing orphan(s) to be deleted may be created or called by a framework at runtime (see the [REVIEW] entries) — confirm they are really unused (add a keep pattern if not), or pass --delete-review-orphans to delete them as-is; nothing was deleted");
                         return 1;
                     }
                     if (report.VerificationErrors > 0)
                     {
-                        Console.Error.WriteLine($"error: verification found {report.VerificationErrors} new compile error(s) in the deletion plan — nothing was deleted (see the VERIFY warnings; --no-verify overrides)");
+                        error.WriteLine($"error: verification found {report.VerificationErrors} new compile error(s) in the deletion plan — nothing was deleted (see the VERIFY warnings; --no-verify overrides)");
                         return 1;
                     }
                     var deleteExit = Editor.Delete(report, log);
@@ -144,7 +146,7 @@ public static class Program
         catch (Exception e) when (e is InvalidOperationException or IOException or UnauthorizedAccessException
             or Microsoft.Build.Exceptions.InvalidProjectFileException)
         {
-            Console.Error.WriteLine("error: " + e.Message);
+            error.WriteLine("error: " + e.Message);
             return 1;
         }
     }
@@ -201,9 +203,9 @@ public static class Program
         return opts;
     }
 
-    static void PrintUsage()
+    static void PrintUsage(TextWriter output)
     {
-        Console.WriteLine("""
+        output.WriteLine("""
             Usage:
               DeadCodeCleaner analyze --solution <path.sln> --remove <FQN> [--remove <FQN>]... [options]
               DeadCodeCleaner mark    --solution <path.sln> --remove <FQN> ...   (insert '// todo: to be deleted' markers)

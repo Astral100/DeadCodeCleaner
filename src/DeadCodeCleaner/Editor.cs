@@ -25,7 +25,7 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(file, out var encoding);
-            if (Stale(lengths, hashes, file, text, out var why))
+            if (Stale(lengths, hashes, file, text, encoding, out var why))
             {
                 log($"  WARNING: {file} {why} — skipped");
                 continue;
@@ -75,7 +75,7 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(file, out var encoding);
-            if (Stale(lengths, hashes, file, text, out var why))
+            if (Stale(lengths, hashes, file, text, encoding, out var why))
             {
                 log($"  WARNING: {file} {why} — skipped");
                 continue;
@@ -132,7 +132,7 @@ public static class Editor
                 continue;
             }
             var text = ReadFileText(pd.CsprojPath, out var encoding);
-            if (Stale(lengths, hashes, CanonicalPath(pd.CsprojPath), text, out var pwhy))
+            if (Stale(lengths, hashes, CanonicalPath(pd.CsprojPath), text, encoding, out var pwhy))
             {
                 log($"  WARNING: {pd.CsprojPath} {pwhy} — skipped");
                 continue;
@@ -197,7 +197,7 @@ public static class Editor
                 return 1;
             }
             var text = ReadFileText(file, out var encoding);
-            if (Stale(lengths, hashes, file, text, out var why))
+            if (Stale(lengths, hashes, file, text, encoding, out var why))
             {
                 log($"error: {file} {why} — NOTHING was deleted");
                 return 1;
@@ -226,7 +226,7 @@ public static class Editor
                 return 1;
             }
             var text = ReadFileText(file, out var wenc);
-            if (Stale(lengths, hashes, file, text, out var why))
+            if (Stale(lengths, hashes, file, text, wenc, out var why))
             {
                 log($"error: {file} {why} — NOTHING was deleted");
                 return 1;
@@ -241,8 +241,8 @@ public static class Editor
             var cpath = CanonicalPath(pd.CsprojPath);
             if (File.Exists(cpath))
             {
-                var ptext = ReadFileText(cpath, out _);
-                if (Stale(lengths, hashes, cpath, ptext, out var pwhy))
+                var ptext = ReadFileText(cpath, out var penc);
+                if (Stale(lengths, hashes, cpath, ptext, penc, out var pwhy))
                 {
                     log($"error: {cpath} {pwhy} — NOTHING was deleted");
                     return 1;
@@ -298,7 +298,7 @@ public static class Editor
                 return 1;
             }
             var xtext = ReadFileText(xfile, out var xenc);
-            if (Stale(lengths, hashes, xfile, xtext, out var xwhy))
+            if (Stale(lengths, hashes, xfile, xtext, xenc, out var xwhy))
             {
                 log($"error: {xfile} {xwhy} — NOTHING was deleted");
                 return 1;
@@ -416,15 +416,45 @@ public static class Editor
         }
         foreach (var m in xmlMessages) { log(m); }
 
+        // A deleted project still listed in the solution no longer builds (its sources are gone): the
+        // solution entries go first, and a failure there rolls back the solution file and every edit.
+        if (report.DeletableProjects.Count > 0)
+        {
+            byte[] slnBytes;
+            try
+            {
+                slnBytes = File.ReadAllBytes(report.Solution);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                var toRestore = deletedWhole.Concat(written).ToList();
+                log($"error: could not read {report.Solution}: {e.Message} — restoring the {deletedWhole.Count} deleted file(s) and the {written.Count} edit(s)");
+                int restored = RestoreFiles(toRestore);
+                log($"  restored {restored}/{toRestore.Count}; the plan was rolled back");
+                return 1;
+            }
+            foreach (var pd in report.DeletableProjects)
+            {
+                if (RemoveProjectFromSolution(report.Solution, pd.CsprojPath, pd.Project, log)) { continue; }
+                var toRestore = deletedWhole.Concat(written).ToList();
+                log($"error: {pd.Project} could not be removed from the solution — restoring {report.Solution}, the {deletedWhole.Count} deleted file(s) and the {written.Count} edit(s)");
+                try
+                {
+                    File.WriteAllBytes(report.Solution, slnBytes);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    log($"  WARNING: could not restore {report.Solution}: {e.Message}");
+                }
+                int restored = RestoreFiles(toRestore);
+                log($"  restored {restored}/{toRestore.Count}; the plan was rolled back");
+                return 1;
+            }
+        }
+
         int deletedProjects = 0;
         foreach (var pd in report.DeletableProjects)
         {
-            if (!RemoveProjectFromSolution(report.Solution, pd.CsprojPath, pd.Project, log))
-            {
-                log($"  WARNING: {pd.Project} left on disk — remove it from the solution manually, then delete {pd.CsprojPath}");
-                manualSteps = true;
-                continue;
-            }
             if (File.Exists(pd.CsprojPath))
             {
                 try
@@ -695,7 +725,7 @@ public static class Editor
         try
         {
             var text = ReadFileText(file, out var encoding);
-            if (Stale(lengths, hashes, file, text, out var why))
+            if (Stale(lengths, hashes, file, text, encoding, out var why))
             {
                 log($"  WARNING: {file} {why} — skipped");
                 return 0;
@@ -905,15 +935,20 @@ public static class Editor
     }
 
     /// <summary>True when the on-disk text no longer matches what the analysis saw.</summary>
-    static bool Stale(Dictionary<string, int> lengths, Dictionary<string, string> hashes, string file, string text, out string why)
+    static bool Stale(Dictionary<string, int> lengths, Dictionary<string, string> hashes, string file, string text, Encoding encoding, out string why)
     {
         if (lengths.TryGetValue(file, out var expected) && expected != text.Length)
         {
             why = $"decodes to {text.Length} chars but the analysis saw {expected} (changed since the analysis, or encoding mismatch)";
             return true;
         }
-        if (hashes.TryGetValue(file, out var h) && h != TextHash(text))
+        if (hashes.TryGetValue(file, out var h) && h != TextHash(text) && !AnalyzedAsLenientUtf8(text, encoding, h))
         {
+            if (encoding.CodePage != Encoding.UTF8.CodePage)
+            {
+                why = "is not valid UTF-8 and the analysis decoded it differently — convert it to UTF-8 first";
+                return true;
+            }
             // U+FFFD means the on-disk bytes were not valid for the decoded encoding: the usual
             // culprit is a legacy single-byte file (CP1252), which Roslyn and this editor decode
             // differently — a conversion problem, not a concurrent edit.
@@ -926,7 +961,27 @@ public static class Editor
         return false;
     }
 
-    static readonly Dictionary<string, string> _canonicalCache = new(StringComparer.Ordinal);
+    /// <summary>A legacy single-byte file the analysis read as UTF-8 with replacement characters (what
+    /// Roslyn does where the system code page is UTF-8, as on Linux). When that reading maps every byte
+    /// to exactly one character, both texts share every position and differ only where the analysis
+    /// saw U+FFFD: the analyzed spans apply to the byte-preserving text unchanged.</summary>
+    static bool AnalyzedAsLenientUtf8(string text, Encoding encoding, string analyzedHash)
+    {
+        if (encoding.CodePage == Encoding.UTF8.CodePage || !encoding.IsSingleByte) { return false; }
+        byte[] bytes;
+        try
+        {
+            bytes = encoding.GetBytes(text);
+        }
+        catch (EncoderFallbackException)
+        {
+            return false;
+        }
+        var lenient = new UTF8Encoding(false, false).GetString(bytes);
+        return lenient.Length == text.Length && lenient.Length == bytes.Length && TextHash(lenient) == analyzedHash;
+    }
+
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _canonicalCache = new(StringComparer.Ordinal);
 
     /// <summary>Collapses case-variant spellings of one path to the single on-disk spelling. On a
     /// case-insensitive filesystem mounted under case-sensitive path rules (WSL /mnt), linked files

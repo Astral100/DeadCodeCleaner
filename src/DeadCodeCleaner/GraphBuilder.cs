@@ -544,10 +544,10 @@ public sealed class GraphBuilder
     {
         foreach (var type in AllSourceTypes(comp.Assembly.GlobalNamespace))
         {
-            if (type.GetAttributes().Any(a => Constants.TestClassAttributeNames.Contains(ShortAttributeName(a)))) { return true; }
+            if (type.GetAttributes().Any(a => AttributeIn(a, Constants.TestClassAttributeNames))) { return true; }
             foreach (var m in type.GetMembers())
             {
-                if (m is IMethodSymbol && m.GetAttributes().Any(a => Constants.TestMethodAttributeNames.Contains(ShortAttributeName(a)))) { return true; }
+                if (m is IMethodSymbol && m.GetAttributes().Any(a => AttributeIn(a, Constants.TestMethodAttributeNames))) { return true; }
             }
         }
         return false;
@@ -562,6 +562,17 @@ public sealed class GraphBuilder
     string ShortAttributeName(string an)
     {
         return an.EndsWith("Attribute", StringComparison.Ordinal) ? an[..^9] : an;
+    }
+
+    /// <summary>True when the attribute's class, or any class it derives from, has one of the short
+    /// names: test frameworks are extended by subclassing ([SkippableFact], [RetryFact], [StaFact]).</summary>
+    bool AttributeIn(AttributeData attr, HashSet<string> names)
+    {
+        for (var c = attr.AttributeClass; c != null; c = c.BaseType)
+        {
+            if (names.Contains(ShortAttributeName(c.Name))) { return true; }
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- Phase 1
@@ -961,7 +972,7 @@ public sealed class GraphBuilder
 
         // A test fixture with no attributed member of its own: an NUnit/MSTest fixture class, or a
         // concrete class INHERITING its tests from a base fixture (the runner executes them on it).
-        bool fixtureAttribute = type.GetAttributes().Any(a => Constants.TestClassAttributeNames.Contains(ShortAttributeName(a)));
+        bool fixtureAttribute = type.GetAttributes().Any(a => AttributeIn(a, Constants.TestClassAttributeNames));
         bool inheritsTests = type.TypeKind == TypeKind.Class && !type.IsAbstract && BaseChainHasTestMethod(type);
         if (fixtureAttribute || inheritsTests)
         {
@@ -981,7 +992,7 @@ public sealed class GraphBuilder
                 var an = attr.AttributeClass?.Name;
                 if (an == null) { continue; }
                 var shortName = ShortAttributeName(attr);
-                bool isTestAttr = Constants.TestAttributeNames.Contains(shortName);
+                bool isTestAttr = AttributeIn(attr, Constants.TestAttributeNames);
                 bool isProdAttr = Constants.ProdRootAttributeNames.Contains(shortName);
                 if (!isTestAttr && !isProdAttr) { continue; }
                 // Test-attributed members root the test world; others root production.
@@ -1028,7 +1039,7 @@ public sealed class GraphBuilder
         {
             foreach (var m in b.GetMembers())
             {
-                if (m is IMethodSymbol && m.GetAttributes().Any(a => Constants.TestMethodAttributeNames.Contains(ShortAttributeName(a)))) { return true; }
+                if (m is IMethodSymbol && m.GetAttributes().Any(a => AttributeIn(a, Constants.TestMethodAttributeNames))) { return true; }
             }
         }
         return false;
@@ -1217,6 +1228,15 @@ public sealed class GraphBuilder
             WalkMember(decl.Type, fId, model);
             foreach (var al in attrs) { WalkMember(al, fId, model); }
         }
+        // Siblings share one line of text: a dead one is kept in place while another lives, so its
+        // initializer still compiles there — everything it references must stay too.
+        if (ids.Count > 1)
+        {
+            foreach (var fId in ids)
+            {
+                _graph.AddRule(new object[] { fId }, ids.Where(o => o != fId).Cast<object>().ToList(), "declared in one field declaration");
+            }
+        }
     }
 
     /// <summary>An initializer runs with every construction (static: on first use of the type), so one
@@ -1383,6 +1403,9 @@ public sealed class GraphBuilder
                     // constructor, with no identifier naming it.
                     AddSymbolInfoEdges(sourceId, model.GetSymbolInfo(pbt));
                     break;
+                case AttributeSyntax at when at.ArgumentList != null:
+                    AddAttributeNamedMemberEdges(sourceId, at, model);
+                    break;
                 case CommonForEachStatementSyntax fe:
                 {
                     // CommonForEachStatementSyntax covers BOTH forms: "foreach (var x in y)" and the
@@ -1403,6 +1426,24 @@ public sealed class GraphBuilder
                     AddEdgeTo(sourceId, info.GetResultMethod);
                     break;
                 }
+            }
+        }
+    }
+
+    /// <summary>An attribute pairing typeof(T) with a string naming one of T's members hands that member
+    /// to a framework, which calls it by reflection: [BindServiceMethod(typeof(Greeter), "BindService")]
+    /// is gRPC's only route to the generated binder, and through it to every service override.</summary>
+    void AddAttributeNamedMemberEdges(string sourceId, AttributeSyntax at, SemanticModel model)
+    {
+        var types = at.ArgumentList.Arguments.Select(a => a.Expression).OfType<TypeOfExpressionSyntax>()
+            .Select(t => model.GetTypeInfo(t.Type).Type).OfType<INamedTypeSymbol>().ToList();
+        if (types.Count == 0) { return; }
+        foreach (var arg in at.ArgumentList.Arguments)
+        {
+            if (model.GetConstantValue(arg.Expression) is not { HasValue: true, Value: string name }) { continue; }
+            foreach (var t in types)
+            {
+                foreach (var m in t.GetMembers(name)) { AddEdgeTo(sourceId, m); }
             }
         }
     }
@@ -1832,6 +1873,7 @@ public sealed class GraphBuilder
             FilterExact = filterExact,
             Mode = mode,
             ServiceTypes = serviceTypes,
+            RegistersSelf = callNames.Overlaps(Constants.ScanSelfNames) || (mode == ScanMode.SelfOnly && serviceTypes.Count == 0),
         });
     }
 
@@ -2082,7 +2124,13 @@ public sealed class GraphBuilder
                 if (type.ContainingAssembly?.Name is not { } tasm || !asms.Contains(tasm)) { continue; }
                 if (scan.Filter != null && !scan.Filter(type)) { continue; }
                 if (NodeId(type) is not { } typeId) { continue; }
-                _graph.ScanMatchedTypes.TryAdd(typeId, scan.Site);
+                // Recorded only when the scan actually registers the class (as itself or under a
+                // service): a filter match the registration style then ignores registers nothing.
+                if (scan.Mode is ScanMode.KeepAll or ScanMode.Unknown || scan.RegistersSelf || scan.ServiceTypes.Any(svc => IsAssignableTo(type, svc))
+                    || (scan.Mode is ScanMode.AllInterfaces or ScanMode.MatchingInterface && type.AllInterfaces.Any(i => scan.Mode == ScanMode.AllInterfaces || IsDefaultInterfaceOf(i, type))))
+                {
+                    _graph.ScanMatchedTypes.TryAdd(typeId, scan.Site);
+                }
                 var ctorIds = type.InstanceConstructors.Select(NodeId).Where(id => id != null).Cast<object>().ToList();
                 // The container constructs a registered class itself: no source names its constructors.
                 if (ctorIds.Count > 0)
@@ -2427,6 +2475,16 @@ public sealed class GraphBuilder
             var mname = cma.Name.Identifier.Text;
             if (Constants.MemberLevelMapChainNames.Contains(mname))
             {
+                // The first argument names the member being configured; everything else is used.
+                var configured = new List<string>();
+                if (cInv.ArgumentList.Arguments.Count > 0)
+                {
+                    foreach (var idn in cInv.ArgumentList.Arguments[0].DescendantNodes())
+                    {
+                        if (idn is not (IdentifierNameSyntax or GenericNameSyntax)) { continue; }
+                        if (Normalize(model.GetSymbolInfo(idn).Symbol) is { } cid && !configured.Contains(cid)) { configured.Add(cid); }
+                    }
+                }
                 // Member-level configuration: when its member dies, only THIS segment goes and the
                 // rest of the mapping stands. The span starts at the '.', so the chain stays valid.
                 var segLines = cInv.GetLocation().GetLineSpan();
@@ -2443,6 +2501,7 @@ public sealed class GraphBuilder
                     MethodName = mname,
                     Snippet = segSnippet,
                     Refs = segRefs,
+                    UsedRefs = segRefs.Where(r => !configured.Contains(r)).ToList(),
                 });
             }
             else
@@ -2456,6 +2515,7 @@ public sealed class GraphBuilder
         }
         var stmt = NewStatement("AutoMapper.CreateMap", inv, sourceId, claimed, involved.Concat(structuralRefs).Concat(argNodes), segmentEnd: (InvocationExpressionSyntax)chainTop);
         stmt.ChainSegments.AddRange(segments);
+        stmt.UsedRefs.AddRange(structuralRefs.Where(r => !involved.Contains(r) && !argNodes.Contains(r)));
         var guards = new List<object> { sourceId };
         guards.AddRange(involved);
         _graph.AddRule(guards, new object[] { stmt }, "CreateMap in use iff both types in use");
@@ -2534,6 +2594,7 @@ public sealed class GraphBuilder
         foreach (var s in spansToSkip) { AddSkip(ref skip, s); }
 
         var stmt = NewStatement(Constants.StatementKindDiRegister, inv, sourceId, new[] { inv }, new[] { service, impl }.Concat(argNodes));
+        if (service != null) { stmt.ServiceNodes.Add(service); }
         // Nested type arguments inside the suppressed spans must stay alive while the statement does.
         var extraArgs = argNodes.Where(a => a != service && a != impl).Cast<object>().ToList();
         if (extraArgs.Count > 0)
@@ -2707,6 +2768,8 @@ public sealed class GraphBuilder
         // No segment: a chain segment of the outermost call would delete only the lifetime call,
         // not the registration, so a partially surviving anchor falls back to a manual warning.
         var stmt = NewStatement(Constants.StatementKindDiRegister, outermost, sourceId, claimed, textualRefs.Append(impl).Concat(argNodes), allowSegment: false);
+        stmt.ServiceNodes.AddRange(services.Distinct());
+        if (impl != null && (asSelf || services.Count == 0) && !stmt.ServiceNodes.Contains(impl)) { stmt.ServiceNodes.Add(impl); }
         // Nested type arguments inside the suppressed spans must stay alive while the statement does.
         var extraArgs = argNodes.Where(a => a != impl && !services.Contains(a)).Cast<object>().ToList();
         if (extraArgs.Count > 0)

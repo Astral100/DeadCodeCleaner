@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <Reference Include="AutoMapper"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/AutoMapper.dll</HintPath></Reference>
+    <Reference Include="Autofac"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/Autofac.dll</HintPath></Reference>
+    <Reference Include="Grpc.Core.Api"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/Grpc.Core.Api.dll</HintPath></Reference>
+    <Reference Include="Microsoft.Extensions.DependencyInjection.Abstractions"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/Microsoft.Extensions.DependencyInjection.Abstractions.dll</HintPath></Reference>
+    <!-- Generated global usings, written by a test into its own copy. -->
+    <Compile Include="obj/Gen/*.cs" />
+  </ItemGroup>
+</Project>

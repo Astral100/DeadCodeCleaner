@@ -96,6 +96,10 @@ public static class TestSolutions
     {
         using var loaded = await LoadFresh(solutionPath);
         var errors = new List<string>();
+        // A project that silently failed to load would make "no errors" vacuous.
+        var expectedProjects = File.ReadLines(solutionPath).Count(l => l.StartsWith("Project(", StringComparison.Ordinal) && l.Contains(".csproj", StringComparison.Ordinal));
+        var actualProjects = loaded.Solution.Projects.Count();
+        if (actualProjects != expectedProjects) { errors.Add($"{actualProjects} of {expectedProjects} projects loaded"); }
         foreach (var project in loaded.Solution.Projects)
         {
             var comp = await project.GetCompilationAsync();
@@ -107,6 +111,23 @@ public static class TestSolutions
             errors.AddRange(comp.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).Select(d => project.Name + ": " + d));
         }
         return errors;
+    }
+
+    /// <summary>Fails when the analysis could not see the whole solution: every assertion about what
+    /// is or is not deleted would otherwise hold for nothing.</summary>
+    public static DeletionReport RequireCleanLoad(DeletionReport report)
+    {
+        if (report.ProjectsFailedToLoad > 0 || report.ProjectsWithCompileErrors > 0)
+        {
+            throw new InvalidOperationException($"{report.Solution}: {report.ProjectsFailedToLoad} project(s) failed to load, {report.ProjectsWithCompileErrors} had compile errors");
+        }
+        return report;
+    }
+
+    /// <summary>True when the symbol is deleted, itself or with a containing type.</summary>
+    public static bool IsDeleted(DeletionReport report, string fqn)
+    {
+        return report.Symbols.Any(s => s.Fqn == fqn || fqn.StartsWith(s.Fqn + ".", StringComparison.Ordinal));
     }
 
     /// <summary>Content hashes of the sources, projects and solution under a directory.</summary>
@@ -156,20 +177,21 @@ public static class TestSolutions
     static string CopyFixture(string copyName)
     {
         var target = Path.Combine(RunRoot, "fixture-" + copyName);
-        CopyDirectory(Path.Combine(RepoRoot, TestConstants.TestsDirectoryName, TestConstants.FixtureDirectoryName), target, skipBuildOutput: false);
+        CopyDirectory(Path.Combine(RepoRoot, TestConstants.TestsDirectoryName, TestConstants.FixtureDirectoryName), target);
         return target;
     }
 
     static string CopyScenario(string name, string copyName)
     {
         var target = Path.Combine(RunRoot, name + "-" + copyName);
-        CopyDirectory(Path.Combine(RepoRoot, TestConstants.TestsDirectoryName, TestConstants.ScenariosDirectoryName, name), target, skipBuildOutput: true);
+        CopyDirectory(Path.Combine(RepoRoot, TestConstants.TestsDirectoryName, TestConstants.ScenariosDirectoryName, name), target);
         CompileStubs(target);
         WriteSolution(target);
         return target;
     }
 
-    static void CopyDirectory(string source, string target, bool skipBuildOutput)
+    /// <summary>Copies sources only: build output (bin, obj) holds absolute paths of the original location.</summary>
+    static void CopyDirectory(string source, string target)
     {
         Directory.CreateDirectory(target);
         foreach (var file in Directory.GetFiles(source))
@@ -179,9 +201,8 @@ public static class TestSolutions
         foreach (var dir in Directory.GetDirectories(source))
         {
             var name = Path.GetFileName(dir);
-            if (skipBuildOutput && TestConstants.SkippedCopyDirectories.Contains(name)) { continue; }
-            if (!skipBuildOutput && name == "bin") { continue; }
-            CopyDirectory(dir, Path.Combine(target, name), skipBuildOutput);
+            if (TestConstants.SkippedCopyDirectories.Contains(name)) { continue; }
+            CopyDirectory(dir, Path.Combine(target, name));
         }
     }
 
