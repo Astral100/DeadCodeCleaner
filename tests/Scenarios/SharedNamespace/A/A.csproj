@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../B/B.csproj" /><Compile Include="../Shared/Version.cs" Link="Version.cs" /></ItemGroup>
+</Project>

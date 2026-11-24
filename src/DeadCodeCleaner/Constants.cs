@@ -28,6 +28,9 @@ public static class Constants
     public const int ShownConfigMentions = 10;
     public const int ShownViewMentions = 10;
     public const int MaxScannedConfigFileBytes = 1_000_000;
+    /// <summary>How many nested constructions an initializer side-effect check follows before assuming
+    /// the construction acts.</summary>
+    public const int MaxConstructionFollowDepth = 8;
     public const int MinMentionNameLength = 3;
     public const int ShownMentionKeeps = 20;
     public const string IdentifierWordPattern = @"[A-Za-z_][A-Za-z0-9_]*";
@@ -46,7 +49,26 @@ public static class Constants
 
     public const string ReasonAutoMapperProfile = "AutoMapper profile";
     public const string ReasonAutofacModule = "Autofac module";
+    public const string ReasonController = "controller";
+    public const string ReasonEfMigration = "EF migration";
+    public const string ReasonFrameworkComponent = "framework component";
+    public const string ReasonFrameworkSubclass = "framework-discovered subclass";
+    public const string ReasonFrameworkImplementation = "framework-discovered implementation";
+    public const string ReasonMefExport = "MEF export";
+
+    /// <summary>Root kinds frameworks find by scanning REFERENCED assemblies at runtime (MVC application
+    /// parts, profile/module/migration discovery, MEF): a project reference to an assembly still holding
+    /// one is kept even when no surviving code uses it at compile time.</summary>
+    public static readonly HashSet<string> RuntimeDiscoveredRootReasons = new(StringComparer.Ordinal)
+    {
+        ReasonController, ReasonEfMigration, ReasonFrameworkComponent, ReasonFrameworkSubclass,
+        ReasonFrameworkImplementation, ReasonMefExport, ReasonAutoMapperProfile, ReasonAutofacModule,
+    };
     public const string CreateMapMethodName = "CreateMap";
+    public const string StatementKindDiRegister = "DI.Register";
+    /// <summary>Warning prefix for a still-used service whose only registration dies with a deleted
+    /// implementation; delete refuses while any exist.</summary>
+    public const string ServiceLeftUnregisteredPrefix = "SERVICE LEFT UNREGISTERED:";
     public const string AutoMapperProfileBaseName = "Profile";
     public const string AutofacModuleBaseName = "Module";
 
@@ -97,13 +119,13 @@ public static class Constants
     /// <summary>Scan vocabulary naming the scanned assembly by a type argument: FromAssemblyOf&lt;X&gt;().</summary>
     public static readonly HashSet<string> ScanAssemblyOfTypeNames = new(StringComparer.Ordinal)
     {
-        "FromAssemblyOf", "FromAssemblyContaining", "AssemblyContainingType", "AssemblyContaining",
+        "FromAssemblyOf", "FromAssemblyContaining", "AssemblyContainingType", "AssemblyContaining", "FromAssembliesOf",
     };
 
     /// <summary>Scan vocabulary meaning "the assembly whose code runs the scan".</summary>
     public static readonly HashSet<string> ScanCurrentAssemblyNames = new(StringComparer.Ordinal)
     {
-        "FromThisAssembly", "TheCallingAssembly", "GetExecutingAssembly", "GetCallingAssembly", "FromCallingAssembly",
+        "FromThisAssembly", "TheCallingAssembly", "GetExecutingAssembly", "FromExecutingAssembly",
     };
 
     /// <summary>Scan vocabulary naming assemblies the analysis cannot pin down: every solution
@@ -112,26 +134,93 @@ public static class Constants
     {
         "FromLoadedAssemblies", "FromApplicationDependencies", "FromAssembliesMatching", "FromAssemblyInThisApplication",
         "AssembliesFromApplicationBaseDirectory", "AssembliesFromPath", "FromAssemblyInDirectory", "FromAssemblies",
-        "FromAssembly", "AssemblyContainingTypes",
+        "FromAssembly", "AssemblyContainingTypes", "FromEntryAssembly", "FromAssemblyDependencies", "FromDependencyContext",
+        "GetCallingAssembly", "FromCallingAssembly", "GetEntryAssembly",
+    };
+
+    /// <summary>The unknown-assembly calls whose ARGUMENTS are the scanned assemblies themselves
+    /// (FromAssemblies(typeof(X).Assembly) stays precise); the others never are (FromAssemblyDependencies(a)
+    /// scans a's dependencies too).</summary>
+    public static readonly HashSet<string> ScanAssemblyListNames = new(StringComparer.Ordinal)
+    {
+        "FromAssemblies", "FromAssembly",
+    };
+
+    /// <summary>Class-selection calls of scanning libraries: with them, a statement registers types even
+    /// when its assembly source is not recognised.</summary>
+    public static readonly HashSet<string> ScanSelectionNames = new(StringComparer.Ordinal)
+    {
+        "AddClasses", "AddTypes", "BasedOn", "Pick", "IncludeNonPublicTypes", "InSameNamespaceAs", "SelectAllClasses",
+        "IncludeAllClasses",
     };
 
     /// <summary>Registration calls of a scan meaning "under every interface the class implements".</summary>
     public static readonly HashSet<string> ScanAllInterfacesNames = new(StringComparer.Ordinal)
     {
         "AsImplementedInterfaces", "WithServiceAllInterfaces", "BindAllInterfaces", "FromAllInterfaces", "AsAllInterfaces",
+        "AsSelfWithInterfaces", "AllInterfaces",
     };
 
-    /// <summary>Registration calls of a scan meaning "under the interface named I + class name".</summary>
+    /// <summary>Registration calls of a scan meaning "under the interface named like the class". Read as
+    /// the widest library rule (Windsor, Ninject's plural form): the class name CONTAINS the interface
+    /// name without its leading "I", ignoring case — a superset of the exact "I" + name conventions.</summary>
     public static readonly HashSet<string> ScanMatchingInterfaceNames = new(StringComparer.Ordinal)
     {
         "WithDefaultConventions", "FromMatchingInterface", "BindDefaultInterface", "BindDefaultInterfaces",
-        "WithServiceDefaultInterfaces", "AsMatchingInterface",
+        "WithServiceDefaultInterfaces", "AsMatchingInterface", "DefaultInterfaces",
     };
+
+    /// <summary>Registration calls of a scan naming the service TYPES (generic or typeof arguments):
+    /// As&lt;Base&gt;(), AsClosedTypesOf(typeof(IHandler&lt;&gt;)), Named&lt;IPlugin&gt;(...), Keyed&lt;T&gt;(...).</summary>
+    public static readonly HashSet<string> ScanServiceTypeNames = new(StringComparer.Ordinal)
+    {
+        "As", "AsClosedTypesOf", "AsClosedInterfacesOf", "Named", "Keyed",
+    };
+
+    /// <summary>Scan calls whose registration the analysis cannot follow (base-class services, custom
+    /// selection, start-up activation): every matched class is kept while the scanning member lives.</summary>
+    public static readonly HashSet<string> ScanKeepAllNames = new(StringComparer.Ordinal)
+    {
+        "WithServiceBase", "WithServiceFirstInterface", "WithServiceFromInterface", "WithServiceSelect", "WithService",
+        "WithServices", "BindBase", "BindAllBaseClasses", "BindWith", "BindSelection", "BindUsingRegex", "BindToSelection",
+        "AddAllTypesOf", "ConnectImplementationsToTypesClosing", "UsingAttributes", "UsingRegistrationStrategy", "AutoActivate",
+        "Configure", "ConfigureFor", "RegisterConcreteTypesAgainstTheFirstInterface", "SingleImplementationsOfInterface",
+        "Base", "FirstInterface", "FromInterface", "Select",
+    };
+
+    /// <summary>Autofac scan-chain calls that only NARROW the matched set (ignoring them only widens it)
+    /// or set a lifetime: anything else in the chain makes the registration unreadable (kept whole).</summary>
+    public static readonly HashSet<string> AutofacScanNarrowingNames = new(StringComparer.Ordinal)
+    {
+        "Where", "AssignableTo", "Except", "InNamespace", "InNamespaceOf", "PublicOnly",
+    };
+
+    /// <summary>Autofac registration-builder calls that make the container build the component at
+    /// start-up: the registration lives while its containing member does, whoever resolves it.</summary>
+    public static readonly HashSet<string> AutofacActivationNames = new(StringComparer.Ordinal)
+    {
+        "AutoActivate",
+    };
+
+    /// <summary>OWIN calls this method of the [assembly: OwinStartup(typeof(X))] class unless the
+    /// attribute names another.</summary>
+    public const string OwinDefaultStartMethod = "Configuration";
+    public const string OwinStartupAttributeName = "OwinStartup";
+
+    /// <summary>Generic-host / WebHost calls naming a startup class whose ConfigureServices/Configure
+    /// methods the framework calls by convention.</summary>
+    public static readonly HashSet<string> UseStartupMethodNames = new(StringComparer.Ordinal)
+    {
+        "UseStartup",
+    };
+
+    /// <summary>The C# compiler's warning group for every nullable-reference-type warning.</summary>
+    public const string NullableWarningGroup = "nullable";
 
     /// <summary>Registration calls of a scan meaning "as the class itself only".</summary>
     public static readonly HashSet<string> ScanSelfNames = new(StringComparer.Ordinal)
     {
-        "AsSelf", "WithServiceSelf", "BindToSelf",
+        "AsSelf", "WithServiceSelf", "BindToSelf", "Self",
     };
 
     /// <summary>Assemblies whose use does not AUTOMATICALLY block deleting an "empty" profile/module
@@ -194,6 +283,8 @@ public static class Constants
     /// LIBRARY that extends a test framework, not a test project, and must not match. Matched
     /// against the id part of parsed PackageReference/Reference Include values, never raw text.</summary>
     public const string TestPackageIdPattern = @"^(xunit(\.v3)?(\.core|\.runner\.[\w.]+|\.extensibility\.[\w.]+)?|nunit|nunit\.framework|nunit3testadapter|nunitlite|mstest(\.testframework|\.testadapter)?|microsoft\.net\.test\.sdk|microsoft\.visualstudio\.qualitytools\.unittestframework|microsoft\.visualstudio\.testplatform\.testframework(\.extensions)?)$";
+    /// <summary>The MSBuild SDK of MSTest projects: brings the test framework without a PackageReference.</summary>
+    public const string MsTestSdkName = "MSTest.Sdk";
     /// <summary>Legacy csproj ProjectTypeGuids entry marking an MSTest project.</summary>
     public const string TestProjectTypeGuid = "3AC096D0-A1C2-E12C-1390-A8335801FDAB";
 
@@ -241,14 +332,15 @@ public static class Constants
         "FunctionName", "Function", "Benchmark", "GlobalSetup", "GlobalCleanup", "ModuleInitializer",
     };
 
-    /// <summary>Global.asax event-method prefixes: ASP.NET calls these by name, whatever their accessibility.</summary>
-    public static readonly string[] HttpApplicationEventPrefixes = { "Application_", "Session_" };
+    /// <summary>Global.asax event methods are named "&lt;Module&gt;_&lt;Event&gt;" (Application_Start,
+    /// FormsAuthentication_OnAuthenticate): ASP.NET wires every such name, whatever its accessibility.</summary>
+    public const char HttpApplicationEventSeparator = '_';
 
     /// <summary>Assembly attributes naming a startup method by STRING next to its type (System.Web,
     /// WebActivatorEx): the type alone is not enough, the named method must be rooted too.</summary>
     public static readonly HashSet<string> StartMethodAttributeNames = new(StringComparer.Ordinal)
     {
-        "PreApplicationStartMethod", "PostApplicationStartMethod", "ApplicationShutdownMethod",
+        "PreApplicationStartMethod", "PostApplicationStartMethod", "ApplicationShutdownMethod", "OwinStartup",
     };
 
     /// <summary>Autofac registration-builder calls from integration packages (MVC/Web API): lifetimes

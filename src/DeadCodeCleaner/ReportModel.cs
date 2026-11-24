@@ -25,6 +25,9 @@ public sealed class DeletionReport
     /// <summary>Removal targets that surviving code still references (the STILL REFERENCED
     /// warnings): deleting them breaks or silently rebinds the callers.</summary>
     public int StillReferencedTargets { get; set; }
+    /// <summary>Still-used services whose only registration dies with a deleted implementation (the
+    /// SERVICE LEFT UNREGISTERED warnings): the build passes, the container fails at runtime.</summary>
+    public int ServicesLeftUnregistered { get; set; }
     /// <summary>Projects whose analysis compilation had errors — references in them are invisible.</summary>
     public int ProjectsWithCompileErrors { get; set; }
     /// <summary>Workspace load failures plus solution projects the analysis could not see at all

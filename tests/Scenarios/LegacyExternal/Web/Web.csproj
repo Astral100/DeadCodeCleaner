@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Web.Stubs"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/System.Web.Stubs.dll</HintPath></Reference>
+    <Reference Include="Autofac"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/Autofac.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

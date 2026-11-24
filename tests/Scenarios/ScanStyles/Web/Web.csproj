@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Web.Stubs"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/System.Web.Stubs.dll</HintPath></Reference>
+    <Reference Include="Autofac"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/Autofac.dll</HintPath></Reference>
+    <Reference Include="Scrutor"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/Scrutor.dll</HintPath></Reference>
+    <Reference Include="Microsoft.Owin.Stubs"><HintPath>$(MSBuildThisFileDirectory)../stubs/out/Microsoft.Owin.Stubs.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

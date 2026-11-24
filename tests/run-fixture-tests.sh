@@ -15,8 +15,10 @@ SCRATCH7=""
 SCRATCH8=""
 SCRATCH9=""
 SCRATCH10=""
+SCRATCH11=""
+SCRATCH12=""
 KEEPCFG=$(mktemp)
-trap 'rm -rf "$SCRATCH" "$SCRATCH2" "$SCRATCH3" "$SCRATCH4" "$SCRATCH5" "$SCRATCH6" "$SCRATCH7" "$SCRATCH8" "$SCRATCH9" "$SCRATCH10"; rm -f "$REPORT" "$KEEPCFG"' EXIT
+trap 'rm -rf "$SCRATCH" "$SCRATCH2" "$SCRATCH3" "$SCRATCH4" "$SCRATCH5" "$SCRATCH6" "$SCRATCH7" "$SCRATCH8" "$SCRATCH9" "$SCRATCH10" "$SCRATCH11" "$SCRATCH12"; rm -f "$REPORT" "$KEEPCFG"' EXIT
 FAIL=0
 
 check() { # check <description> <jq filter that must output true>
@@ -229,13 +231,23 @@ check "registrations reported dead although their service survives" \
     '[.statements[] | select(.snippet|contains("IWidgetService"))] | length == 2'
 check "deleted-but-in-use registration warnings emitted" \
     '[.warnings[]] | map(select(startswith("registration deleted although still in use"))) | length == 2'
+check "the still-used service left without any registration is reported" \
+    '(.servicesLeftUnregistered >= 1) and ([.warnings[]] | map(select(startswith("SERVICE LEFT UNREGISTERED:") and contains("Fixture.Domain.IWidgetService"))) | length >= 1)'
 
 SCRATCH2=$(mktemp -d)
 cp -r tests/Fixture "$SCRATCH2/Fixture"
 dotnet restore "$SCRATCH2/Fixture/Fixture.sln" > /dev/null 2>&1
 dotnet run --project src/DeadCodeCleaner -- delete --config tests/Fixture/dcc-config.json --solution "$SCRATCH2/Fixture/Fixture.sln" \
     --remove Fixture.Domain.WidgetService --remove Fixture.Domain.WidgetKind.Fancy \
-    --delete-review-tests --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED (verification rejected the plan?)"; exit 1; }
+    --delete-review-tests --json "$REPORT" > /dev/null 2> "$SCRATCH2/del.err"
+if [ $? -eq 1 ] && grep -q "lose their only registration" "$SCRATCH2/del.err" && grep -q "class WidgetService" -r "$SCRATCH2/Fixture/Fixture.Domain"; then
+    pass "delete refuses while a still-used service would lose its only registration (nothing deleted)"
+else
+    failx "delete refuses while a still-used service would lose its only registration (nothing deleted)"
+fi
+dotnet run --project src/DeadCodeCleaner -- delete --config tests/Fixture/dcc-config.json --solution "$SCRATCH2/Fixture/Fixture.sln" \
+    --remove Fixture.Domain.WidgetService --remove Fixture.Domain.WidgetKind.Fancy \
+    --delete-review-tests --allow-unregistered-services --json "$REPORT" > /dev/null 2>&1 || { echo "DELETE FAILED (verification rejected the plan?)"; exit 1; }
 if ! grep -q "    Fancy" "$SCRATCH2/Fixture/Fixture.Domain/Shapes.cs"; then
     pass "enum member deleted"; else failx "enum member deleted"; fi
 check "enum renumber warning emitted" \
@@ -466,13 +478,13 @@ check "kept test NOT deleted" \
 check "kept test referencing deleted code reported as STILL REFERENCED" \
     '[.warnings[]] | map(select(startswith("STILL REFERENCED: config-kept Fixture.Tests.WidgetsControllerTests"))) | length >= 1'
 check "delete would refuse (counted as still referenced)" '.stillReferencedTargets >= 1'
-# Exact type name (no '*'): the class is kept but its broken test is not — this used to loop forever.
+# Exact type name (no '*'): the class is kept WHOLE, its broken test included — this used to loop forever.
 printf '{ "inSolutionRegistrations": true, "keep": ["Fixture.Tests.WidgetsControllerTests"] }\n' > "$KEEPCFG"
 timeout 600 dotnet run --project src/DeadCodeCleaner -- analyze --config "$KEEPCFG" \
     --solution tests/Fixture/Fixture.sln \
     --remove Fixture.Web.WidgetsController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED (or hung)"; exit 1; }
-check "exact-name keep: class kept, its broken test deleted" \
-    '[.symbols[].fqn] | map(select(startswith("Fixture.Tests.WidgetsControllerTests"))) == ["Fixture.Tests.WidgetsControllerTests.GetWidget_when_called_then_widget_is_returned"]'
+check "exact-name keep: class kept whole, its broken test reported STILL REFERENCED" \
+    '([.symbols[].fqn] | map(select(startswith("Fixture.Tests.WidgetsControllerTests"))) | length == 0) and ([.warnings[]] | map(select(startswith("STILL REFERENCED: config-kept Fixture.Tests.WidgetsControllerTests"))) | length >= 1)'
 
 echo "== Case 14: empty-profile side effects, chained in-solution extension, marker inside a string (scratch)"
 SCRATCH7=$(mktemp -d)
@@ -839,7 +851,7 @@ cp -r "$SCRATCH9/Web" "$SCRATCH9/WebDel" && rm -rf "$SCRATCH9/WebDel/obj" "$SCRA
 (cd "$SCRATCH9" && dotnet new sln -n Del --force > /dev/null 2>&1 && dotnet sln Del.sln add WebDel/Web.csproj > /dev/null 2>&1)
 dotnet run --project src/DeadCodeCleaner -- delete \
     --solution "$SCRATCH9/Del.sln" --remove Web.JobsController --json "$REPORT" > /dev/null 2> "$SCRATCH9/del.err"
-if [ $? -eq 1 ] && grep -q "may be created by a framework" "$SCRATCH9/del.err" && [ -f "$SCRATCH9/WebDel/App.cs" ] && grep -q "class OrderPlacedHandler" "$SCRATCH9/WebDel/App.cs"; then
+if [ $? -eq 1 ] && grep -q "may be created or called by a framework" "$SCRATCH9/del.err" && [ -f "$SCRATCH9/WebDel/App.cs" ] && grep -q "class OrderPlacedHandler" "$SCRATCH9/WebDel/App.cs"; then
     pass "delete refuses while a framework-built orphan awaits review (nothing deleted)"
 else
     failx "delete refuses while a framework-built orphan awaits review (nothing deleted)"
@@ -896,6 +908,259 @@ else
     failx "delete refuses with a Web Site project in the solution (nothing deleted)"
 fi
 check "the Web Site project is reported" '.websiteProjects == 1'
+
+echo "== Case 18: scan styles, convention entry points and construction side effects with EXTERNAL stubs (scratch)"
+SCRATCH11=$(mktemp -d)
+mkdir -p "$SCRATCH11/stubs/SysWeb" "$SCRATCH11/stubs/Autofac" "$SCRATCH11/stubs/Scrutor" "$SCRATCH11/stubs/Hosting" "$SCRATCH11/Web"
+cat > "$SCRATCH11/stubs/SysWeb/SysWeb.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>System.Web.Stubs</AssemblyName></PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH11/stubs/SysWeb/Stubs.cs" <<'CSFILE'
+namespace System.Web { public class HttpApplication { } }
+namespace System.Web.Mvc { public abstract class Controller { } public abstract class ActionFilterAttribute : System.Attribute { } }
+CSFILE
+cat > "$SCRATCH11/stubs/Autofac/Autofac.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>Autofac</AssemblyName></PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH11/stubs/Autofac/Stubs.cs" <<'CSFILE'
+using System;
+namespace Autofac
+{
+    public class Reg<T>
+    {
+        public Reg<T> As<TS>() { return this; }
+        public Reg<T> Named<TS>(Func<Type, string> name) { return this; }
+        public Reg<T> AsClosedTypesOf(Type open) { return this; }
+        public Reg<T> Where(Func<Type, bool> predicate) { return this; }
+        public Reg<T> AsImplementedInterfaces() { return this; }
+        public Reg<T> AsSelf() { return this; }
+        public Reg<T> AutoActivate() { return this; }
+    }
+    public class ContainerBuilder
+    {
+        public Reg<T> RegisterType<T>() { return new Reg<T>(); }
+        public Reg<object> RegisterAssemblyTypes(params System.Reflection.Assembly[] assemblies) { return new Reg<object>(); }
+    }
+}
+CSFILE
+cat > "$SCRATCH11/stubs/Scrutor/Scrutor.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>Scrutor</AssemblyName></PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH11/stubs/Scrutor/Stubs.cs" <<'CSFILE'
+using System;
+namespace Scrutor
+{
+    public class Selector
+    {
+        public Selector FromAssembliesOf(params Type[] types) { return this; }
+        public Selector AddClasses() { return this; }
+        public Selector AsMatchingInterface() { return this; }
+    }
+    public class Services { }
+    public static class ScanExtensions { public static Services Scan(this Services s, Action<Selector> a) { return s; } }
+}
+CSFILE
+cat > "$SCRATCH11/stubs/Hosting/Hosting.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>Microsoft.Owin.Stubs</AssemblyName></PropertyGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH11/stubs/Hosting/Stubs.cs" <<'CSFILE'
+using System;
+namespace Microsoft.Owin { [AttributeUsage(AttributeTargets.Assembly)] public sealed class OwinStartupAttribute : Attribute { public OwinStartupAttribute(Type t) { } } }
+namespace Hosting { public class HostBuilder { public HostBuilder UseStartup<T>() { return this; } } }
+CSFILE
+for s in SysWeb Autofac Scrutor Hosting; do
+    dotnet build "$SCRATCH11/stubs/$s/$s.csproj" -o "$SCRATCH11/stubs/out" > /dev/null 2>&1 || { echo "STUB BUILD FAILED ($s)"; exit 1; }
+done
+cat > "$SCRATCH11/Web/Web.csproj" <<CSPROJ
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Web.Stubs"><HintPath>$SCRATCH11/stubs/out/System.Web.Stubs.dll</HintPath></Reference>
+    <Reference Include="Autofac"><HintPath>$SCRATCH11/stubs/out/Autofac.dll</HintPath></Reference>
+    <Reference Include="Scrutor"><HintPath>$SCRATCH11/stubs/out/Scrutor.dll</HintPath></Reference>
+    <Reference Include="Microsoft.Owin.Stubs"><HintPath>$SCRATCH11/stubs/out/Microsoft.Owin.Stubs.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH11/Web/App.cs" <<'CSFILE'
+[assembly: Microsoft.Owin.OwinStartup(typeof(Web.AuthConfig))]
+namespace Web
+{
+    // Every helper is used by Admin AND by exactly one place only a framework reaches: removing
+    // Admin must delete none of them.
+    public class Global : System.Web.HttpApplication
+    {
+        public static Heartbeat Beat = new Heartbeat();
+        public static UserRepo Users = new UserRepo();
+        public static AuditFilter Filter = new AuditFilter();
+        protected void Application_Start() { ScanConfig.Register(); new Hosting.HostBuilder().UseStartup<ApiStartup>(); }
+        protected void FormsAuthentication_OnAuthenticate(object s, System.EventArgs e) { HelperA.Go(); }
+    }
+    public class AuthConfig { public void Configuration(object app) { HelperO.Go(); } }
+    public class ApiStartup { public void ConfigureServices(object services) { HelperU.Go(); } }
+    public interface ICommandHandler<T> { void Handle(T c); }
+    public class CreateOrder { }
+    public class CreateOrderHandler : ICommandHandler<CreateOrder> { public void Handle(CreateOrder c) { HelperC.Go(); } }
+    public interface IPlugin { }
+    public class ZipPlugin : IPlugin { public ZipPlugin() { HelperN.Go(); } }
+    public abstract class HandlerBase { }
+    public class EmailHandler : HandlerBase { public EmailHandler() { HelperB.Go(); } }
+    public interface IFooService { }
+    public class FooService : IFooService { public FooService() { HelperI.Go(); } }
+    public interface IOrderRepository { }
+    public class SqlOrderRepository : IOrderRepository { public SqlOrderRepository() { HelperM.Go(); } }
+    public class CacheWarmer { public CacheWarmer() { HelperW.Go(); } }
+    public class ReportBuilder { public ReportBuilder(IFooService f) { HelperS.Go(); } public ReportBuilder() { } }
+    public static class ScanConfig
+    {
+        public static void Register()
+        {
+            var b = new Autofac.ContainerBuilder();
+            b.RegisterAssemblyTypes(typeof(ScanConfig).Assembly).AsClosedTypesOf(typeof(ICommandHandler<>));
+            b.RegisterAssemblyTypes(typeof(ScanConfig).Assembly).Where(t => t.Name.EndsWith("Plugin")).Named<IPlugin>(t => t.Name);
+            b.RegisterAssemblyTypes(typeof(ScanConfig).Assembly).Where(t => t.IsSubclassOf(typeof(HandlerBase))).As<HandlerBase>();
+            b.RegisterAssemblyTypes(typeof(ScanConfig).Assembly).Where(t => t.Name.EndsWith("service", true, System.Globalization.CultureInfo.InvariantCulture)).AsImplementedInterfaces();
+            b.RegisterAssemblyTypes(typeof(ScanConfig).Assembly).Where(t => t.Namespace != null && t.Namespace.StartsWith("Web") && t.Name.StartsWith("Report")).AsSelf();
+            b.RegisterType<CacheWarmer>().AsSelf().AutoActivate();
+            b.RegisterType<NightlyTask>().AsSelf().AutoActivate();
+            new Scrutor.Services().Scan(s => s.FromAssembliesOf(typeof(ScanConfig)).AddClasses().AsMatchingInterface());
+        }
+    }
+    // A timer started by a SOLUTION class's constructor, created in a field initializer.
+    public class Poller { private readonly System.Threading.Timer _t; public Poller(int ms) { _t = new System.Threading.Timer(_ => { }, null, ms, ms); } public void Stop() { _t.Dispose(); } }
+    public class Heartbeat { private readonly Poller _poller = new Poller(1000); public void Stop() { _poller.Stop(); } }
+    // UserRepo has no constructor: it implicitly calls the base constructor with its default argument.
+    public class RepoBase { public string Conn; public RepoBase(string conn = "db") { Conn = conn; HelperR.Go(); } }
+    public class UserRepo : RepoBase { }
+    // Built by the container, never by the solution: a method nothing calls may be a convention the
+    // tool does not know — held for review, not deleted.
+    public class NightlyTask { public void Execute() { HelperX.Go(); } }
+    // Created by the solution's own code: its dead method is deleted as usual.
+    public class AuditFilter : System.Web.Mvc.ActionFilterAttribute { public void OldLog() { HelperY.Go(); } }
+    // Kept by exact name in the config: reached by reflection, so its members stay too.
+    public class ExportPlugin { public void Run() { HelperK.Go(); } }
+    public class HomeController : System.Web.Mvc.Controller
+    {
+        public HomeController(ICommandHandler<CreateOrder> h, IPlugin p, HandlerBase hb, IFooService f, IOrderRepository r, ReportBuilder rb) { h.Handle(new CreateOrder()); }
+        public void Admin()
+        {
+            HelperA.Go(); HelperO.Go(); HelperU.Go(); HelperC.Go(); HelperN.Go(); HelperB.Go(); HelperI.Go(); HelperM.Go(); HelperW.Go();
+            HelperS.Go(); HelperR.Go(); HelperK.Go(); HelperX.Go(); HelperY.Go(); Global.Beat.Stop(); _ = new RepoBase("x"); new ExportPlugin().Run(); _ = new ReportBuilder();
+        }
+    }
+    public static class HelperA { public static void Go() { } }
+    public static class HelperO { public static void Go() { } }
+    public static class HelperU { public static void Go() { } }
+    public static class HelperC { public static void Go() { } }
+    public static class HelperN { public static void Go() { } }
+    public static class HelperB { public static void Go() { } }
+    public static class HelperI { public static void Go() { } }
+    public static class HelperM { public static void Go() { } }
+    public static class HelperW { public static void Go() { } }
+    public static class HelperS { public static void Go() { } }
+    public static class HelperR { public static void Go() { } }
+    public static class HelperK { public static void Go() { } }
+    public static class HelperX { public static void Go() { } }
+    public static class HelperY { public static void Go() { } }
+}
+// A class outside any namespace: the scan filter reading t.Namespace must not crash on it.
+public class GlobalNamespaceThing { }
+CSFILE
+printf '{ "keep": ["Web.ExportPlugin"] }\n' > "$SCRATCH11/keep.json"
+(cd "$SCRATCH11" && dotnet new sln -n Scratch --force > /dev/null 2>&1 && dotnet sln Scratch.sln add Web/Web.csproj > /dev/null 2>&1)
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH11/Scratch.sln" --config "$SCRATCH11/keep.json" \
+    --remove Web.HomeController.Admin --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "scan styles, Global.asax module events, OwinStartup, UseStartup, AutoActivate, base ctor defaults, initializer ctors and kept-type members keep their code" \
+    '[.symbols[].fqn] | sort == ["Web.AuditFilter.OldLog", "Web.Heartbeat.Stop", "Web.HelperX", "Web.HelperY", "Web.HomeController.Admin", "Web.NightlyTask.Execute", "Web.Poller.Stop"]'
+check "no registration statement deleted" '.statements | length == 0'
+check "a dead method of a container-built class is held for review" \
+    '[.symbols[] | select(.fqn=="Web.NightlyTask.Execute") | (.category == "broken-orphan" and .review)] == [true]'
+check "a dead method of a class the code creates with new is deleted without review" \
+    '[.symbols[] | select(.fqn=="Web.AuditFilter.OldLog") | (.category == "broken-orphan" and (.review | not))] == [true]'
+
+echo "== Case 19: project references, linked files, nullable warnings-as-errors and props-declared tests (scratch)"
+SCRATCH12=$(mktemp -d)
+mkdir -p "$SCRATCH12/stubs/Xunit" "$SCRATCH12/App" "$SCRATCH12/Lib" "$SCRATCH12/LibA" "$SCRATCH12/LibB" "$SCRATCH12/Cons" "$SCRATCH12/Shared" "$SCRATCH12/tests/Tst"
+printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>xunit.core</AssemblyName></PropertyGroup>\n</Project>\n' > "$SCRATCH12/stubs/Xunit/Xunit.csproj"
+printf 'namespace Xunit { public sealed class FactAttribute : System.Attribute { } }\n' > "$SCRATCH12/stubs/Xunit/Stubs.cs"
+dotnet build "$SCRATCH12/stubs/Xunit/Xunit.csproj" -o "$SCRATCH12/stubs/out" > /dev/null 2>&1 || { echo "STUB BUILD FAILED"; exit 1; }
+# App references Lib; its only compile-time use of Lib dies, but Lib still holds a controller.
+cat > "$SCRATCH12/App/App.csproj" <<'CSPROJ'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net9.0</TargetFramework><OutputType>Exe</OutputType><Nullable>enable</Nullable><WarningsAsErrors>nullable</WarningsAsErrors></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../Lib/Lib.csproj" /></ItemGroup>
+</Project>
+CSPROJ
+cat > "$SCRATCH12/App/App.cs" <<'CSFILE'
+namespace App
+{
+    public static class Program { public static void Main() { System.Console.WriteLine(new HomeController().Index(null!)); } }
+    public class Svc
+    {
+        private readonly string _name;
+        public Svc(string n) { _name = n; }
+        public string Name() { return _name; }
+    }
+    public class HomeController
+    {
+        public int Index(Svc s) { return s.Name().Length; }
+        // Losing the only constructor leaves _name unassigned: CS8618, an error under WarningsAsErrors=nullable.
+        public int Old() { return new Svc("x").Name().Length; }
+    }
+    public class FeatureController { public int Run() { return Lib.LibUtil.Do(); } }
+    public static class Calc { public static int Net(int g) { return g - 1; } }
+}
+CSFILE
+printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>\n</Project>\n' > "$SCRATCH12/Lib/Lib.csproj"
+printf 'namespace Lib\n{\n    public static class LibUtil { public static int Do() { return 1; } }\n    public class LibAdminController { public int Index() { return 2; } }\n}\n' > "$SCRATCH12/Lib/Lib.cs"
+# One file linked into LibA and LibB; Cons references only LibB and needs its using.
+for p in LibA LibB; do
+    printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>\n  <ItemGroup><Compile Include="../Shared/Linked.cs" Link="Linked.cs" /></ItemGroup>\n</Project>\n' > "$SCRATCH12/$p/$p.csproj"
+done
+printf 'namespace LinkedNs { public static class SharedThing { public static int V() { return 1; } } }\n' > "$SCRATCH12/Shared/Linked.cs"
+printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>\n  <ItemGroup><ProjectReference Include="../LibB/LibB.csproj" /></ItemGroup>\n</Project>\n' > "$SCRATCH12/Cons/Cons.csproj"
+cat > "$SCRATCH12/Cons/Cons.cs" <<'CSFILE'
+using LinkedNs;
+namespace Cons
+{
+    public class UseController { public int Go() { return SharedThing.V(); } }
+    public class OldController { public int Go() { return 2; } }
+}
+CSFILE
+# The test library comes from tests/Directory.Build.props, not from the test project itself.
+cat > "$SCRATCH12/tests/Directory.Build.props" <<PROPS
+<Project>
+  <ItemGroup><Reference Include="xunit.core"><HintPath>$SCRATCH12/stubs/out/xunit.core.dll</HintPath></Reference></ItemGroup>
+</Project>
+PROPS
+printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>\n  <ItemGroup><ProjectReference Include="../../App/App.csproj" /></ItemGroup>\n</Project>\n' > "$SCRATCH12/tests/Tst/Tst.csproj"
+printf 'namespace Tst\n{\n    public class FeatureTests { [Xunit.Fact] public void Both() { new App.FeatureController().Run(); _ = new App.HomeController(); } }\n}\n' > "$SCRATCH12/tests/Tst/Tests.cs"
+(cd "$SCRATCH12" && dotnet new sln -n Scratch --force > /dev/null 2>&1 \
+    && dotnet sln Scratch.sln add App/App.csproj Lib/Lib.csproj LibA/LibA.csproj LibB/LibB.csproj Cons/Cons.csproj tests/Tst/Tst.csproj > /dev/null 2>&1)
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH12/Scratch.sln" \
+    --remove App.FeatureController --remove Cons.OldController --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "Lib's helper dies with the removed controller" '[.symbols[].fqn] | index("Lib.LibUtil") != null'
+check "the reference to a project still holding entry points is kept, with a warning" \
+    '(.projectRefRemovals | length == 0) and ([.warnings[]] | map(select(contains("ProjectReference Lib") and contains("entry points"))) | length == 1)'
+check "a using of a linked file's namespace stays for the project that only references the second copy" \
+    '[.usingRemovals[] | select(.namespace=="LinkedNs")] | length == 0'
+check "a test project whose test library comes from Directory.Build.props is a test project" \
+    '[.symbols[] | select(.fqn=="Tst.FeatureTests") | (.category == "broken-test" and .review)] == [true]'
+dotnet run --project src/DeadCodeCleaner -- analyze \
+    --solution "$SCRATCH12/Scratch.sln" \
+    --remove App.HomeController.Old --json "$REPORT" > /dev/null 2>&1 || { echo "ANALYZE FAILED"; exit 1; }
+check "WarningsAsErrors=nullable: the new CS8618 is caught by verification" \
+    '[.warnings[]] | map(select(startswith("VERIFY") and contains("CS8618"))) | length >= 1'
 
 if [ "$FAIL" = 1 ]; then echo "RESULT: FAILURES PRESENT"; exit 1; fi
 echo "RESULT: all checks passed"

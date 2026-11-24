@@ -113,6 +113,11 @@ public static class Program
                         Console.Error.WriteLine($"error: {report.StillReferencedTargets} removal target(s) are still referenced by surviving code (see the STILL REFERENCED warnings) — deleting them breaks the callers, or silently rebinds them to another overload; fix the callers first (--allow-still-referenced overrides); nothing was deleted");
                         return 1;
                     }
+                    if (report.ServicesLeftUnregistered > 0 && !opts.AllowUnregisteredServices)
+                    {
+                        Console.Error.WriteLine($"error: {report.ServicesLeftUnregistered} service(s) still in use would lose their only registration (see the SERVICE LEFT UNREGISTERED warnings) — the build passes but the container fails at runtime; register a replacement first, or pass --allow-unregistered-services; nothing was deleted");
+                        return 1;
+                    }
                     var reviewTests = report.Symbols.Count(s => s.Review && s.Category == Constants.CategoryBrokenTest);
                     if (reviewTests > 0 && !opts.DeleteReviewTests)
                     {
@@ -122,7 +127,7 @@ public static class Program
                     var reviewOrphans = report.Symbols.Count(s => s.Review && s.Category != Constants.CategoryBrokenTest);
                     if (reviewOrphans > 0 && !opts.DeleteReviewOrphans)
                     {
-                        Console.Error.WriteLine($"error: {reviewOrphans} pre-existing orphan(s) to be deleted may be created by a framework at runtime (see the [REVIEW] entries) — confirm they are really unused (add a keep pattern if not), or pass --delete-review-orphans to delete them as-is; nothing was deleted");
+                        Console.Error.WriteLine($"error: {reviewOrphans} pre-existing orphan(s) to be deleted may be created or called by a framework at runtime (see the [REVIEW] entries) — confirm they are really unused (add a keep pattern if not), or pass --delete-review-orphans to delete them as-is; nothing was deleted");
                         return 1;
                     }
                     if (report.VerificationErrors > 0)
@@ -174,6 +179,7 @@ public static class Program
                 case "--strict-members": opts.StrictMembers = true; break;
                 case "--no-verify": opts.NoVerify = true; break;
                 case "--allow-still-referenced": opts.AllowStillReferenced = true; break;
+                case "--allow-unregistered-services": opts.AllowUnregisteredServices = true; break;
                 case "--allow-compile-errors": opts.AllowCompileErrors = true; break;
                 case "--delete-review-tests": opts.DeleteReviewTests = true; break;
                 case "--allow-no-roots": opts.AllowNoRoots = true; break;
@@ -210,6 +216,7 @@ public static class Program
               --strict-members        do not auto-keep public properties / enum members of in-use types
               --no-verify             skip the in-memory rebuild that checks the plan compiles
               --allow-still-referenced  let delete run although surviving code still references a removal target
+              --allow-unregistered-services  let delete run although a still-used service loses its only DI registration
               --allow-compile-errors  let delete run although some projects failed to compile during analysis
               --delete-review-tests   delete review-flagged tests too (default: delete refuses while any exist)
               --allow-no-roots        let delete run although no production entry points were detected

@@ -144,6 +144,9 @@ public sealed class Graph
     public List<ScanRegistration> ScanRegistrations { get; } = new();
     /// <summary>Type id -> file:line of a scan registration that registers it.</summary>
     public Dictionary<string, string> ScanMatchedTypes { get; } = new(StringComparer.Ordinal);
+    /// <summary>Type id -> the members whose code creates it with "new": a class the solution creates
+    /// itself is not one a framework instantiates (and calls by convention) unseen.</summary>
+    public Dictionary<string, HashSet<string>> CreatedBy { get; } = new(StringComparer.Ordinal);
     /// <summary>Roots that exist only because a name is mentioned where the analysis cannot follow
     /// it (views, inactive #if code, dynamic calls, config files): id -> where it is mentioned.</summary>
     public Dictionary<string, string> MentionRoots { get; } = new(StringComparer.Ordinal);
@@ -351,6 +354,8 @@ public sealed class CliOptions
     public bool StrictMembers;
     public bool NoVerify;
     public bool AllowStillReferenced;
+    /// <summary>Let delete run although a still-used service loses its only registration.</summary>
+    public bool AllowUnregisteredServices;
     /// <summary>Let delete run although some projects had compile errors during analysis (their
     /// references are invisible, so the cascade may over-delete). Default: delete refuses.</summary>
     public bool AllowCompileErrors;
@@ -368,13 +373,15 @@ public sealed class CliOptions
 /// <summary>How the classes a scan matches are registered.</summary>
 public enum ScanMode
 {
-    /// <summary>Not recognised: treated like AllInterfaces (the safe side).</summary>
+    /// <summary>Not determined: treated like KeepAll (the safe side).</summary>
     Unknown,
+    /// <summary>The registration style cannot be followed: every matched class lives while the scanning member does.</summary>
+    KeepAll,
     /// <summary>Every matched class under every interface it implements (Autofac AsImplementedInterfaces).</summary>
     AllInterfaces,
-    /// <summary>Only under the interface named like the class, "I" + name (StructureMap default conventions).</summary>
+    /// <summary>Only under the interface named like the class (StructureMap/Scrutor/Windsor/Ninject default interfaces).</summary>
     MatchingInterface,
-    /// <summary>Only as the class itself: whoever resolves it names it in code.</summary>
+    /// <summary>Only as the class itself (plus any ServiceTypes): whoever resolves it names it in code.</summary>
     SelfOnly,
 }
 
@@ -391,4 +398,29 @@ public sealed class ScanRegistration
     /// <summary>False when part of the filter could not be read and was widened to "matches".</summary>
     public bool FilterExact { get; init; }
     public required ScanMode Mode { get; init; }
+    /// <summary>Services named by type (As&lt;Base&gt;, AsClosedTypesOf(typeof(IHandler&lt;&gt;)), Named&lt;T&gt;):
+    /// a matched class assignable to one is registered under it, whatever the mode.</summary>
+    public List<INamedTypeSymbol> ServiceTypes { get; init; } = new();
+}
+
+/// <summary>A solution opened with MSBuild, with the load failures its workspace reported. Disposing it
+/// releases the workspace.</summary>
+public sealed class LoadedSolution : IDisposable
+{
+    readonly Microsoft.CodeAnalysis.MSBuild.MSBuildWorkspace _workspace;
+
+    public LoadedSolution(Microsoft.CodeAnalysis.MSBuild.MSBuildWorkspace workspace, Solution solution, List<string> loadWarnings)
+    {
+        _workspace = workspace;
+        Solution = solution;
+        LoadWarnings = loadWarnings;
+    }
+
+    public Solution Solution { get; }
+    public List<string> LoadWarnings { get; }
+
+    public void Dispose()
+    {
+        _workspace.Dispose();
+    }
 }

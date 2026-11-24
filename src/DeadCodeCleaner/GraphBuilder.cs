@@ -21,6 +21,7 @@ public sealed class GraphBuilder
     readonly HashSet<string> _solutionAssemblies = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<SyntaxNode, AnchorInfo> _anchors = new();
     readonly HashSet<SyntaxNode> _scanRegions = new();
+    readonly Dictionary<SyntaxTree, Compilation> _treeCompilations = new();
 
     /// <summary>Everything known about one anchor statement shared by tracked registrations: which
     /// chain invocations the registrations claim as their own, and the statements on the anchor.</summary>
@@ -73,6 +74,7 @@ public sealed class GraphBuilder
                 _graph.Warnings.Add($"{project.Name}: references a test library but contains no test — treated as PRODUCTION code");
             }
             compilations.Add((comp, isTest, project.Name));
+            foreach (var tree in comp.SyntaxTrees) { _treeCompilations.TryAdd(tree, comp); }
             _solutionAssemblies.Add(comp.Assembly.Name);
             CollectProjectInfo(project);
             if (_graph.Projects.TryGetValue(project.Name, out var pinfo))
@@ -365,7 +367,7 @@ public sealed class GraphBuilder
             // exception (a linked file), not a listing every deleted file must appear in.
             bool sdkStyle = xml.Root?.Attribute("Sdk") != null
                 || xml.Descendants().Any(d => d.Name.LocalName is "Sdk" or "Import" && d.Attribute("Sdk") != null);
-            bool defaultsOff = xml.Descendants().Any(d => d.Name.LocalName == "EnableDefaultCompileItems" && StringComparer.OrdinalIgnoreCase.Equals(d.Value.Trim(), "false"));
+            bool defaultsOff = xml.Descendants().Any(d => d.Name.LocalName is "EnableDefaultCompileItems" or "EnableDefaultItems" && StringComparer.OrdinalIgnoreCase.Equals(d.Value.Trim(), "false"));
             info.DefaultCompileItems = sdkStyle && !defaultsOff;
             var assetsPath = Path.Combine(Path.GetDirectoryName(project.FilePath), "obj", "project.assets.json");
             if (File.Exists(assetsPath))
@@ -422,18 +424,40 @@ public sealed class GraphBuilder
         _graph.Projects[project.Name] = info;
     }
 
-    /// <summary>The analysis neutralizes warnings-as-errors so design-time builds load; the verifier
-    /// needs the REAL settings back. Read from the csproj and every Directory.Build.props above it.
-    /// Conservative: a conditional "true" counts as on (a stricter verifier only refuses more).</summary>
-    void ReadWarningsAsErrors(string csprojPath, ProjectInfo info)
+    /// <summary>The project file plus the Directory.Build.props files MSBuild imports into it: the
+    /// nearest one above the project, then the next one up only while the previous one imports it
+    /// (an Import naming Directory.Build.props or GetPathOfFileAbove).</summary>
+    List<string> ProjectBuildFiles(string csprojPath)
     {
         var files = new List<string> { csprojPath };
         for (var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath)); dir != null; dir = Path.GetDirectoryName(dir))
         {
             var props = Path.Combine(dir, Constants.DirectoryBuildPropsFileName);
-            if (File.Exists(props)) { files.Add(props); }
+            if (!File.Exists(props)) { continue; }
+            files.Add(props);
+            bool importsParent;
+            try
+            {
+                importsParent = XDocument.Load(props).Descendants().Any(d => d.Name.LocalName == "Import"
+                    && (d.Attribute("Project")?.Value is { } ip)
+                    && (ip.Contains(Constants.DirectoryBuildPropsFileName, StringComparison.OrdinalIgnoreCase) || ip.Contains("GetPathOfFileAbove", StringComparison.Ordinal)));
+            }
+            catch (Exception e) when (e is XmlException or IOException or UnauthorizedAccessException)
+            {
+                // Unreadable: assume the chain continues (reading more settings only verifies stricter).
+                importsParent = true;
+            }
+            if (!importsParent) { break; }
         }
-        foreach (var file in files)
+        return files;
+    }
+
+    /// <summary>The analysis neutralizes warnings-as-errors so design-time builds load; the verifier
+    /// needs the REAL settings back. Read from the csproj and the Directory.Build.props it imports.
+    /// Conservative: a conditional "true" counts as on (a stricter verifier only refuses more).</summary>
+    void ReadWarningsAsErrors(string csprojPath, ProjectInfo info)
+    {
+        foreach (var file in ProjectBuildFiles(csprojPath))
         {
             XDocument doc;
             try
@@ -466,9 +490,20 @@ public sealed class GraphBuilder
 
     IEnumerable<string> SplitWarningIds(string value)
     {
-        return value.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(id => !id.StartsWith("$(", StringComparison.Ordinal))
-            .Select(id => id.All(char.IsDigit) ? "CS" + id.PadLeft(4, '0') : id);
+        var ids = new List<string>();
+        foreach (var id in value.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (id.StartsWith("$(", StringComparison.Ordinal)) { continue; }
+            if (StringComparer.OrdinalIgnoreCase.Equals(id, Constants.NullableWarningGroup))
+            {
+                // The compiler's own command-line parser knows which ids the group stands for.
+                var parsed = CSharpCommandLineParser.Default.Parse(new[] { "/warnaserror:" + Constants.NullableWarningGroup }, Directory.GetCurrentDirectory(), sdkDirectory: null);
+                ids.AddRange(parsed.CompilationOptions.SpecificDiagnosticOptions.Keys);
+                continue;
+            }
+            ids.Add(id.All(char.IsDigit) ? "CS" + id.PadLeft(4, '0') : id);
+        }
+        return ids;
     }
 
     bool ReferencesTestLibrary(Project project)
@@ -479,9 +514,16 @@ public sealed class GraphBuilder
         try
         {
             if (project.FilePath == null || !File.Exists(project.FilePath)) { return false; }
-            foreach (var el in XDocument.Load(project.FilePath).Descendants())
+            // Test packages are often added for a whole tests/ folder by its Directory.Build.props.
+            foreach (var el in ProjectBuildFiles(project.FilePath).SelectMany(f => XDocument.Load(f).Descendants()))
             {
                 var ln = el.Name.LocalName;
+                // <Project Sdk="MSTest.Sdk/3.6.4">: the SDK brings the test framework and IsTestProject.
+                if (ln is "Project" or "Sdk" or "Import" && ((string)el.Attribute("Sdk") ?? (ln == "Sdk" ? (string)el.Attribute("Name") : null)) is { } sdk
+                    && sdk.Split('/')[0].Trim() == Constants.MsTestSdkName)
+                {
+                    return true;
+                }
                 if (ln is "PackageReference" or "Reference")
                 {
                     var include = (string)el.Attribute("Include") ?? (string)el.Attribute("Update") ?? "";
@@ -736,8 +778,10 @@ public sealed class GraphBuilder
         // Implicit base constructor calls (": base()" omitted, or no explicit constructors at all).
         if (type.BaseType is { } baseType && NodeId(baseType) != null)
         {
+            // Callable without arguments: none, or all optional / params (RepoBase(string conn = "db")).
             var baseCtorId = baseType.OriginalDefinition.InstanceConstructors
-                .Where(c => c.Parameters.Length == 0)
+                .Where(c => c.Parameters.All(p => p.IsOptional || p.IsParams))
+                .OrderBy(c => c.Parameters.Length)
                 .Select(c => NodeId(c))
                 .FirstOrDefault(id => id != null);
             if (baseCtorId != null)
@@ -799,13 +843,13 @@ public sealed class GraphBuilder
     {
         bool rootWholeType = false;
         bool rootAllMethods = false;
-        string[] rootNamePrefixes = Array.Empty<string>();
+        bool rootEventNamedMethods = false;
         string reason = "";
 
         if (type.Name.EndsWith("Controller", StringComparison.Ordinal) || BaseChainHasName(type, "Controller", "ControllerBase", "ApiController"))
         {
             rootWholeType = true;
-            reason = "controller";
+            reason = Constants.ReasonController;
         }
         else if (type.AllInterfaces.Any(i => i.Name == "IHostedService" && IsFrameworkType(i)) || BaseChainHasName(type, "BackgroundService"))
         {
@@ -832,19 +876,19 @@ public sealed class GraphBuilder
         else if (BaseChainHasName(type, "Migration", "DbMigration"))
         {
             rootWholeType = true;
-            reason = "EF migration";
+            reason = Constants.ReasonEfMigration;
         }
         else if (BaseChainHasName(type, "ViewComponent", "TagHelper", "PageModel", "ComponentBase", "Hub"))
         {
             rootWholeType = true;
-            reason = "framework component";
+            reason = Constants.ReasonFrameworkComponent;
         }
         else if (BaseChainHasName(type, "EntityTypeConfiguration", "ComplexTypeConfiguration", "AreaRegistration", "NinjectModule"))
         {
             // EF6 configurations (AddFromAssembly), MVC areas (RegisterAllAreas), Ninject modules:
             // all discovered by assembly scanning.
             rootWholeType = true;
-            reason = "framework-discovered subclass";
+            reason = Constants.ReasonFrameworkSubclass;
         }
         else if (BaseChainHasExternalName(type, "Page", "System.Web") || BaseChainHasExternalName(type, "UserControl", "System.Web")
             || BaseChainHasExternalName(type, "MasterPage", "System.Web"))
@@ -856,15 +900,16 @@ public sealed class GraphBuilder
         }
         else if (BaseChainHasExternalName(type, "HttpApplication", "System.Web"))
         {
-            // Application_Start / Session_Start / Application_Error are protected and called by name.
+            // Application_Start, Session_End, FormsAuthentication_OnAuthenticate, <AnyModule>_<Event>:
+            // protected or private, and wired by name.
             rootWholeType = true;
-            rootNamePrefixes = Constants.HttpApplicationEventPrefixes;
+            rootEventNamedMethods = true;
             reason = "Global.asax application";
         }
         else if (type.AllInterfaces.Any(i => i.Name is "IEntityTypeConfiguration" or "IMiddleware" or "IHttpModule" or "IHttpHandler" or "IJob" or "ITagHelper" && IsFrameworkType(i)))
         {
             rootWholeType = true;
-            reason = "framework-discovered implementation";
+            reason = Constants.ReasonFrameworkImplementation;
         }
         else if (type.InstanceConstructors.Any(c => c.Parameters.Any(p => p.Type.Name == "RequestDelegate")))
         {
@@ -884,7 +929,7 @@ public sealed class GraphBuilder
         else if (HasAttributeNamed(type, "ExportAttribute") || HasAttributeNamed(type, "InheritedExportAttribute"))
         {
             rootWholeType = true;
-            reason = "MEF export";
+            reason = Constants.ReasonMefExport;
         }
         else if (BaseChainHasExternalName(type, "MembershipProvider", "System.Web") || BaseChainHasExternalName(type, "RoleProvider", "System.Web")
             || BaseChainHasExternalName(type, "ProfileProvider", "System.Web"))
@@ -906,7 +951,7 @@ public sealed class GraphBuilder
                 if (NodeId(m) is not { } mId) { continue; }
                 bool isCtor = m is IMethodSymbol c && c.MethodKind == MethodKind.Constructor;
                 bool byConvention = m is IMethodSymbol { MethodKind: MethodKind.Ordinary }
-                    && (rootAllMethods || rootNamePrefixes.Any(p => m.Name.StartsWith(p, StringComparison.Ordinal)));
+                    && (rootAllMethods || (rootEventNamedMethods && m.Name.IndexOf(Constants.HttpApplicationEventSeparator) > 0));
                 if (isCtor || byConvention || m.DeclaredAccessibility == Accessibility.Public)
                 {
                     _graph.AddRoot(mId, reason, isTest);
@@ -1005,6 +1050,7 @@ public sealed class GraphBuilder
         var regexes = patterns
             .Select(p => new Regex("^" + Regex.Escape(p).Replace(@"\*", ".*") + "$", RegexOptions.Compiled))
             .ToList();
+        var matchedTypes = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (id, symbol) in _graph.Decl)
         {
             var fqn = SymbolNames.Fqn(symbol);
@@ -1012,6 +1058,19 @@ public sealed class GraphBuilder
             {
                 _graph.AddRoot(id, "config keep/root", _graph.TestNodes.Contains(id));
                 _graph.ConfigKeptIds.Add(id);
+                if (symbol is INamedTypeSymbol) { matchedTypes.Add(id); }
+            }
+        }
+        // Keeping a type keeps it WHOLE: code reached only by reflection calls members nothing names.
+        if (matchedTypes.Count == 0) { return; }
+        foreach (var id in _graph.Decl.Keys)
+        {
+            for (var cur = id; _graph.ContainerOf.TryGetValue(cur, out var c); cur = c)
+            {
+                if (!matchedTypes.Contains(c)) { continue; }
+                _graph.AddRoot(id, "config keep/root (member of a kept type)", _graph.TestNodes.Contains(id));
+                _graph.ConfigKeptIds.Add(id);
+                break;
             }
         }
     }
@@ -1168,6 +1227,17 @@ public sealed class GraphBuilder
     {
         if (member?.ContainingType == null || NodeId(member.ContainingType) is not { } typeId) { return; }
         if (model.GetOperation(value) is not { } op) { return; }
+        if (OperationActs(op, new HashSet<ISymbol>(SymbolEqualityComparer.Default), 0))
+        {
+            _graph.AddRule(new object[] { typeId }, new object[] { memberId }, "initializer with side effects kept with type");
+        }
+    }
+
+    /// <summary>True when evaluating the operation does something observable: a call that is not pure
+    /// BCL, or a construction whose constructor does (followed into solution constructors, their
+    /// base calls and their types' instance initializers). Lambda bodies do not run here.</summary>
+    bool OperationActs(IOperation op, HashSet<ISymbol> seen, int depth)
+    {
         var pending = new Stack<IOperation>();
         pending.Push(op);
         while (pending.Count > 0)
@@ -1176,17 +1246,61 @@ public sealed class GraphBuilder
             if (cur is IAnonymousFunctionOperation or ILocalFunctionOperation) { continue; }
             bool acts = cur switch
             {
+                // A constructor invoked as a call is a ": base(...)" / ": this(...)" initializer.
+                IInvocationOperation { TargetMethod.MethodKind: MethodKind.Constructor } ci => ConstructionActs(ci.TargetMethod, seen, depth),
                 IInvocationOperation inv => !IsPureBclTarget(inv.TargetMethod.OriginalDefinition),
-                IObjectCreationOperation oc => oc.Constructor != null && NodeId(oc.Constructor.ContainingType) == null && !IsPureBclTarget(oc.Constructor.OriginalDefinition),
+                IObjectCreationOperation oc => oc.Constructor != null && ConstructionActs(oc.Constructor, seen, depth),
                 _ => false,
             };
-            if (acts)
-            {
-                _graph.AddRule(new object[] { typeId }, new object[] { memberId }, "initializer with side effects kept with type");
-                return;
-            }
+            if (acts) { return true; }
             foreach (var child in cur.ChildOperations) { pending.Push(child); }
         }
+        return false;
+    }
+
+    bool ConstructionActs(IMethodSymbol ctor, HashSet<ISymbol> seen, int depth)
+    {
+        var def = ctor.OriginalDefinition;
+        if (NodeId(def.ContainingType) == null) { return !IsPureBclTarget(def); }
+        if (!seen.Add(def)) { return false; }
+        // Too deep to follow: assume it acts (over-keeping is the safe side).
+        if (depth >= Constants.MaxConstructionFollowDepth) { return true; }
+        var bodies = new List<SyntaxNode>();
+        bool hasInitializer = false;
+        foreach (var r in def.DeclaringSyntaxReferences)
+        {
+            var syn = r.GetSyntax();
+            // A primary constructor's syntax is the type declaration: not followable here.
+            if (syn is not ConstructorDeclarationSyntax cds) { return true; }
+            bodies.Add(cds);
+            if (cds.Initializer != null) { hasInitializer = true; }
+        }
+        foreach (var m in def.ContainingType.GetMembers())
+        {
+            if (m.IsStatic || m is not (IFieldSymbol or IPropertySymbol)) { continue; }
+            foreach (var r in m.DeclaringSyntaxReferences)
+            {
+                var init = r.GetSyntax() switch
+                {
+                    VariableDeclaratorSyntax v => v.Initializer,
+                    PropertyDeclarationSyntax pd => pd.Initializer,
+                    _ => null,
+                };
+                if (init != null) { bodies.Add(init); }
+            }
+        }
+        foreach (var body in bodies)
+        {
+            if (!_treeCompilations.TryGetValue(body.SyntaxTree, out var comp)) { return true; }
+            if (comp.GetSemanticModel(body.SyntaxTree).GetOperation(body) is { } bop && OperationActs(bop, seen, depth + 1)) { return true; }
+        }
+        // No ": base(...)" written: the base constructor callable without arguments runs.
+        if (!hasInitializer && def.ContainingType.BaseType is { } bt)
+        {
+            var baseCtor = bt.InstanceConstructors.Where(c => c.Parameters.All(p => p.IsOptional || p.IsParams)).OrderBy(c => c.Parameters.Length).FirstOrDefault();
+            if (baseCtor != null && ConstructionActs(baseCtor, seen, depth + 1)) { return true; }
+        }
+        return false;
     }
 
     /// <summary>[assembly: PreApplicationStartMethod(typeof(X), "Start")] and the WebActivatorEx variants
@@ -1198,14 +1312,20 @@ public sealed class GraphBuilder
         if (!Constants.StartMethodAttributeNames.Contains(attrName) || at.ArgumentList == null) { return; }
         var args = at.ArgumentList.Arguments.Select(a => a.Expression).ToList();
         var typeOf = args.OfType<TypeOfExpressionSyntax>().FirstOrDefault();
-        var name = args.Select(a => model.GetConstantValue(a)).Where(c => c.HasValue && c.Value is string).Select(c => (string)c.Value).FirstOrDefault();
-        if (typeOf == null || name == null) { return; }
+        // Every string argument may be the method name (OwinStartup's first one is a friendly name):
+        // rooting a same-named method too only over-keeps.
+        var names = args.Select(a => model.GetConstantValue(a)).Where(c => c.HasValue && c.Value is string).Select(c => (string)c.Value).ToList();
+        if (attrName == Constants.OwinStartupAttributeName) { names.Add(Constants.OwinDefaultStartMethod); }
+        if (typeOf == null || names.Count == 0) { return; }
         if (model.GetTypeInfo(typeOf.Type).Type is not INamedTypeSymbol target) { return; }
-        foreach (var m in target.GetMembers(name))
+        foreach (var name in names.Distinct())
         {
-            if (NodeId(m) is not { } mId) { continue; }
-            _graph.AddRoot(mId, $"[assembly: {attrName}] method", isTest);
-            _graph.AddAssemblyAttrRef(projectName, mId);
+            foreach (var m in target.GetMembers(name))
+            {
+                if (NodeId(m) is not { } mId) { continue; }
+                _graph.AddRoot(mId, $"[assembly: {attrName}] method", isTest);
+                _graph.AddAssemblyAttrRef(projectName, mId);
+            }
         }
     }
 
@@ -1350,6 +1470,11 @@ public sealed class GraphBuilder
             case IObjectCreationOperation oc:
                 Emit(oc.Constructor);
                 if (!suppressed) { RecordExternalCall(sourceId, oc.Constructor); }
+                if (oc.Type is INamedTypeSymbol created && NodeId(created.OriginalDefinition) is { } createdId)
+                {
+                    if (!_graph.CreatedBy.TryGetValue(createdId, out var creators)) { _graph.CreatedBy[createdId] = creators = new HashSet<string>(StringComparer.Ordinal); }
+                    creators.Add(sourceId);
+                }
                 break;
             case IMemberReferenceOperation mr: Emit(mr.Member); break;
             case IUnaryOperation u: Emit(u.OperatorMethod); break;
@@ -1561,6 +1686,11 @@ public sealed class GraphBuilder
         bool isAutofac = name == Constants.AutofacScanMethodName;
         SyntaxNode region;
 
+        var serviceTypes = new List<INamedTypeSymbol>();
+        // Set when a registration call cannot be followed: every matched class then lives while the
+        // scanning member does.
+        bool keepAll = false;
+
         if (isAutofac)
         {
             region = inv;
@@ -1587,6 +1717,21 @@ public sealed class GraphBuilder
                 {
                     filter = AndFilter(filter, t => IsAssignableTo(t, at));
                 }
+                else if (Constants.ScanServiceTypeNames.Contains(mname))
+                {
+                    if (!CollectScanServiceTypes(ma.Name, pInv, model, serviceTypes)) { keepAll = true; }
+                }
+                else if (Constants.AutofacActivationNames.Contains(mname))
+                {
+                    keepAll = true;
+                }
+                else if (!Constants.AutofacScanNarrowingNames.Contains(mname) && !Constants.ScanAllInterfacesNames.Contains(mname)
+                    && !Constants.ScanSelfNames.Contains(mname) && !Constants.ScanMatchingInterfaceNames.Contains(mname)
+                    && !Constants.AutofacChainContinuers.Contains(mname) && !Constants.AutofacExtraLifetimeNames.Contains(mname))
+                {
+                    // A call this reading does not know may register services it cannot see.
+                    keepAll = true;
+                }
                 region = pInv;
                 cur = pInv;
             }
@@ -1604,11 +1749,19 @@ public sealed class GraphBuilder
                 if (Constants.ScanAssemblyOfTypeNames.Contains(cname))
                 {
                     anyAssemblySource = true;
-                    ITypeSymbol of = cn is GenericNameSyntax gn && gn.TypeArgumentList.Arguments.Count == 1
-                        ? model.GetTypeInfo(gn.TypeArgumentList.Arguments[0]).Type
-                        : call.ArgumentList.Arguments.Select(a => a.Expression).OfType<TypeOfExpressionSyntax>().Select(t => model.GetTypeInfo(t.Type).Type).FirstOrDefault();
-                    if (of?.ContainingAssembly?.Name is { } oa) { assemblies.Add(oa); }
-                    else { assembliesKnown = false; }
+                    // FromAssemblyOf<X>(), FromAssembliesOf(typeof(A), typeof(B)): every named type counts.
+                    var ofTypes = new List<ITypeSymbol>();
+                    if (cn is GenericNameSyntax gn)
+                    {
+                        ofTypes.AddRange(gn.TypeArgumentList.Arguments.Select(ta => model.GetTypeInfo(ta).Type));
+                    }
+                    ofTypes.AddRange(call.ArgumentList.Arguments.Select(a => a.Expression).OfType<TypeOfExpressionSyntax>().Select(t => model.GetTypeInfo(t.Type).Type));
+                    if (ofTypes.Count == 0 || call.ArgumentList.Arguments.Any(a => a.Expression is not TypeOfExpressionSyntax)) { assembliesKnown = false; }
+                    foreach (var of in ofTypes)
+                    {
+                        if (of?.ContainingAssembly?.Name is { } oa) { assemblies.Add(oa); }
+                        else { assembliesKnown = false; }
+                    }
                 }
                 else if (Constants.ScanCurrentAssemblyNames.Contains(cname))
                 {
@@ -1618,13 +1771,23 @@ public sealed class GraphBuilder
                 else if (Constants.ScanUnknownAssemblyNames.Contains(cname))
                 {
                     anyAssemblySource = true;
-                    // FromAssemblies(typeof(X).Assembly) is still precise.
-                    foreach (var arg in call.ArgumentList.Arguments)
+                    if (Constants.ScanAssemblyListNames.Contains(cname) && call.ArgumentList.Arguments.Count > 0)
                     {
-                        if (ScanAssemblyOf(arg.Expression, model, currentAsm) is { } a) { assemblies.Add(a); }
-                        else { assembliesKnown = false; }
+                        // FromAssemblies(typeof(X).Assembly) is still precise.
+                        foreach (var arg in call.ArgumentList.Arguments)
+                        {
+                            if (ScanAssemblyOf(arg.Expression, model, currentAsm) is { } a) { assemblies.Add(a); }
+                            else { assembliesKnown = false; }
+                        }
                     }
-                    if (call.ArgumentList.Arguments.Count == 0) { assembliesKnown = false; }
+                    else
+                    {
+                        assembliesKnown = false;
+                    }
+                }
+                else if (Constants.ScanServiceTypeNames.Contains(cname) && call.Expression is MemberAccessExpressionSyntax sma)
+                {
+                    if (!CollectScanServiceTypes(sma.Name, call, model, serviceTypes)) { keepAll = true; }
                 }
             }
             foreach (var ma in region.DescendantNodesAndSelf().OfType<MemberAccessExpressionSyntax>())
@@ -1640,17 +1803,24 @@ public sealed class GraphBuilder
                     callNames.Add(ma.Name.Identifier.Text);
                 }
             }
-            // No assembly vocabulary at all: not a registration scan (some other "Scan" method).
-            if (!anyAssemblySource) { return; }
+            bool registers = callNames.Overlaps(Constants.ScanAllInterfacesNames) || callNames.Overlaps(Constants.ScanMatchingInterfaceNames)
+                || callNames.Overlaps(Constants.ScanSelfNames) || callNames.Overlaps(Constants.ScanKeepAllNames)
+                || callNames.Overlaps(Constants.ScanSelectionNames) || serviceTypes.Count > 0;
+            // Neither assembly nor registration vocabulary: not a registration scan (some other "Scan" method).
+            if (!anyAssemblySource && !registers) { return; }
+            // Registration vocabulary over assemblies named in a way this reading does not know.
+            if (!anyAssemblySource) { assembliesKnown = false; }
+            if (callNames.Overlaps(Constants.ScanKeepAllNames)) { keepAll = true; }
             filterExact = false;
         }
         if (!_scanRegions.Add(region)) { return; }
 
         ScanMode mode;
-        if (callNames.Overlaps(Constants.ScanAllInterfacesNames) || (isAutofac && callNames.Contains("As"))) { mode = ScanMode.AllInterfaces; }
+        if (keepAll) { mode = ScanMode.KeepAll; }
+        else if (callNames.Overlaps(Constants.ScanAllInterfacesNames)) { mode = ScanMode.AllInterfaces; }
         else if (callNames.Overlaps(Constants.ScanMatchingInterfaceNames)) { mode = ScanMode.MatchingInterface; }
         // Autofac registers scanned types as themselves unless told otherwise.
-        else if (callNames.Overlaps(Constants.ScanSelfNames) || isAutofac) { mode = ScanMode.SelfOnly; }
+        else if (callNames.Overlaps(Constants.ScanSelfNames) || isAutofac || serviceTypes.Count > 0) { mode = ScanMode.SelfOnly; }
         else { mode = ScanMode.Unknown; }
 
         _graph.ScanRegistrations.Add(new ScanRegistration
@@ -1661,7 +1831,45 @@ public sealed class GraphBuilder
             Filter = filter,
             FilterExact = filterExact,
             Mode = mode,
+            ServiceTypes = serviceTypes,
         });
+    }
+
+    /// <summary>The service types a scan registration call names by generic argument or typeof:
+    /// As&lt;Base&gt;(), As(typeof(IFoo)), AsClosedTypesOf(typeof(IHandler&lt;&gt;)), Named&lt;IPlugin&gt;(t =&gt; t.Name).
+    /// False when the call names its services some other way (a lambda, a variable).</summary>
+    bool CollectScanServiceTypes(SimpleNameSyntax name, InvocationExpressionSyntax call, SemanticModel model, List<INamedTypeSymbol> serviceTypes)
+    {
+        int found = 0;
+        if (name is GenericNameSyntax g)
+        {
+            foreach (var ta in g.TypeArgumentList.Arguments)
+            {
+                if (model.GetTypeInfo(ta).Type is not INamedTypeSymbol st) { return false; }
+                serviceTypes.Add(st.OriginalDefinition);
+                found++;
+            }
+        }
+        foreach (var arg in call.ArgumentList.Arguments)
+        {
+            if (arg.Expression is TypeOfExpressionSyntax tof)
+            {
+                if (model.GetTypeInfo(tof.Type).Type is not INamedTypeSymbol st) { return false; }
+                serviceTypes.Add(st.OriginalDefinition);
+                found++;
+            }
+            else if (name.Identifier.Text is "Named" or "Keyed")
+            {
+                // The name/key argument (a string, or a t => t.Name lambda): not a service.
+                continue;
+            }
+            else
+            {
+                // As(t => ...) selecting services by code, or a Type variable: not followable.
+                return false;
+            }
+        }
+        return found > 0;
     }
 
     /// <summary>The assembly an expression like typeof(X).Assembly or Assembly.GetExecutingAssembly()
@@ -1747,10 +1955,17 @@ public sealed class GraphBuilder
             {
                 var lhs = TypeStringOf(eq.Left, p);
                 var rhs = TypeStringOf(eq.Right, p);
-                var lit = lhs != null ? StringLiteral(eq.Right, model) : StringLiteral(eq.Left, model);
                 var getter = lhs ?? rhs;
-                if (getter == null || lit == null) { return (null, false); }
+                if (getter == null) { return (null, false); }
+                var other = lhs != null ? eq.Right : eq.Left;
                 bool negate = eq.IsKind(SyntaxKind.NotEqualsExpression);
+                // t.Namespace != null: the usual guard in front of t.Namespace.StartsWith(...).
+                if (other.IsKind(SyntaxKind.NullLiteralExpression))
+                {
+                    return (t => (getter(t) == null) != negate, true);
+                }
+                var lit = StringLiteral(other, model);
+                if (lit == null) { return (null, false); }
                 return (t => (getter(t) == lit) != negate, true);
             }
             case InvocationExpressionSyntax call when call.Expression is MemberAccessExpressionSyntax cma:
@@ -1764,14 +1979,26 @@ public sealed class GraphBuilder
                     var cmp = StringComparison.Ordinal;
                     if (args.Count == 2)
                     {
-                        var cmpText = args[1].Expression.ToString();
-                        if (cmpText.EndsWith("IgnoreCase", StringComparison.Ordinal)) { cmp = StringComparison.OrdinalIgnoreCase; }
+                        // (value, StringComparison): the odd enum values are the IgnoreCase ones.
+                        if (model.GetConstantValue(args[1].Expression) is not { HasValue: true, Value: int cmpValue }) { return (null, false); }
+                        if (cmpValue % 2 == 1) { cmp = StringComparison.OrdinalIgnoreCase; }
                     }
+                    else if (args.Count == 3)
+                    {
+                        // (value, bool ignoreCase, CultureInfo).
+                        if (model.GetConstantValue(args[1].Expression) is not { HasValue: true, Value: bool ignoreCase }) { return (null, false); }
+                        if (ignoreCase) { cmp = StringComparison.OrdinalIgnoreCase; }
+                    }
+                    else if (args.Count > 3)
+                    {
+                        return (null, false);
+                    }
+                    // A null string (a type in the global namespace has no Namespace) matches nothing.
                     return method switch
                     {
-                        "EndsWith" => (t => getter(t).EndsWith(lit, cmp), true),
-                        "StartsWith" => (t => getter(t).StartsWith(lit, cmp), true),
-                        _ => (t => getter(t).Contains(lit, cmp), true),
+                        "EndsWith" => (t => getter(t) is { } v && v.EndsWith(lit, cmp), true),
+                        "StartsWith" => (t => getter(t) is { } v && v.StartsWith(lit, cmp), true),
+                        _ => (t => getter(t) is { } v && v.Contains(lit, cmp), true),
                     };
                 }
                 // t.IsSubclassOf(typeof(B)) / t.IsAssignableTo(typeof(B))
@@ -1856,14 +2083,37 @@ public sealed class GraphBuilder
                 if (scan.Filter != null && !scan.Filter(type)) { continue; }
                 if (NodeId(type) is not { } typeId) { continue; }
                 _graph.ScanMatchedTypes.TryAdd(typeId, scan.Site);
-                if (scan.Mode == ScanMode.SelfOnly) { continue; }
+                var ctorIds = type.InstanceConstructors.Select(NodeId).Where(id => id != null).Cast<object>().ToList();
+                // The container constructs a registered class itself: no source names its constructors.
+                if (ctorIds.Count > 0)
+                {
+                    _graph.AddRule(new object[] { scan.SourceId, typeId }, ctorIds, "assembly-scanned class: the container constructs it");
+                }
                 var payload = new List<object> { typeId };
-                payload.AddRange(type.InstanceConstructors.Select(NodeId).Where(id => id != null));
+                payload.AddRange(ctorIds);
+                if (scan.Mode is ScanMode.KeepAll or ScanMode.Unknown)
+                {
+                    _graph.AddRule(new object[] { scan.SourceId }, payload, "assembly-scan registration (style not readable)");
+                    continue;
+                }
+                foreach (var svc in scan.ServiceTypes)
+                {
+                    if (!IsAssignableTo(type, svc)) { continue; }
+                    if (NodeId(svc) is { } svcId)
+                    {
+                        _graph.AddRule(new object[] { scan.SourceId, svcId }, payload, "assembly-scan registration");
+                    }
+                    else
+                    {
+                        _graph.AddRule(new object[] { scan.SourceId }, payload, "assembly-scan registration (external service)");
+                    }
+                }
+                if (scan.Mode is not (ScanMode.AllInterfaces or ScanMode.MatchingInterface)) { continue; }
                 foreach (var iface in type.AllInterfaces)
                 {
                     // Autofac itself excludes these from AsImplementedInterfaces.
                     if (iface.ContainingNamespace is { IsGlobalNamespace: false } ins && ins.ToDisplayString() == "System" && iface.Name is "IDisposable" or "IAsyncDisposable") { continue; }
-                    if (scan.Mode == ScanMode.MatchingInterface && iface.Name != "I" + type.Name) { continue; }
+                    if (scan.Mode == ScanMode.MatchingInterface && !IsDefaultInterfaceOf(iface, type)) { continue; }
                     if (NodeId(iface) is { } ifaceId)
                     {
                         _graph.AddRule(new object[] { scan.SourceId, ifaceId }, payload, "assembly-scan registration");
@@ -1878,6 +2128,40 @@ public sealed class GraphBuilder
         }
     }
 
+    /// <summary>UseStartup&lt;ApiStartup&gt;() / UseStartup(typeof(ApiStartup)): the host calls the class's
+    /// ConfigureServices/Configure methods by convention, so it is rooted like a class named Startup.</summary>
+    void RootStartupClass(InvocationExpressionSyntax inv, SimpleNameSyntax name, SemanticModel model)
+    {
+        var types = new List<ITypeSymbol>();
+        if (name is GenericNameSyntax g) { types.AddRange(g.TypeArgumentList.Arguments.Select(ta => model.GetTypeInfo(ta).Type)); }
+        types.AddRange(inv.ArgumentList.Arguments.Select(a => a.Expression).OfType<TypeOfExpressionSyntax>().Select(t => model.GetTypeInfo(t.Type).Type));
+        foreach (var t in types.OfType<INamedTypeSymbol>())
+        {
+            var def = t.OriginalDefinition;
+            if (NodeId(def) is not { } typeId) { continue; }
+            bool isTest = _graph.TestNodes.Contains(typeId);
+            _graph.AddRoot(typeId, "startup class", isTest);
+            foreach (var m in def.GetMembers())
+            {
+                bool isCtor = m is IMethodSymbol { MethodKind: MethodKind.Constructor };
+                if ((isCtor || m.DeclaredAccessibility == Accessibility.Public) && NodeId(m) is { } mId)
+                {
+                    _graph.AddRoot(mId, "startup class", isTest);
+                }
+            }
+        }
+    }
+
+    /// <summary>The widest "default interface" rule of the scanning libraries: Windsor and Ninject's
+    /// plural form match when the class name CONTAINS the interface name without its leading "I"
+    /// (SqlOrderRepository -> IOrderRepository); Ninject's singular form ignores case. The exact
+    /// "I" + name conventions (StructureMap, Scrutor, Unity) are a subset.</summary>
+    bool IsDefaultInterfaceOf(INamedTypeSymbol iface, INamedTypeSymbol type)
+    {
+        var bare = iface.Name.Length > 1 && iface.Name[0] == 'I' ? iface.Name[1..] : iface.Name;
+        return type.Name.Contains(bare, StringComparison.OrdinalIgnoreCase);
+    }
+
     // --------------------------------------------- co-dependent statements
 
     List<TextSpan> MatchStatements(SyntaxNode subtree, string sourceId, SemanticModel model)
@@ -1890,6 +2174,7 @@ public sealed class GraphBuilder
             if (name == null) { continue; }
             var id = name.Identifier.Text;
             if (Constants.AssemblyScanMethodNames.Contains(id)) { RecordScan(inv, id, sourceId, model); }
+            if (Constants.UseStartupMethodNames.Contains(id)) { RootStartupClass(inv, name, model); }
             var typeArgs = (name as GenericNameSyntax)?.TypeArgumentList.Arguments;
 
             bool looksTracked = (id == Constants.CreateMapMethodName && typeArgs is { Count: 2 })
@@ -2248,7 +2533,7 @@ public sealed class GraphBuilder
         AddEdgeTo(sourceId, model.GetSymbolInfo(inv).Symbol);
         foreach (var s in spansToSkip) { AddSkip(ref skip, s); }
 
-        var stmt = NewStatement("DI.Register", inv, sourceId, new[] { inv }, new[] { service, impl }.Concat(argNodes));
+        var stmt = NewStatement(Constants.StatementKindDiRegister, inv, sourceId, new[] { inv }, new[] { service, impl }.Concat(argNodes));
         // Nested type arguments inside the suppressed spans must stay alive while the statement does.
         var extraArgs = argNodes.Where(a => a != service && a != impl).Cast<object>().ToList();
         if (extraArgs.Count > 0)
@@ -2387,6 +2672,11 @@ public sealed class GraphBuilder
                     else { hasExternalService = true; }
                 }
             }
+            else if (Constants.AutofacActivationNames.Contains(mname))
+            {
+                // AutoActivate(): the container builds the component at start-up, whoever resolves it.
+                hasExternalService = true;
+            }
             else if (!Constants.AutofacChainContinuers.Contains(mname) && !Constants.AutofacExtraLifetimeNames.Contains(mname))
             {
                 // An unknown call may declare services this walk cannot see (an As<IFoo>() can follow
@@ -2416,7 +2706,7 @@ public sealed class GraphBuilder
 
         // No segment: a chain segment of the outermost call would delete only the lifetime call,
         // not the registration, so a partially surviving anchor falls back to a manual warning.
-        var stmt = NewStatement("DI.Register", outermost, sourceId, claimed, textualRefs.Append(impl).Concat(argNodes), allowSegment: false);
+        var stmt = NewStatement(Constants.StatementKindDiRegister, outermost, sourceId, claimed, textualRefs.Append(impl).Concat(argNodes), allowSegment: false);
         // Nested type arguments inside the suppressed spans must stay alive while the statement does.
         var extraArgs = argNodes.Where(a => a != impl && !services.Contains(a)).Cast<object>().ToList();
         if (extraArgs.Count > 0)

@@ -7,6 +7,10 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{D24CD3C8-55A
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DeadCodeCleaner", "src\DeadCodeCleaner\DeadCodeCleaner.csproj", "{41B39260-20F5-4101-ACFB-FE713B9F219F}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{24629EA9-B6C5-4905-A611-155B25A67534}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DeadCodeCleaner.Tests", "tests\DeadCodeCleaner.Tests\DeadCodeCleaner.Tests.csproj", "{E29C5BB7-D4B3-450A-937D-4EA9D06E7E4B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -20,8 +24,13 @@ Global
 		{41B39260-20F5-4101-ACFB-FE713B9F219F}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{41B39260-20F5-4101-ACFB-FE713B9F219F}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{41B39260-20F5-4101-ACFB-FE713B9F219F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E29C5BB7-D4B3-450A-937D-4EA9D06E7E4B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E29C5BB7-D4B3-450A-937D-4EA9D06E7E4B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E29C5BB7-D4B3-450A-937D-4EA9D06E7E4B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E29C5BB7-D4B3-450A-937D-4EA9D06E7E4B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{41B39260-20F5-4101-ACFB-FE713B9F219F} = {D24CD3C8-55A1-428E-8A73-F3710F01D1D2}
+		{E29C5BB7-D4B3-450A-937D-4EA9D06E7E4B} = {24629EA9-B6C5-4905-A611-155B25A67534}
 	EndGlobalSection
 EndGlobal

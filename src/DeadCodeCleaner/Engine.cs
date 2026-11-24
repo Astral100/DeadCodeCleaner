@@ -23,14 +23,31 @@ public sealed class Engine
 
     public async Task<(DeletionReport Report, Graph Graph)> Analyze()
     {
-        using var workspace = MSBuildWorkspace.Create(Constants.NeutralizedBuildProperties);
+        _log($"Loading solution {_opts.SolutionPath} ...");
+        using var loaded = await LoadSolution(_opts.SolutionPath);
+        var result = await Analyze(loaded);
+        return result;
+    }
+
+    /// <summary>Opens a solution with MSBuild, collecting its load failures. The result can be analyzed
+    /// any number of times (each analysis builds its own graph), and owns the workspace.</summary>
+    public static async Task<LoadedSolution> LoadSolution(string solutionPath)
+    {
+        var workspace = MSBuildWorkspace.Create(Constants.NeutralizedBuildProperties);
         var loadWarnings = new List<string>();
         workspace.WorkspaceFailed += (_, e) =>
         {
             if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure) { loadWarnings.Add(e.Diagnostic.Message); }
         };
-        _log($"Loading solution {_opts.SolutionPath} ...");
-        var solution = await workspace.OpenSolutionAsync(_opts.SolutionPath);
+        var solution = await workspace.OpenSolutionAsync(solutionPath);
+        return new LoadedSolution(workspace, solution, loadWarnings);
+    }
+
+    /// <summary>Analyzes an already loaded solution (the options' solution path must name it).</summary>
+    public async Task<(DeletionReport Report, Graph Graph)> Analyze(LoadedSolution loaded)
+    {
+        var solution = loaded.Solution;
+        var loadWarnings = loaded.LoadWarnings;
         _log($"Building dependency graph for {solution.Projects.Count()} projects ...");
         var graph = await new GraphBuilder(_config, _log).Build(solution);
         foreach (var w in loadWarnings.Take(Constants.WorkspaceWarningLimit))
@@ -419,6 +436,8 @@ public sealed class Engine
         // production does not keep alive: integration tests may reach a production registration,
         // and losing those tests must never delete it.
         var deadStmts = new HashSet<StatementNode>();
+        // Live registrations that die only because they name deleted code (judged once all passes ran).
+        var lostRegistrations = new List<StatementNode>();
         foreach (var stmt in graph.Statements)
         {
             bool prodDead = r1.Contains(stmt) && !r2.Contains(stmt);
@@ -438,6 +457,7 @@ public sealed class Engine
                 deadStmts.Add(stmt);
                 if (r2.Contains(stmt))
                 {
+                    if (stmt.Kind == Constants.StatementKindDiRegister) { lostRegistrations.Add(stmt); }
                     var gone = stmt.InvolvedNodes.Where(allDead.Contains).Select(n => FqnOf(graph, n)).Distinct().ToList();
                     report.Warnings.Add($"registration deleted although still in use: {stmt.FilePath}:{stmt.StartLine} references deleted {string.Join(", ", gone)} — check for a replacement: {stmt.Snippet}");
                 }
@@ -647,13 +667,24 @@ public sealed class Engine
                     note = "also references surviving code: " + string.Join(", ", surviving);
                 }
             }
-            else if (brokenOrphans.Contains(id) && symbol is INamedTypeSymbol bot && FrameworkBaseOf(graph, bot) is { } fw && !ReferencedInSolution(graph, id))
+            else if (brokenOrphans.Contains(id) && symbol is INamedTypeSymbol bot && FrameworkBaseOf(graph, bot) is { } fw && !ReferencedInSolution(graph, id, r1))
             {
                 // "Already unused" may only mean the analysis cannot see who uses it: a class built on
                 // an outside framework type that nothing in the solution names is typically created by
                 // that framework at runtime (scanning, conventions). Never deleted unconfirmed.
                 review = true;
                 note = $"possibly created by a framework at runtime: built on {fw} from outside the solution, and nothing in the solution references it";
+            }
+            else if (brokenOrphans.Contains(id) && symbol is IMethodSymbol or IPropertySymbol
+                && graph.ContainerOf.TryGetValue(id, out var ownerId) && !allDead.Contains(ownerId)
+                && graph.Decl.TryGetValue(ownerId, out var ownerSym) && ownerSym is INamedTypeSymbol owner
+                && FrameworkCreatedReason(graph, owner, ownerId, r2) is { } createdHow)
+            {
+                // A member nothing calls, in a class that stays and that a framework or container
+                // creates: the framework may call it by name (ConfigureServices, Application_Start,
+                // a convention the tool does not know) — never deleted unconfirmed.
+                review = true;
+                note = $"possibly called by a framework at runtime: {SymbolNames.Fqn(owner)} stays, {createdHow}, and no live code creates it with new";
             }
             var parts = DeclarationParts(graph, symbol, id, allDead, keptInPlace, report.Warnings, report.FileTextLengths, report.FileTextHashes);
             if (parts.Count == 0) { continue; }
@@ -831,6 +862,20 @@ public sealed class Engine
             report.Warnings.Add($"STILL REFERENCED: config-kept {FqnOf(graph, id)} references deleted {string.Join(", ", shown)} — the keep pattern protects it, so the build will fail; fix it manually");
         }
         report.StillReferencedTargets += keptBrokenTargets.Count;
+
+        // A live registration lost with a deleted implementation leaves its still-used service with
+        // nothing registered — it compiles, and fails when the container first resolves a consumer —
+        // unless another surviving registration names the same surviving type.
+        foreach (var lost in lostRegistrations)
+        {
+            var survivingTypes = lost.InvolvedNodes.Where(n => !allDead.Contains(n)).ToHashSet(StringComparer.Ordinal);
+            if (survivingTypes.Count == 0) { continue; }
+            bool covered = graph.Statements.Any(o => o != lost && o.Kind == Constants.StatementKindDiRegister && !deadStmts.Contains(o)
+                && r2.Contains(o) && o.InvolvedNodes.Any(survivingTypes.Contains));
+            if (covered) { continue; }
+            report.ServicesLeftUnregistered++;
+            report.Warnings.Add($"{Constants.ServiceLeftUnregisteredPrefix} {string.Join(", ", survivingTypes.Select(n => FqnOf(graph, n)).Distinct())} stay in use but lose their only registration at {lost.FilePath}:{lost.StartLine} — the container fails when it first creates a consumer: {lost.Snippet}");
+        }
 
         // Statement entries (only when their containing member survives). Statements sharing one
         // anchor (fluent chains) delete only their own segment when a sibling survives.
@@ -1053,9 +1098,22 @@ public sealed class Engine
         return null;
     }
 
-    /// <summary>True when any code outside the type (or a tracked statement) references the type or
-    /// one of its members.</summary>
-    bool ReferencedInSolution(Graph graph, string typeId)
+    /// <summary>Why a surviving class is probably instantiated by a framework or container rather than
+    /// by the solution's own code: it is built on an outside framework type or registered (explicitly
+    /// or by an assembly scan), and no live production code creates it with "new". Null otherwise.</summary>
+    string FrameworkCreatedReason(Graph graph, INamedTypeSymbol owner, string ownerId, HashSet<object> r2)
+    {
+        if (graph.CreatedBy.TryGetValue(ownerId, out var creators) && creators.Any(c => r2.Contains(c) && !graph.TestNodes.Contains(c))) { return null; }
+        if (FrameworkBaseOf(graph, owner) is { } fw) { return $"is built on {fw}"; }
+        if (graph.ScanMatchedTypes.TryGetValue(ownerId, out var scanSite)) { return $"is registered by the assembly scan at {scanSite}"; }
+        var reg = graph.Statements.FirstOrDefault(s => s.Kind == Constants.StatementKindDiRegister && r2.Contains(s) && s.InvolvedNodes.Contains(ownerId));
+        return reg != null ? $"is registered at {reg.FilePath}:{reg.StartLine}" : null;
+    }
+
+    /// <summary>True when any LIVE production code outside the type (or a live tracked statement)
+    /// references the type or one of its members. A unit test or already-dead code naming the class
+    /// proves nothing about whether a framework creates it.</summary>
+    bool ReferencedInSolution(Graph graph, string typeId, HashSet<object> r1)
     {
         bool Inside(string id)
         {
@@ -1067,10 +1125,10 @@ public sealed class Engine
         }
         foreach (var (src, outs) in graph.Edges)
         {
-            if (Inside(src)) { continue; }
+            if (Inside(src) || graph.TestNodes.Contains(src) || !r1.Contains(src)) { continue; }
             if (outs.Any(Inside)) { return true; }
         }
-        return graph.Statements.Any(s => s.InvolvedNodes.Any(Inside));
+        return graph.Statements.Any(s => r1.Contains(s) && s.InvolvedNodes.Any(Inside));
     }
 
     /// <summary>Every package the given package depends on, transitively (from project.assets.json).</summary>
@@ -1530,6 +1588,7 @@ public sealed class Engine
                     report.Warnings.Add($"{pname}: PackageReference {pkg} lost its last direct user but {dependent} depends on it — left in place (it may pin a newer version), remove manually if appropriate");
                 }
             }
+            bool referencingIsTest = nodesByProject.TryGetValue(pname, out var ownNodes) && ownNodes.Any(graph.TestNodes.Contains);
             foreach (var (refName, include) in pi.ProjectReferences)
             {
                 bool targetDeleted = deletableProjects.Contains(refName);
@@ -1547,6 +1606,16 @@ public sealed class Engine
                 if (!targetDeleted && AssemblyConfigMention(graph, refName) is { } refCfg)
                 {
                     report.Warnings.Add($"{pname}: ProjectReference {refName} lost its last compile-time user but its assembly is named in {refCfg} — left in place, remove manually if appropriate");
+                    continue;
+                }
+                // Entry points a framework discovers in the referenced assembly at runtime
+                // (controllers as application parts, modules, profiles, migrations) stop shipping
+                // with the reference. A test project does not run the application's discovery.
+                if (!targetDeleted && !referencingIsTest && nodesByProject.TryGetValue(refName, out var refNodes)
+                    && refNodes.FirstOrDefault(n => graph.Roots.Contains(n) && Stays(n)
+                        && Constants.RuntimeDiscoveredRootReasons.Contains(graph.RootReasons.GetValueOrDefault(n) ?? "")) is { } liveRoot)
+                {
+                    report.Warnings.Add($"{pname}: ProjectReference {refName} lost its last compile-time user but {refName} still holds entry points ({FqnOf(graph, liveRoot)}: {graph.RootReasons.GetValueOrDefault(liveRoot)}) — left in place, remove manually if they are not needed at runtime");
                     continue;
                 }
                 rc.Add(refName);
@@ -1755,15 +1824,26 @@ public sealed class Engine
         {
             if (sym is not INamedTypeSymbol t) { continue; }
             bool alive = Stays(id);
-            var tasm = t.ContainingAssembly?.Name ?? "";
-            MarkName(tasm, SymbolNames.Fqn(t), alive);
-            if (t.ContainingType != null) { continue; }
-            var ns = t.ContainingNamespace?.IsGlobalNamespace == false ? t.ContainingNamespace.ToDisplayString() : "";
-            for (var cur = ns; cur.Length > 0;)
+            // A type in a file linked into several projects is compiled into EACH of their assemblies;
+            // the declaring symbol only names the first one.
+            var asms = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { t.ContainingAssembly?.Name ?? "" };
+            if (graph.ProjectsOf.TryGetValue(id, out var declaringProjects))
             {
-                MarkName(tasm, cur, alive);
-                var dot = cur.LastIndexOf('.');
-                cur = dot < 0 ? "" : cur[..dot];
+                foreach (var dp in declaringProjects)
+                {
+                    if (graph.Projects.TryGetValue(dp, out var dpi) && dpi.AssemblyName.Length > 0) { asms.Add(dpi.AssemblyName); }
+                }
+            }
+            var ns = t.ContainingType == null && t.ContainingNamespace?.IsGlobalNamespace == false ? t.ContainingNamespace.ToDisplayString() : "";
+            foreach (var tasm in asms)
+            {
+                MarkName(tasm, SymbolNames.Fqn(t), alive);
+                for (var cur = ns; cur.Length > 0;)
+                {
+                    MarkName(tasm, cur, alive);
+                    var dot = cur.LastIndexOf('.');
+                    cur = dot < 0 ? "" : cur[..dot];
+                }
             }
         }
 
